@@ -13,7 +13,7 @@ use rusqlite::params;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::task;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::sqlite_helpers;
 
@@ -244,9 +244,11 @@ impl Storage for LanceDbStorage {
             let table = self.get_table().await?;
             if let Err(e) = table.add(vec![batch]).execute().await {
                 // Best-effort rollback of SQLite to avoid orphaned rows. We
-                // delete the memory we just inserted; if rollback also fails,
-                // we surface the original error.
-                warn!("LanceDB add failed after SQLite insert; rolling back: {e}");
+                // delete the memory we just inserted so the subsequent retry
+                // isn't blocked by a unique-id collision. If the rollback
+                // itself fails (swallowed below), the row stays — hence error!
+                // rather than warn! so the incident shows up in alert queries.
+                error!("LanceDB add failed after SQLite insert; rolling back: {e}");
                 let pool2 = self.sqlite_pool.clone();
                 let id_owned = id.clone();
                 let _ = run_blocking(move || -> MerkurResult<()> {
@@ -384,9 +386,9 @@ impl Storage for LanceDbStorage {
                         embedding: None,
                         metadata,
                         context,
-                        created_at: parse_dt(&created_at),
-                        updated_at: parse_dt(&updated_at),
-                        accessed_at: parse_dt(&accessed_at),
+                        created_at: sqlite_helpers::parse_rfc3339(&created_at),
+                        updated_at: sqlite_helpers::parse_rfc3339(&updated_at),
+                        accessed_at: sqlite_helpers::parse_rfc3339(&accessed_at),
                         access_count,
                     }))
                 }
@@ -565,7 +567,7 @@ impl Storage for LanceDbStorage {
                         level,
                         category,
                         context,
-                        created_at: parse_dt(&created_at),
+                        created_at: sqlite_helpers::parse_rfc3339(&created_at),
                     }
                 },
             )
@@ -747,10 +749,4 @@ impl Storage for LanceDbStorage {
         let pool = self.sqlite_pool.clone();
         run_blocking(move || sqlite_helpers::memory_exists(&pool, &id_owned)).await
     }
-}
-
-fn parse_dt(s: &str) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.into())
-        .unwrap_or_else(|_| Utc::now())
 }

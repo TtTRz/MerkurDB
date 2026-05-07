@@ -301,9 +301,9 @@ impl Storage for SqliteStorage {
                         embedding,
                         metadata,
                         context,
-                        created_at: parse_dt(&created_at),
-                        updated_at: parse_dt(&updated_at),
-                        accessed_at: parse_dt(&accessed_at),
+                        created_at: sqlite_helpers::parse_rfc3339(&created_at),
+                        updated_at: sqlite_helpers::parse_rfc3339(&updated_at),
+                        accessed_at: sqlite_helpers::parse_rfc3339(&accessed_at),
                         access_count,
                     }))
                 }
@@ -437,7 +437,7 @@ impl Storage for SqliteStorage {
                         level,
                         category,
                         context,
-                        created_at: parse_dt(&created_at),
+                        created_at: sqlite_helpers::parse_rfc3339(&created_at),
                     }
                 },
             )
@@ -612,12 +612,6 @@ impl Storage for SqliteStorage {
         let pool = self.pool.clone();
         run_blocking(move || sqlite_helpers::memory_exists(&pool, &id_owned)).await
     }
-}
-
-fn parse_dt(s: &str) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.into())
-        .unwrap_or_else(|_| Utc::now())
 }
 
 fn vec_f32_to_bytes(vec: &[f32]) -> Vec<u8> {

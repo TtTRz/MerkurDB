@@ -1,10 +1,11 @@
+use parking_lot::RwLock;
 use std::collections::{BinaryHeap, HashMap};
-use std::sync::RwLock;
 
-/// In-memory vector index with O(1) update by id and O(n log k) top-k search.
+/// In-memory vector index with O(1) id-keyed update and O(n log k) top-k search.
 ///
-/// Thread-safe via `parking_lot`-style `RwLock` semantics (here `std::sync::RwLock`
-/// is adequate because all critical sections are short and contain no `.await`).
+/// Uses [`parking_lot::RwLock`] so lock acquisition never fails and
+/// poison-recovery is not a concern. All critical sections are short and
+/// contain no `.await`, so the blocking lock is safe from async contexts.
 pub struct InMemoryVectorIndex {
     inner: RwLock<Inner>,
     dim: usize,
@@ -78,34 +79,34 @@ impl InMemoryVectorIndex {
             self.dim,
             vec.len()
         );
-        let mut inner = self.inner.write().expect("lock poisoned");
-        inner.upsert(id, vec);
+        self.inner.write().upsert(id, vec);
     }
 
     pub fn remove(&self, id: &str) {
-        let mut inner = self.inner.write().expect("lock poisoned");
-        inner.remove(id);
+        self.inner.write().remove(id);
     }
 
     /// Top-k cosine similarity search using a min-heap of size `limit`.
     ///
     /// Complexity: O(n log k) vs the naive O(n log n). Returns scores in the
     /// closed interval [-1, 1] for pairs of non-zero vectors, or 0.0 when
-    /// either operand is the zero vector.
+    /// either operand is the zero vector. Ordering uses [`f64::total_cmp`],
+    /// so NaN scores are handled consistently without violating the `Ord`
+    /// contract.
     pub fn search(&self, query: &[f32], limit: usize) -> Vec<(String, f64)> {
         if limit == 0 {
             return Vec::new();
         }
-        let inner = self.inner.read().expect("lock poisoned");
+        let inner = self.inner.read();
 
         // Min-heap: smallest score at the top so we can pop it when a better
-        // candidate arrives. We store (OrderedF64, index).
-        let mut heap: BinaryHeap<std::cmp::Reverse<(OrderedF64, usize)>> =
+        // candidate arrives. Stores (TotalF64, index_in_ids).
+        let mut heap: BinaryHeap<std::cmp::Reverse<(TotalF64, usize)>> =
             BinaryHeap::with_capacity(limit + 1);
         let query_norm = l2_norm(query);
         for (i, vec) in inner.vectors.iter().enumerate() {
             let score = cosine_similarity(query, vec, query_norm);
-            heap.push(std::cmp::Reverse((OrderedF64(score), i)));
+            heap.push(std::cmp::Reverse((TotalF64(score), i)));
             if heap.len() > limit {
                 heap.pop();
             }
@@ -113,15 +114,17 @@ impl InMemoryVectorIndex {
 
         let mut results: Vec<(String, f64)> = heap
             .into_iter()
-            .map(|std::cmp::Reverse((OrderedF64(score), i))| (inner.ids[i].clone(), score))
+            .map(|std::cmp::Reverse((TotalF64(score), i))| (inner.ids[i].clone(), score))
             .collect();
-        // Sort descending by score for stable output.
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort descending by score for stable output. Using total_cmp keeps
+        // NaN at the bottom (largest via total order semantics), matching
+        // the heap's eviction policy.
+        results.sort_by(|a, b| b.1.total_cmp(&a.1));
         results
     }
 
     pub fn rebuild(&self, all: Vec<(String, Vec<f32>)>) {
-        let mut inner = self.inner.write().expect("lock poisoned");
+        let mut inner = self.inner.write();
         *inner = Inner::new();
         for (id, vec) in all {
             inner.upsert(id, vec);
@@ -129,7 +132,7 @@ impl InMemoryVectorIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.read().expect("lock poisoned").len()
+        self.inner.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -137,34 +140,31 @@ impl InMemoryVectorIndex {
     }
 }
 
-/// Wrapper providing total ordering on f64 by treating NaN as less than any
-/// real number. Sufficient for heap ordering where NaN would otherwise panic.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct OrderedF64(f64);
+/// f64 wrapper with a total order based on [`f64::total_cmp`].
+///
+/// Unlike a hand-rolled `PartialOrd` → `Ord` bridge, this respects the
+/// `Eq` contract: `a == b` iff `cmp(a, b) == Equal`, because `total_cmp`
+/// is a true total order from IEEE 754's `totalOrder` predicate.
+#[derive(Debug, Clone, Copy)]
+struct TotalF64(f64);
 
-impl Eq for OrderedF64 {}
+impl PartialEq for TotalF64 {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.total_cmp(&other.0) == std::cmp::Ordering::Equal
+    }
+}
 
-impl PartialOrd for OrderedF64 {
+impl Eq for TotalF64 {}
+
+impl PartialOrd for TotalF64 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for OrderedF64 {
+impl Ord for TotalF64 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.0.partial_cmp(&other.0) {
-            Some(o) => o,
-            None => {
-                // Push NaN to the bottom so it's evicted first.
-                if self.0.is_nan() && other.0.is_nan() {
-                    std::cmp::Ordering::Equal
-                } else if self.0.is_nan() {
-                    std::cmp::Ordering::Less
-                } else {
-                    std::cmp::Ordering::Greater
-                }
-            }
-        }
+        self.0.total_cmp(&other.0)
     }
 }
 

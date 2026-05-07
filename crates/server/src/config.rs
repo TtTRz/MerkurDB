@@ -155,65 +155,68 @@ pub struct AuthConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ConsolidationConfig {
-    #[serde(default = "default_60")]
+    #[serde(default = "default_consolidation_interval")]
     pub interval_seconds: u64,
-    #[serde(default = "default_10")]
+    #[serde(default = "default_consolidation_batch")]
     pub batch_size: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ForgettingConfig {
-    #[serde(default = "default_300")]
+    #[serde(default = "default_forgetting_interval")]
     pub interval_seconds: u64,
-    #[serde(default = "default_100")]
+    #[serde(default = "default_forgetting_batch")]
     pub batch_size: usize,
-    #[serde(default = "default_30")]
+    #[serde(default = "default_archive_days")]
     pub archive_days: i32,
-    #[serde(default = "default_0_9")]
+    #[serde(default = "default_decay_factor")]
     pub decay_factor: f64,
-    #[serde(default = "default_86400")]
+    #[serde(default = "default_half_life_seconds")]
     pub half_life_seconds: f64,
-    #[serde(default = "default_0_1")]
+    #[serde(default = "default_access_boost")]
     pub access_boost: f64,
-    #[serde(default = "default_0_3")]
+    #[serde(default = "default_threshold_to_l1")]
     pub threshold_to_l1: f64,
-    #[serde(default = "default_0_2")]
+    #[serde(default = "default_threshold_to_l0")]
     pub threshold_to_l0: f64,
-    #[serde(default = "default_0_1_a")]
+    #[serde(default = "default_threshold_archive")]
     pub threshold_archive: f64,
 }
 
-fn default_60() -> u64 {
+// Serde requires free functions for field-level defaults. Keep them named for
+// the semantic they encode, not the literal they return — magic-number-style
+// names like `default_0_1` read as line noise in diffs.
+fn default_consolidation_interval() -> u64 {
     60
 }
-fn default_300() -> u64 {
-    300
-}
-fn default_10() -> usize {
+fn default_consolidation_batch() -> usize {
     10
 }
-fn default_100() -> usize {
+fn default_forgetting_interval() -> u64 {
+    300
+}
+fn default_forgetting_batch() -> usize {
     100
 }
-fn default_30() -> i32 {
+fn default_archive_days() -> i32 {
     30
 }
-fn default_86400() -> f64 {
-    86400.0
-}
-fn default_0_9() -> f64 {
+fn default_decay_factor() -> f64 {
     0.9
 }
-fn default_0_1() -> f64 {
+fn default_half_life_seconds() -> f64 {
+    86_400.0
+}
+fn default_access_boost() -> f64 {
     0.1
 }
-fn default_0_2() -> f64 {
-    0.2
-}
-fn default_0_3() -> f64 {
+fn default_threshold_to_l1() -> f64 {
     0.3
 }
-fn default_0_1_a() -> f64 {
+fn default_threshold_to_l0() -> f64 {
+    0.2
+}
+fn default_threshold_archive() -> f64 {
     0.1
 }
 

@@ -148,24 +148,30 @@ pub struct HttpMerkurClient {
 }
 
 impl HttpMerkurClient {
-    pub fn new(base_url: &str) -> Self {
+    /// Build a client against `base_url` with a 30-second default timeout
+    /// and no bearer token.
+    pub fn new(base_url: &str) -> ClientResult<Self> {
         Self::with_options(base_url, None, Duration::from_secs(30))
     }
 
-    pub fn with_token(base_url: &str, token: impl Into<String>) -> Self {
+    /// Build a client that authenticates with `Authorization: Bearer <token>`.
+    pub fn with_token(base_url: &str, token: impl Into<String>) -> ClientResult<Self> {
         Self::with_options(base_url, Some(token.into()), Duration::from_secs(30))
     }
 
-    pub fn with_options(base_url: &str, bearer: Option<String>, timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("reqwest::Client::build is infallible with default settings");
-        Self {
+    /// Low-level constructor. Propagates any `reqwest::Client::build` failure
+    /// (TLS initialization, etc.) as a `ClientError::Http`.
+    pub fn with_options(
+        base_url: &str,
+        bearer: Option<String>,
+        timeout: Duration,
+    ) -> ClientResult<Self> {
+        let client = reqwest::Client::builder().timeout(timeout).build()?;
+        Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             bearer,
-        }
+        })
     }
 
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

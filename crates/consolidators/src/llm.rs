@@ -82,7 +82,7 @@ impl Consolidator for LlmConsolidator {
             return Ok(ConsolidationReport::empty());
         }
 
-        let prompt = build_prompt(memories);
+        let prompt = build_prompt(memories)?;
 
         let resp = self
             .client
@@ -174,7 +174,12 @@ impl Consolidator for LlmConsolidator {
 
 /// Build a JSON-safe prompt by serializing each memory through `serde_json`,
 /// avoiding hand-rolled escaping bugs around backslashes and Unicode controls.
-fn build_prompt(memories: &[Memory]) -> String {
+///
+/// Returns an error if serialization fails — in practice that only happens
+/// when a `Memory.content` contains non-UTF8 bytes smuggled in through a
+/// custom upstream, which should be surfaced rather than silently replaced
+/// with an empty array.
+fn build_prompt(memories: &[Memory]) -> MerkurResult<String> {
     let items: Vec<serde_json::Value> = memories
         .iter()
         .map(|m| {
@@ -184,9 +189,10 @@ fn build_prompt(memories: &[Memory]) -> String {
             })
         })
         .collect();
-    let items_json = serde_json::to_string(&items).unwrap_or_else(|_| "[]".into());
+    let items_json = serde_json::to_string(&items)
+        .map_err(|e| MerkurError::Consolidation(format!("encode prompt memories: {e}")))?;
 
-    format!(
+    Ok(format!(
         r#"You are a memory consolidation agent. Given a list of memories, produce:
 1. An abstract (concise 1-2 sentence summary) for each memory.
 2. Edges between semantically related memories (same entities, cause-effect, temporal sequence).
@@ -197,7 +203,7 @@ Memories: {items_json}
 
 Respond with JSON only:
 {{"memories":[{{"id":"...","abstract":"..."}}],"edges":[{{"source_id":"...","target_id":"...","relation":"...","weight":0.8}}]}}"#
-    )
+    ))
 }
 
 #[cfg(test)]

@@ -25,7 +25,13 @@ pub fn build_pool(path: &str, max_size: u32) -> MerkurResult<Pool<SqliteConnecti
         .map_err(|e| MerkurError::Storage(format!("Failed to create connection pool: {e}")))
 }
 
-fn parse_rfc3339(s: &str) -> DateTime<Utc> {
+/// Parse an RFC 3339 timestamp, falling back to `Utc::now()` on malformed input.
+///
+/// Rows are always written via `DateTime::to_rfc3339()`, so a parse failure at
+/// read time indicates catastrophic on-disk corruption — not something the
+/// read path can act on. Falling back to "now" keeps the stream of
+/// `DateTime<Utc>` values monotonic-ish rather than panicking mid-request.
+pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.into())
         .unwrap_or_else(|_| Utc::now())
@@ -260,30 +266,27 @@ pub fn list_forgetting_ids(
         .collect())
 }
 
-/// Mark memories as consolidated, chunking to stay within SQLite's variable limit.
+/// Mark memories as consolidated.
+///
+/// The list of ids is sent as a single JSON parameter via `json_each(?)`,
+/// avoiding the positional-placeholder bookkeeping that would otherwise bump
+/// against SQLite's `SQLITE_MAX_VARIABLE_NUMBER`.
 pub fn mark_consolidated(pool: &Pool<SqliteConnectionManager>, ids: &[String]) -> MerkurResult<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    // Stay well below SQLite's default SQLITE_MAX_VARIABLE_NUMBER (999 on older
-    // builds, 32766 on 3.32+). 500 is a safe, conservative chunk size.
-    const CHUNK: usize = 500;
     let conn = pool
         .get()
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
-    for chunk in ids.chunks(CHUNK) {
-        let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
-        let sql = format!(
-            "UPDATE memories SET pending_consolidation = 0 WHERE id IN ({})",
-            placeholders.join(",")
-        );
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> = chunk
-            .iter()
-            .map(|id| id as &dyn rusqlite::types::ToSql)
-            .collect();
-        conn.execute(&sql, params_ref.as_slice())
-            .map_err(|e| MerkurError::Storage(format!("Failed to mark consolidated: {e}")))?;
-    }
+    let ids_json = serde_json::to_string(ids)
+        .map_err(|e| MerkurError::Storage(format!("Failed to encode ids: {e}")))?;
+    conn.execute(
+        "UPDATE memories
+         SET pending_consolidation = 0
+         WHERE id IN (SELECT value FROM json_each(?1))",
+        params![ids_json],
+    )
+    .map_err(|e| MerkurError::Storage(format!("Failed to mark consolidated: {e}")))?;
     Ok(())
 }
 
@@ -518,8 +521,15 @@ pub fn get_edges_batch(
     Ok(by_mem)
 }
 
-/// Update access tracking for memories. Errors are logged and swallowed because
-/// access bookkeeping must never fail a read, but at least they're observable.
+/// Update access tracking for a batch of memories.
+///
+/// Errors are logged and swallowed — access bookkeeping must never fail a read
+/// request — but every failure still surfaces a `warn!` record so the problem
+/// is observable via the log pipeline.
+///
+/// Uses `json_each(?)` so the list of ids is sent as a single parameter
+/// regardless of size, sidestepping SQLite's `SQLITE_MAX_VARIABLE_NUMBER` and
+/// the bookkeeping of emitting positional placeholders.
 pub fn update_access(pool: &Pool<SqliteConnectionManager>, ids: &[String]) {
     if ids.is_empty() {
         return;
@@ -532,23 +542,18 @@ pub fn update_access(pool: &Pool<SqliteConnectionManager>, ids: &[String]) {
         }
     };
     let now = Utc::now().to_rfc3339();
-    const CHUNK: usize = 500;
-    for chunk in ids.chunks(CHUNK) {
-        let placeholders: Vec<String> = (2..=(chunk.len() + 1)).map(|i| format!("?{i}")).collect();
-        let sql = format!(
-            "UPDATE memories SET accessed_at = ?1, access_count = access_count + 1
-             WHERE id IN ({})",
-            placeholders.join(",")
-        );
-        let mut all_params: Vec<&dyn rusqlite::types::ToSql> = Vec::with_capacity(chunk.len() + 1);
-        all_params.push(&now);
-        for id in chunk {
-            all_params.push(id as &dyn rusqlite::types::ToSql);
-        }
-        if let Err(e) = conn.execute(&sql, all_params.as_slice()) {
-            warn!("update_access failed: {e}");
+    let ids_json = match serde_json::to_string(ids) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("update_access failed to encode ids: {e}");
             return;
         }
+    };
+    let sql = "UPDATE memories
+               SET accessed_at = ?1, access_count = access_count + 1
+               WHERE id IN (SELECT value FROM json_each(?2))";
+    if let Err(e) = conn.execute(sql, params![now, ids_json]) {
+        warn!("update_access failed: {e}");
     }
 }
 

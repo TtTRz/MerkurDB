@@ -9,7 +9,6 @@ mod scheduler;
 #[cfg(test)]
 mod tests;
 
-use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -26,18 +25,19 @@ use tracing::{error, info, warn};
 async fn main() -> Result<()> {
     let config_path = parse_config_path();
 
-    // Initialize tracing as early as possible so config-loading errors are
-    // observable.
-    let early_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("merkur_server=info,info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(early_filter)
-        .try_init();
+    // Load config first with a fallback stderr writer so errors are at least
+    // visible. Tracing is not installed until after we know the desired level
+    // and format, guaranteeing a single subscriber registration over the
+    // lifetime of the process.
+    let cfg = match config::Config::load(config_path.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to load config: {e:#}");
+            std::process::exit(1);
+        }
+    };
 
-    let cfg = config::Config::load(config_path.as_deref()).context("Failed to load config")?;
-
-    // Apply log-level / format from config if explicit env wasn't already set.
-    apply_logging_config(&cfg.logging);
+    init_tracing(&cfg.logging);
 
     info!(
         "MerkurDB v{} starting (host={}, port={})",
@@ -123,22 +123,33 @@ fn parse_config_path() -> Option<String> {
     None
 }
 
-fn apply_logging_config(log: &config::LoggingConfig) {
-    if std::env::var("RUST_LOG").is_ok() {
-        return; // Honour the operator's explicit override.
-    }
+/// Initialize the tracing subscriber exactly once, honouring the operator's
+/// explicit `RUST_LOG` if present and otherwise deriving the directive from
+/// `config.logging`.
+///
+/// This function is deliberately side-effectful at startup only: tracing has a
+/// single global subscriber per process, so any log record emitted before this
+/// call is lost. Callers must invoke it after config has been parsed but before
+/// any work that would `info!`/`warn!`/`error!`.
+fn init_tracing(log: &config::LoggingConfig) {
+    use tracing_subscriber::EnvFilter;
+
     let level = log.level.as_deref().unwrap_or("info");
-    if let Ok(filter) =
-        tracing_subscriber::EnvFilter::from_str(&format!("merkur_server={level},{level}"))
-    {
-        // Best-effort: subscriber may already be initialized.
-        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
-    }
-    if matches!(log.format.as_deref(), Some("json")) {
-        // Note: we don't dynamically swap the formatter once initialized; this
-        // is a known limitation. Operators wanting JSON should set
-        // `RUST_LOG_FORMAT=json` before launch in their wrapper script.
-        warn!("logging.format=json requested; runtime format swap is not supported");
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::try_new(format!("merkur_server={level},{level}"))
+            .unwrap_or_else(|_| EnvFilter::new("merkur_server=info,info"))
+    });
+
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    let result = match log.format.as_deref() {
+        Some("json") => builder.json().try_init(),
+        _ => builder.try_init(),
+    };
+    if let Err(e) = result {
+        // Re-initialization during tests is expected; in a real process this
+        // indicates someone else installed a subscriber first (unusual for a
+        // binary crate).
+        eprintln!("tracing subscriber already installed: {e}");
     }
 }
 

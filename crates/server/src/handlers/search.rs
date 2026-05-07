@@ -2,7 +2,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use merkur_core::{SearchMode, limits};
+use merkur_core::{MemoryLevel, SearchMode, limits};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -72,10 +72,10 @@ pub async fn search(
     let from_date: Option<chrono::DateTime<chrono::Utc>> = parse_optional_rfc3339(&params.from)?;
     let to_date: Option<chrono::DateTime<chrono::Utc>> = parse_optional_rfc3339(&params.to)?;
 
-    let levels: Option<Vec<String>> = params
-        .level
-        .as_ref()
-        .map(|s| s.split(',').map(str::trim).map(str::to_lowercase).collect());
+    // Parse the `level` query parameter once into typed `MemoryLevel` values.
+    // Unknown level tokens are dropped silently (rather than 400) because
+    // comma-separated filters are historically permissive.
+    let level_filter: Option<Vec<MemoryLevel>> = params.level.as_deref().map(parse_level_list);
 
     let query_vec = state.embedder.encode(&params.q).await?;
 
@@ -94,14 +94,7 @@ pub async fn search(
     let mut filtered: Vec<_> = results
         .into_iter()
         .filter(|r| r.score >= threshold)
-        .filter(|r| {
-            if let Some(ref levels) = levels {
-                let rl = format!("{:?}", r.level).to_lowercase();
-                levels.contains(&rl)
-            } else {
-                true
-            }
-        })
+        .filter(|r| level_filter.as_ref().is_none_or(|ls| ls.contains(&r.level)))
         .filter(|r| {
             params
                 .category
@@ -200,4 +193,23 @@ fn parse_optional_rfc3339(s: &Option<String>) -> ApiResult<Option<chrono::DateTi
             .map(|dt| Some(dt.into()))
             .map_err(|e| ApiError::bad_request(format!("invalid RFC3339 date: {e}"))),
     }
+}
+
+/// Parse a comma-separated level filter into typed `MemoryLevel` values.
+///
+/// Unknown / empty tokens are skipped rather than rejected; passing
+/// `"full,garbage,summary"` yields `[Full, Summary]` so a typo does not
+/// accidentally zero the result set.
+fn parse_level_list(s: &str) -> Vec<MemoryLevel> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|tok| !tok.is_empty())
+        .filter_map(|tok| match tok.to_ascii_lowercase().as_str() {
+            "full" => Some(MemoryLevel::Full),
+            "summary" => Some(MemoryLevel::Summary),
+            "title" => Some(MemoryLevel::Title),
+            "archived" => Some(MemoryLevel::Archived),
+            _ => None,
+        })
+        .collect()
 }
