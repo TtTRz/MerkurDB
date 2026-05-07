@@ -1,0 +1,33 @@
+[package]
+name = "merkur-storage"
+description = "SQLite and LanceDB storage backends for MerkurDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+merkur-core = { path = "../core" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+# LanceDB backend (optional)
+lancedb = { version = "0.27.2", optional = true }
+arrow-array = { version = "57", optional = true }
+arrow-schema = { version = "57", optional = true }
+futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]

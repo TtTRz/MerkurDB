@@ -1,0 +1,35 @@
+[package]
+name = "merkur-server"
+description = "HTTP server and scheduler for MerkurDB - a cognitive memory service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "merkur-server"
+path = "src/main.rs"
+[features]
+default = ["ollama"]
+ollama = ["merkur-embedders/ollama"]
+openai = ["merkur-embedders/openai"]
+lancedb = ["merkur-storage/lancedb"]
+[dependencies]
+merkur-core = { path = "../core" }
+merkur-storage = { path = "../storage" }
+merkur-embedders = { path = "../embedders" }
+merkur-consolidators = { path = "../consolidators" }
+merkur-forgetters = { path = "../forgetters" }
+axum = "0.8"
+figment = { version = "0.10", features = ["yaml", "env"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+[dev-dependencies]
+tower = "0.5"
+tokio = { workspace = true, features = ["test-util"] }

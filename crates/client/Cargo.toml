@@ -1,0 +1,20 @@
+[package]
+name = "merkur-client"
+description = "Rust SDK client for MerkurDB (MerkurClient trait + HttpMerkurClient)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+merkur-core = { path = "../core" }
+reqwest = { version = "0.12", features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

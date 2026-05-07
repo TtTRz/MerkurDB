@@ -1,0 +1,51 @@
+server:
+  host: "127.0.0.1"
+  port: 1934
+
+# Storage backend: "sqlite" (default) or "lancedb" (requires --features lancedb)
+storage:
+  type: "sqlite"
+  sqlite:
+    path: "~/.merkur/data/merkur.db"
+  # lancedb:
+  #   lance_path: "~/.merkur/data/vectors"
+  #   sqlite_path: "~/.merkur/data/merkur.db"
+
+plugins:
+  # Embedder: "noop" (default), "ollama", or "openai" (requires --features openai)
+  embedder:
+    type: "noop"
+    noop:
+      dim: 384
+    # ollama:
+    #   base_url: "http://localhost:11434"
+    #   model: "all-minilm"
+    # openai:
+    #   base_url: "https://api.openai.com"
+    #   api_key: "sk-..."
+    #   model: "text-embedding-3-small"
+
+retrieval:
+  fast_default_limit: 10
+  score_threshold: 0.3
+
+# Offline consolidation: summarize memories, extract entities, build edges
+consolidation:
+  interval_seconds: 60
+  batch_size: 10
+
+# Ebbinghaus forgetting curve: decay, downgrade, archive
+forgetting:
+  interval_seconds: 300
+  batch_size: 100
+  archive_days: 30
+  decay_factor: 0.9
+  half_life_seconds: 86400
+  access_boost: 0.1
+  threshold_to_l1: 0.3
+  threshold_to_l0: 0.2
+  threshold_archive: 0.1
+
+logging:
+  level: "info"
+  format: "text"

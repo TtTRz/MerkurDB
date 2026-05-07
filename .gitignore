@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+*.log
+.env
+.env.local
+data/
+.claude/

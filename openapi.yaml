@@ -1,0 +1,664 @@
+openapi: "3.0.3"
+info:
+  title: MerkurDB
+  version: "0.1.0"
+  description: |
+    Standalone cognitive memory service for AI agents.
+    MerkurDB is an independent HTTP memory service supporting memory writes, semantic search, graph diffusion,
+    memory consolidation, and forgetting curve management.
+  contact:
+    name: MerkurDB
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:1934/v1
+    description: Local development server
+
+tags:
+  - name: Write
+    description: Memory write
+  - name: Search
+    description: Memory search
+  - name: Memory
+    description: Single memory management
+  - name: Graph
+    description: Memory graph
+  - name: Lifecycle
+    description: Consolidation & forgetting
+  - name: Status
+    description: Service statistics
+  - name: Admin
+    description: Operations & audit
+
+paths:
+  /health:
+    get:
+      tags: [Admin]
+      summary: Health check
+      operationId: health
+      responses:
+        "200":
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  version:
+                    type: string
+                    example: "0.1.0"
+
+  /write:
+    post:
+      tags: [Write]
+      summary: Write a memory
+      operationId: write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  description: Memory text content
+                context:
+                  type: object
+                  additionalProperties:
+                    type: string
+                  description: Context tags (agent, session, topic, etc.)
+                metadata:
+                  type: object
+                  description: Custom metadata
+            example:
+              content: "v8 GC is generational"
+              context:
+                agent: "test"
+      responses:
+        "201":
+          description: Memory created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WriteResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /write-batch:
+    post:
+      tags: [Write]
+      summary: Batch write memories
+      operationId: writeBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  items:
+                    type: object
+                    required: [content]
+                    properties:
+                      content:
+                        type: string
+                      context:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      metadata:
+                        type: object
+            example:
+              items:
+                - content: "memory 1"
+                - content: "memory 2"
+      responses:
+        "201":
+          description: Batch write successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ids:
+                    type: array
+                    items:
+                      type: string
+                  count:
+                    type: integer
+                  time_ms:
+                    type: integer
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /search:
+    get:
+      tags: [Search]
+      summary: Search memories
+      operationId: search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query text
+        - name: mode
+          in: query
+          schema:
+            type: string
+            enum: [fast, deep]
+            default: fast
+          description: fast=vector retrieval, deep=BFS graph diffusion
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+        - name: score_threshold
+          in: query
+          schema:
+            type: number
+            default: 0.3
+        - name: context
+          in: query
+          schema:
+            type: string
+          description: JSON context filter, e.g. '{"agent":"test"}'
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            default: 2
+          description: BFS depth (deep mode only)
+        - name: degree_limit
+          in: query
+          schema:
+            type: integer
+            default: 10
+          description: Max neighbors per node (deep mode only)
+        - name: level
+          in: query
+          schema:
+            type: string
+          description: Comma-separated level filter, e.g. "Full,Summary"
+        - name: category
+          in: query
+          schema:
+            type: string
+          description: Exact category match
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start date inclusive (RFC 3339)
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End date inclusive (RFC 3339)
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "500":
+          $ref: "#/components/responses/Error"
+
+  /memory/{id}:
+    get:
+      tags: [Memory]
+      summary: Get memory details
+      operationId: getMemory
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Memory details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Memory"
+        "404":
+          $ref: "#/components/responses/Error"
+    put:
+      tags: [Memory]
+      summary: Update memory content
+      operationId: updateMemory
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  description: New memory content
+            example:
+              content: "updated memory content"
+      responses:
+        "200":
+          description: Update successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: updated
+                  id:
+                    type: string
+    delete:
+      tags: [Memory]
+      summary: Delete memory
+      operationId: deleteMemory
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Delete successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: deleted
+                  id:
+                    type: string
+
+  /graph/{id}:
+    get:
+      tags: [Graph]
+      summary: View memory graph neighborhood
+      operationId: getGraph
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Center memory ID
+      responses:
+        "200":
+          description: Graph neighborhood
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  center:
+                    type: string
+                  neighborhood:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        content:
+                          type: string
+                        abstract:
+                          type: string
+                        score:
+                          type: number
+                        level:
+                          type: string
+
+  /relate:
+    post:
+      tags: [Graph]
+      summary: Manually create an edge
+      operationId: relate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_id, target_id]
+              properties:
+                source_id:
+                  type: string
+                target_id:
+                  type: string
+                weight:
+                  type: number
+                  default: 1.0
+                relation:
+                  type: string
+            example:
+              source_id: "mem_abc"
+              target_id: "mem_def"
+              weight: 0.8
+              relation: "related_to"
+      responses:
+        "201":
+          description: Edge created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: edge_created
+
+  /relate-batch:
+    post:
+      tags: [Graph]
+      summary: Batch create edges
+      operationId: relateBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [edges]
+              properties:
+                edges:
+                  type: array
+                  items:
+                    type: object
+                    required: [source_id, target_id]
+                    properties:
+                      source_id:
+                        type: string
+                      target_id:
+                        type: string
+                      weight:
+                        type: number
+                      relation:
+                        type: string
+            example:
+              edges:
+                - source_id: "mem_a"
+                  target_id: "mem_b"
+                  relation: "related"
+                - source_id: "mem_b"
+                  target_id: "mem_c"
+                  weight: 0.5
+      responses:
+        "201":
+          description: Batch create results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  created:
+                    type: integer
+                  errors:
+                    type: array
+                    items:
+                      type: object
+
+  /consolidate:
+    post:
+      tags: [Lifecycle]
+      summary: Manually trigger consolidation
+      description: Feed pending memories to consolidator for summarization and edge creation
+      operationId: triggerConsolidate
+      responses:
+        "200":
+          description: Consolidation results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  processed:
+                    type: integer
+                  edges_created:
+                    type: integer
+                  errors:
+                    type: integer
+              example:
+                status: "ok"
+                processed: 5
+                edges_created: 3
+                errors: 0
+
+  /consolidate/log:
+    get:
+      tags: [Lifecycle]
+      summary: Get consolidation audit log
+      operationId: consolidationLog
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+          description: Max entries to return
+      responses:
+        "200":
+          description: Consolidation log entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                        started_at:
+                          type: string
+                          format: date-time
+                        finished_at:
+                          type: string
+                          format: date-time
+                        memories_processed:
+                          type: integer
+                        edges_created:
+                          type: integer
+                        errors:
+                          type: integer
+
+  /forget:
+    post:
+      tags: [Lifecycle]
+      summary: Manually trigger forgetting evaluation
+      description: Evaluate memory weights via forgetting curve, perform downgrade/archive/cleanup
+      operationId: triggerForget
+      responses:
+        "200":
+          description: Forgetting results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  archived:
+                    type: integer
+                  downgraded:
+                    type: integer
+                  cleaned:
+                    type: integer
+              example:
+                status: "ok"
+                archived: 2
+                downgraded: 1
+                cleaned: 0
+
+  /status:
+    get:
+      tags: [Status]
+      summary: Get storage statistics
+      operationId: status
+      responses:
+        "200":
+          description: Storage statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusResponse"
+
+components:
+  schemas:
+    Memory:
+      type: object
+      properties:
+        id:
+          type: string
+        content:
+          type: string
+        abstract:
+          type: string
+        category:
+          type: string
+        weight:
+          type: number
+        level:
+          type: string
+          enum: [Full, Summary, Title, Archived]
+        pending_consolidation:
+          type: boolean
+        metadata:
+          type: object
+        context:
+          type: object
+          additionalProperties:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        accessed_at:
+          type: string
+          format: date-time
+        access_count:
+          type: integer
+
+    WriteResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        status:
+          type: string
+          example: ok
+        searchable:
+          type: boolean
+        time_ms:
+          type: integer
+
+    ScoredMemory:
+      type: object
+      properties:
+        id:
+          type: string
+        content:
+          type: string
+        abstract:
+          type: string
+        score:
+          type: number
+        level:
+          type: string
+        category:
+          type: string
+        context:
+          type: object
+        created_at:
+          type: string
+          format: date-time
+
+    SearchResponse:
+      type: object
+      properties:
+        mode:
+          type: string
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/ScoredMemory"
+        total:
+          type: integer
+        time_ms:
+          type: integer
+        graph:
+          nullable: true
+          type: object
+
+    StatusResponse:
+      type: object
+      properties:
+        total_memories:
+          type: integer
+        total_edges:
+          type: integer
+        pending_consolidation:
+          type: integer
+        by_level:
+          type: object
+          additionalProperties:
+            type: integer
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+
+  responses:
+    Error:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"

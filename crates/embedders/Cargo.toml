@@ -1,0 +1,25 @@
+[package]
+name = "merkur-embedders"
+description = "Embedding backends (Noop, Ollama, OpenAI) for MerkurDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+ollama = ["reqwest"]
+openai = ["reqwest"]
+
+[dependencies]
+merkur-core = { path = "../core" }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

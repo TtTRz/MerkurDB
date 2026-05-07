@@ -1,0 +1,17 @@
+[package]
+name = "merkur-core"
+description = "Core types, traits, and errors for MerkurDB - a cognitive memory service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true

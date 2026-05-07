@@ -1,0 +1,13 @@
+[package]
+name = "merkur-forgetters"
+description = "Ebbinghaus forgetting curve implementation for MerkurDB"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+merkur-core = { path = "../core" }
+chrono.workspace = true
+tracing.workspace = true
