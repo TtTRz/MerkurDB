@@ -1,13 +1,16 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use merkur_core::{MerkurError, NewMemory, WriteItem};
+use axum::response::IntoResponse;
+use merkur_core::{NewMemory, WriteItem, limits};
 use serde::Deserialize;
-use tracing::error;
+use serde_json::json;
 
 use crate::app_state::AppState;
+use crate::error::{ApiError, ApiResult};
 
 #[derive(Debug, Deserialize)]
 pub struct WriteRequest {
@@ -21,106 +24,99 @@ pub struct WriteBatchRequest {
     pub items: Vec<WriteItem>,
 }
 
+fn check_content(content: &str) -> ApiResult<()> {
+    if content.is_empty() {
+        return Err(ApiError::bad_request("content must not be empty"));
+    }
+    if content.len() > limits::MAX_CONTENT_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "content exceeds {} bytes",
+            limits::MAX_CONTENT_BYTES
+        )));
+    }
+    Ok(())
+}
+
 pub async fn write(
     State(state): State<AppState>,
     Json(req): Json<WriteRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let start = std::time::Instant::now();
+) -> ApiResult<impl IntoResponse> {
+    let start = Instant::now();
+    check_content(&req.content)?;
 
-    let embedding = match state.embedder.encode(&req.content).await {
-        Ok(vec) => Some(vec),
-        Err(e) => {
-            error!("Embedding failed: {e:?}");
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "EMBED_FAILED", e);
-        }
-    };
+    let embedding = state.embedder.encode(&req.content).await?;
 
     let new_mem = NewMemory {
         content: req.content,
         category: None,
         context: req.context.unwrap_or_default(),
         metadata: req.metadata.unwrap_or_default(),
-        embedding,
+        embedding: Some(embedding),
     };
 
-    match state.storage.insert_memory(&new_mem).await {
-        Ok(id) => {
-            let time_ms = start.elapsed().as_millis() as u64;
-            (
-                StatusCode::CREATED,
-                Json(serde_json::json!({
-                    "id": id,
-                    "status": "ok",
-                    "searchable": true,
-                    "time_ms": time_ms
-                })),
-            )
-        }
-        Err(e) => {
-            error!("Write failed: {e:?}");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "WRITE_FAILED", e)
-        }
-    }
+    let id = state.storage.insert_memory(&new_mem).await?;
+    let time_ms = start.elapsed().as_millis() as u64;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({
+            "id": id,
+            "status": "ok",
+            "searchable": true,
+            "time_ms": time_ms
+        })),
+    ))
 }
 
 pub async fn write_batch(
     State(state): State<AppState>,
     Json(req): Json<WriteBatchRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let start = std::time::Instant::now();
-    let mut ids = Vec::new();
+) -> ApiResult<impl IntoResponse> {
+    let start = Instant::now();
+    if req.items.len() > limits::MAX_BATCH_ITEMS {
+        return Err(ApiError::bad_request(format!(
+            "items exceeds limit of {}",
+            limits::MAX_BATCH_ITEMS
+        )));
+    }
 
+    let mut ids = Vec::new();
     let mut errors = Vec::new();
     for (i, item) in req.items.iter().enumerate() {
+        if let Err(e) = check_content(&item.content) {
+            errors.push(json!({"index": i, "code": e.code, "message": e.message}));
+            continue;
+        }
         let embedding = match state.embedder.encode(&item.content).await {
-            Ok(vec) => Some(vec),
+            Ok(v) => v,
             Err(e) => {
-                errors.push(serde_json::json!({"index": i, "code": "EMBED_FAILED", "message": e.to_string()}));
+                errors.push(json!({"index": i, "code": "EMBED_FAILED", "message": e.to_string()}));
                 continue;
             }
         };
-
         let new_mem = NewMemory {
             content: item.content.clone(),
             category: None,
             context: item.context.clone().unwrap_or_default(),
             metadata: item.metadata.clone().unwrap_or_default(),
-            embedding,
+            embedding: Some(embedding),
         };
-
         match state.storage.insert_memory(&new_mem).await {
             Ok(id) => ids.push(id),
             Err(e) => {
-                errors.push(serde_json::json!({"index": i, "code": "WRITE_FAILED", "message": e.to_string()}));
+                errors.push(json!({"index": i, "code": "WRITE_FAILED", "message": e.to_string()}))
             }
         }
     }
 
     let time_ms = start.elapsed().as_millis() as u64;
-    (
+    Ok((
         StatusCode::CREATED,
-        Json(serde_json::json!({
+        Json(json!({
             "ids": ids,
             "count": ids.len(),
             "requested": req.items.len(),
             "errors": errors,
             "time_ms": time_ms
         })),
-    )
-}
-
-pub fn error_response(
-    status: StatusCode,
-    code: &str,
-    err: MerkurError,
-) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": {
-                "code": code,
-                "message": err.to_string()
-            }
-        })),
-    )
+    ))
 }

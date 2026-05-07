@@ -15,6 +15,9 @@ servers:
   - url: http://localhost:1934/v1
     description: Local development server
 
+security:
+  - bearerAuth: []
+
 tags:
   - name: Write
     description: Memory write
@@ -135,8 +138,16 @@ paths:
                       type: string
                   count:
                     type: integer
+                  requested:
+                    type: integer
+                  errors:
+                    type: array
+                    items:
+                      type: object
                   time_ms:
                     type: integer
+        "400":
+          $ref: "#/components/responses/Error"
         "500":
           $ref: "#/components/responses/Error"
 
@@ -163,11 +174,15 @@ paths:
           in: query
           schema:
             type: integer
+            minimum: 1
+            maximum: 1000
             default: 10
         - name: score_threshold
           in: query
           schema:
             type: number
+            minimum: -1
+            maximum: 1
             default: 0.3
         - name: context
           in: query
@@ -178,19 +193,24 @@ paths:
           in: query
           schema:
             type: integer
+            minimum: 0
             default: 0
         - name: depth
           in: query
           schema:
             type: integer
+            minimum: 0
+            maximum: 5
             default: 2
-          description: BFS depth (deep mode only)
+          description: BFS depth (deep mode only). Hard upper bound is 5.
         - name: degree_limit
           in: query
           schema:
             type: integer
+            minimum: 1
+            maximum: 100
             default: 10
-          description: Max neighbors per node (deep mode only)
+          description: Max neighbors per node (deep mode only). Hard upper bound is 100.
         - name: level
           in: query
           schema:
@@ -542,6 +562,10 @@ paths:
                 $ref: "#/components/schemas/StatusResponse"
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
   schemas:
     Memory:
       type: object
@@ -558,7 +582,8 @@ components:
           type: number
         level:
           type: string
-          enum: [Full, Summary, Title, Archived]
+          enum: [full, summary, title, archived]
+          description: Lower-case enum to match the wire format.
         pending_consolidation:
           type: boolean
         metadata:
@@ -626,6 +651,21 @@ components:
           type: integer
         time_ms:
           type: integer
+        filters:
+          type: object
+          properties:
+            level:
+              type: string
+              nullable: true
+            category:
+              type: string
+              nullable: true
+            from:
+              type: string
+              nullable: true
+            to:
+              type: string
+              nullable: true
         graph:
           nullable: true
           type: object
@@ -643,6 +683,9 @@ components:
           type: object
           additionalProperties:
             type: integer
+        uptime_seconds:
+          type: integer
+          nullable: true
 
     ErrorResponse:
       type: object

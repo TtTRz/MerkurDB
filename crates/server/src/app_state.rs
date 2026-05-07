@@ -2,13 +2,17 @@ use chrono::{DateTime, Utc};
 use merkur_core::{Consolidator, Embedder, Forgetter, Storage};
 use std::sync::Arc;
 
+use crate::config::Config;
+
+/// Shared application state. Wrapped in cheap clones — `Arc<dyn ...>` and
+/// `Arc<Config>` make this O(1) on each request.
 #[derive(Clone)]
 pub struct AppState {
     pub embedder: Arc<dyn Embedder>,
     pub storage: Arc<dyn Storage>,
     pub consolidator: Arc<dyn Consolidator>,
     pub forgetter: Arc<dyn Forgetter>,
-    pub config: crate::config::Config,
+    pub config: Arc<Config>,
     pub started_at: DateTime<Utc>,
 }
 
@@ -18,7 +22,7 @@ impl AppState {
         storage: Arc<dyn Storage>,
         consolidator: Arc<dyn Consolidator>,
         forgetter: Arc<dyn Forgetter>,
-        config: crate::config::Config,
+        config: Arc<Config>,
         started_at: DateTime<Utc>,
     ) -> Self {
         Self {

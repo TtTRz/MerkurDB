@@ -1,11 +1,13 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use merkur_core::SearchMode;
+use axum::response::IntoResponse;
+use merkur_core::{SearchMode, limits};
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::app_state::AppState;
-use crate::handlers::write::error_response;
+use crate::error::{ApiError, ApiResult};
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
@@ -20,7 +22,6 @@ pub struct SearchQuery {
     pub depth: Option<usize>,
     #[serde(default)]
     pub degree_limit: Option<usize>,
-    // Advanced filters
     pub level: Option<String>,
     pub category: Option<String>,
     pub from: Option<String>,
@@ -36,68 +37,57 @@ fn default_mode() -> String {
 pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> ApiResult<impl IntoResponse> {
     let start = std::time::Instant::now();
+    if params.q.is_empty() {
+        return Err(ApiError::bad_request("q must not be empty"));
+    }
     let mode = match params.mode.as_str() {
         "fast" => SearchMode::Fast,
         "deep" => SearchMode::Deep,
-        _ => SearchMode::Fast,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "Unknown search mode: {other}"
+            )));
+        }
     };
-    let limit = params.limit.unwrap_or_else(|| state.config.fast_limit());
+
+    let limit = params
+        .limit
+        .unwrap_or_else(|| state.config.fast_limit())
+        .clamp(1, limits::MAX_SEARCH_LIMIT);
+    let depth = params
+        .depth
+        .unwrap_or_else(|| state.config.default_depth())
+        .clamp(0, limits::MAX_BFS_DEPTH);
+    let degree_limit = params
+        .degree_limit
+        .unwrap_or_else(|| state.config.default_degree_limit())
+        .clamp(1, limits::MAX_BFS_DEGREE);
     let threshold = params
         .score_threshold
         .unwrap_or_else(|| state.config.score_threshold());
     let offset = params.offset.unwrap_or(0);
 
-    // Parse date filters
-    let from_date: Option<chrono::DateTime<chrono::Utc>> = params
-        .from
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.into());
-    let to_date: Option<chrono::DateTime<chrono::Utc>> = params
-        .to
-        .as_deref()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.into());
+    let from_date: Option<chrono::DateTime<chrono::Utc>> = parse_optional_rfc3339(&params.from)?;
+    let to_date: Option<chrono::DateTime<chrono::Utc>> = parse_optional_rfc3339(&params.to)?;
 
-    // Parse level filter (comma-separated)
     let levels: Option<Vec<String>> = params
         .level
         .as_ref()
         .map(|s| s.split(',').map(str::trim).map(str::to_lowercase).collect());
 
-    let query_vec = match state.embedder.encode(&params.q).await {
-        Ok(vec) => vec,
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "EMBED_FAILED", e),
-    };
+    let query_vec = state.embedder.encode(&params.q).await?;
 
     let results = match mode {
-        SearchMode::Fast => match state.storage.vector_search(&query_vec, limit * 2).await {
-            Ok(r) => r,
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_FAILED", e),
-        },
+        SearchMode::Fast => state.storage.vector_search(&query_vec, limit * 2).await?,
         SearchMode::Deep => {
-            let seeds = match state.storage.vector_search(&query_vec, limit).await {
-                Ok(r) => r,
-                Err(e) => {
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_FAILED", e);
-                }
-            };
+            let seeds = state.storage.vector_search(&query_vec, limit).await?;
             let seed_ids: Vec<String> = seeds.iter().map(|s| s.id.clone()).collect();
-            let depth = params.depth.unwrap_or(2);
-            let degree_limit = params.degree_limit.unwrap_or(10);
-
-            match state
+            state
                 .storage
                 .bfs_expand(&seed_ids, depth, degree_limit)
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    return error_response(StatusCode::INTERNAL_SERVER_ERROR, "BFS_FAILED", e);
-                }
-            }
+                .await?
         }
     };
 
@@ -113,29 +103,15 @@ pub async fn search(
             }
         })
         .filter(|r| {
-            if let Some(ref cat) = params.category {
-                r.category == *cat
-            } else {
-                true
-            }
+            params
+                .category
+                .as_ref()
+                .is_none_or(|cat| r.category == *cat)
         })
-        .filter(|r| {
-            if let Some(from) = from_date {
-                r.created_at >= from
-            } else {
-                true
-            }
-        })
-        .filter(|r| {
-            if let Some(to) = to_date {
-                r.created_at <= to
-            } else {
-                true
-            }
-        })
+        .filter(|r| from_date.is_none_or(|f| r.created_at >= f))
+        .filter(|r| to_date.is_none_or(|t| r.created_at <= t))
         .collect();
 
-    // Context-aware filtering and boosting
     if let Some(ref ctx_str) = params.context
         && let Ok(ctx_filter) = serde_json::from_str::<serde_json::Value>(ctx_str)
         && let Some(obj) = ctx_filter.as_object()
@@ -161,14 +137,13 @@ pub async fn search(
     let total = filtered.len();
     let paginated: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
 
-    // Build graph data on demand
     let graph = if params.include_graph == Some(true) && !paginated.is_empty() {
-        let mut graph_edges = Vec::new();
         let result_ids: Vec<String> = paginated.iter().map(|r| r.id.clone()).collect();
+        let mut graph_edges = Vec::new();
         for memory_id in &result_ids {
             if let Ok(edges) = state.storage.get_edges(memory_id).await {
                 for e in edges {
-                    graph_edges.push(serde_json::json!({
+                    graph_edges.push(json!({
                         "source_id": e.source_id,
                         "target_id": e.target_id,
                         "weight": e.weight,
@@ -178,8 +153,8 @@ pub async fn search(
                 }
             }
         }
-        Some(serde_json::json!({
-            "nodes": paginated.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+        Some(json!({
+            "nodes": result_ids,
             "edges": graph_edges,
         }))
     } else {
@@ -188,12 +163,12 @@ pub async fn search(
 
     let time_ms = start.elapsed().as_millis() as u64;
 
-    (
+    Ok((
         StatusCode::OK,
-        Json(serde_json::json!({
+        Json(json!({
             "mode": params.mode,
             "results": paginated.iter().map(|r| {
-                serde_json::json!({
+                json!({
                     "id": r.id,
                     "content": r.content,
                     "abstract": r.abstract_,
@@ -215,5 +190,14 @@ pub async fn search(
             },
             "graph": graph
         })),
-    )
+    ))
+}
+
+fn parse_optional_rfc3339(s: &Option<String>) -> ApiResult<Option<chrono::DateTime<chrono::Utc>>> {
+    match s.as_deref() {
+        None => Ok(None),
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s)
+            .map(|dt| Some(dt.into()))
+            .map_err(|e| ApiError::bad_request(format!("invalid RFC3339 date: {e}"))),
+    }
 }

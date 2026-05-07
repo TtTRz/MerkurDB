@@ -1,12 +1,15 @@
 use async_trait::async_trait;
 use merkur_core::{Embedder, MerkurError, MerkurResult};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::debug;
 
 #[derive(Debug, Serialize)]
-struct OpenAIEmbedRequest {
-    model: String,
+struct OpenAIEmbedRequest<'a> {
+    model: &'a str,
     input: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -26,20 +29,34 @@ pub struct OpenAIEmbedder {
     api_key: String,
     model: String,
     dim: usize,
+    /// Optional output dimension override for `text-embedding-3-*` models.
+    requested_dim: Option<usize>,
 }
 
 impl OpenAIEmbedder {
     pub async fn new(base_url: &str, api_key: &str, model: &str) -> MerkurResult<Self> {
-        let client = reqwest::Client::new();
+        Self::new_with_dimensions(base_url, api_key, model, None).await
+    }
+
+    pub async fn new_with_dimensions(
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        dimensions: Option<usize>,
+    ) -> MerkurResult<Self> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| MerkurError::Embedding(format!("Failed to build HTTP client: {e}")))?;
         let base_url = base_url.trim_end_matches('/').to_string();
 
-        // Probe to get the embedding dimension
         let probe_resp = client
             .post(format!("{base_url}/v1/embeddings"))
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&OpenAIEmbedRequest {
-                model: model.to_string(),
+                model,
                 input: serde_json::Value::String("probe".to_string()),
+                dimensions,
             })
             .send()
             .await
@@ -58,7 +75,12 @@ impl OpenAIEmbedder {
             .await
             .map_err(|e| MerkurError::Embedding(format!("Failed to parse OpenAI response: {e}")))?;
 
-        let dim = resp.data.first().map(|d| d.embedding.len()).unwrap_or(1536);
+        let dim = resp
+            .data
+            .first()
+            .map(|d| d.embedding.len())
+            .filter(|&n| n > 0)
+            .ok_or_else(|| MerkurError::Embedding("OpenAI probe returned no embeddings".into()))?;
 
         debug!("OpenAIEmbedder initialized: model={model}, dim={dim}");
 
@@ -68,6 +90,7 @@ impl OpenAIEmbedder {
             api_key: api_key.to_string(),
             model: model.to_string(),
             dim,
+            requested_dim: dimensions,
         })
     }
 }
@@ -82,19 +105,31 @@ impl Embedder for OpenAIEmbedder {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
+        // OpenAI caps inputs at 2048 per request; we conservatively enforce
+        // a smaller cap to leave token budget headroom.
+        const MAX_BATCH: usize = 512;
+        if texts.len() > MAX_BATCH {
+            return Err(MerkurError::BadRequest(format!(
+                "OpenAI batch size {} exceeds limit {MAX_BATCH}",
+                texts.len()
+            )));
+        }
 
-        let inputs: Vec<serde_json::Value> = texts
-            .iter()
-            .map(|t| serde_json::Value::String(t.clone()))
-            .collect();
+        let inputs = serde_json::Value::Array(
+            texts
+                .iter()
+                .map(|t| serde_json::Value::String(t.clone()))
+                .collect(),
+        );
 
         let resp = self
             .client
             .post(format!("{}/v1/embeddings", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .json(&OpenAIEmbedRequest {
-                model: self.model.clone(),
-                input: serde_json::Value::Array(inputs),
+                model: &self.model,
+                input: inputs,
+                dimensions: self.requested_dim,
             })
             .send()
             .await
@@ -112,6 +147,14 @@ impl Embedder for OpenAIEmbedder {
             .json()
             .await
             .map_err(|e| MerkurError::Embedding(format!("Failed to parse OpenAI response: {e}")))?;
+
+        if resp.data.len() != texts.len() {
+            return Err(MerkurError::Embedding(format!(
+                "OpenAI returned {} embeddings for {} inputs",
+                resp.data.len(),
+                texts.len()
+            )));
+        }
 
         resp.data.sort_by_key(|d| d.index);
         let embeddings: Vec<Vec<f32>> = resp.data.into_iter().map(|d| d.embedding).collect();

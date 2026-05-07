@@ -1,6 +1,11 @@
 server:
   host: "127.0.0.1"
   port: 1934
+  # Comma-separated list of allowed CORS origins. Use "*" only with dev_mode=true.
+  cors_allow_origin: "http://localhost:3000"
+  # Set to true to relax production safeguards (allow `*` CORS, no auth tokens).
+  # Never enable in production.
+  dev_mode: false
 
 # Storage backend: "sqlite" (default) or "lancedb" (requires --features lancedb)
 storage:
@@ -22,12 +27,29 @@ plugins:
     #   model: "all-minilm"
     # openai:
     #   base_url: "https://api.openai.com"
-    #   api_key: "sk-..."
+    #   api_key: "sk-..."           # Prefer MERKUR_PLUGINS__EMBEDDER__OPENAI__API_KEY env var
     #   model: "text-embedding-3-small"
+    #   dimensions: 512             # Optional output-dim override for v3 models
+
+  # Consolidator: "noop" (default) or "llm"
+  consolidator:
+    type: "noop"
+    # llm:
+    #   base_url: "http://localhost:11434"
+    #   model: "qwen2.5:7b"
 
 retrieval:
   fast_default_limit: 10
   score_threshold: 0.3
+  default_depth: 2
+  default_degree_limit: 10
+
+# Authentication: provide one or more bearer tokens. Empty list + `disabled: false`
+# is rejected at startup unless `server.dev_mode = true`.
+auth:
+  tokens:
+    - "replace-me-with-a-strong-token"
+  disabled: false
 
 # Offline consolidation: summarize memories, extract entities, build edges
 consolidation:
@@ -39,8 +61,8 @@ forgetting:
   interval_seconds: 300
   batch_size: 100
   archive_days: 30
-  decay_factor: 0.9
-  half_life_seconds: 86400
+  decay_factor: 0.9        # legacy; not used by current formula
+  half_life_seconds: 86400 # weight halves every `half_life_seconds`
   access_boost: 0.1
   threshold_to_l1: 0.3
   threshold_to_l0: 0.2

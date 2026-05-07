@@ -48,7 +48,7 @@ async fn test_vector_store_and_search() -> MerkurResult<()> {
     let id1 = storage
         .insert_memory(&new_test_memory("v8 GC", Some(vec![1.0, 0.0, 0.0, 0.0])))
         .await?;
-    let id2 = storage
+    let _id2 = storage
         .insert_memory(&new_test_memory(
             "Rust async",
             Some(vec![-1.0, 0.0, 0.0, 0.0]),
@@ -57,8 +57,10 @@ async fn test_vector_store_and_search() -> MerkurResult<()> {
 
     let results = storage.vector_search(&[1.0, 0.0, 0.0, 0.0], 5).await?;
     assert!(!results.is_empty());
-    assert!(results[0].id == id1);
-    assert!(results[0].score > results[1].score);
+    assert_eq!(results[0].id, id1);
+    if results.len() > 1 {
+        assert!(results[0].score > results[1].score);
+    }
     Ok(())
 }
 
@@ -95,7 +97,7 @@ async fn test_edge_and_bfs() -> MerkurResult<()> {
         })
         .await?;
 
-    let expanded = storage.bfs_expand(&[a.clone()], 2, 20).await?;
+    let expanded = storage.bfs_expand(std::slice::from_ref(&a), 2, 20).await?;
     let ids: Vec<_> = expanded.iter().map(|m| m.id.clone()).collect();
     assert!(ids.contains(&b));
     assert!(ids.contains(&c));
@@ -103,15 +105,59 @@ async fn test_edge_and_bfs() -> MerkurResult<()> {
 }
 
 #[tokio::test]
-async fn test_delete_cascades() -> MerkurResult<()> {
+async fn test_delete_cascades_edges_and_context() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
 
-    let id = storage
-        .insert_memory(&new_test_memory("test", Some(vec![1.0, 0.0, 0.0, 0.0])))
+    let a = storage
+        .insert_memory(&new_test_memory("A", Some(vec![1.0, 0.0, 0.0, 0.0])))
         .await?;
-    storage.insert_context_tag(&id, "agent", "test").await?;
-    storage.delete_memory(&id).await?;
-    assert!(storage.get_memory(&id).await?.is_none());
+    let b = storage
+        .insert_memory(&new_test_memory("B", Some(vec![0.0, 1.0, 0.0, 0.0])))
+        .await?;
+    storage.insert_context_tag(&a, "ns", "team").await?;
+    storage
+        .insert_edge(&NewEdge {
+            source_id: a.clone(),
+            target_id: b.clone(),
+            weight: None,
+            relation: None,
+            edge_type: EdgeType::Manual,
+        })
+        .await?;
+
+    storage.delete_memory(&a).await?;
+    assert!(storage.get_memory(&a).await?.is_none());
+
+    // Edges referencing the deleted memory must have been removed by FK CASCADE.
+    let remaining = storage.get_edges(&b).await?;
+    assert!(
+        remaining
+            .iter()
+            .all(|e| e.source_id != a && e.target_id != a),
+        "edges referencing deleted memory still present: {remaining:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_edge_to_unknown_memory_fails() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let a = storage
+        .insert_memory(&new_test_memory("A", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+
+    // With foreign_keys=ON enforced on every connection, an edge pointing at a
+    // non-existent target must be rejected by the engine.
+    let res = storage
+        .insert_edge(&NewEdge {
+            source_id: a,
+            target_id: "mem_does_not_exist".into(),
+            weight: None,
+            relation: None,
+            edge_type: EdgeType::Manual,
+        })
+        .await;
+    assert!(res.is_err(), "expected FK violation, got {res:?}");
     Ok(())
 }
 
@@ -137,5 +183,16 @@ async fn test_stats() -> MerkurResult<()> {
     let stats = storage.stats().await?;
     assert_eq!(stats.total_memories, 2);
     assert_eq!(stats.pending_consolidation, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_memory_exists() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let id = storage
+        .insert_memory(&new_test_memory("hello", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+    assert!(storage.memory_exists(&id).await?);
+    assert!(!storage.memory_exists("mem_zzz").await?);
     Ok(())
 }

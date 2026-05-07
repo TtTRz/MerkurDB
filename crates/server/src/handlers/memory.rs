@@ -1,45 +1,40 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::app_state::AppState;
-use crate::handlers::write::error_response;
+use crate::error::{ApiError, ApiResult};
 
 pub async fn get_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    match state.storage.get_memory(&id).await {
-        Ok(Some(memory)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "id": memory.id,
-                "content": memory.content,
-                "abstract": memory.abstract_,
-                "category": memory.category,
-                "weight": memory.weight,
-                "level": memory.level,
-                "pending_consolidation": memory.pending_consolidation,
-                "metadata": memory.metadata,
-                "context": memory.context,
-                "created_at": memory.created_at,
-                "updated_at": memory.updated_at,
-                "accessed_at": memory.accessed_at,
-                "access_count": memory.access_count
-            })),
-        ),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "MEMORY_NOT_FOUND",
-                    "message": format!("Memory {id} not found")
-                }
-            })),
-        ),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "STORAGE_ERROR", e),
-    }
+) -> ApiResult<impl IntoResponse> {
+    let memory = state
+        .storage
+        .get_memory(&id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("Memory {id} not found")))?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "id": memory.id,
+            "content": memory.content,
+            "abstract": memory.abstract_,
+            "category": memory.category,
+            "weight": memory.weight,
+            "level": memory.level,
+            "pending_consolidation": memory.pending_consolidation,
+            "metadata": memory.metadata,
+            "context": memory.context,
+            "created_at": memory.created_at,
+            "updated_at": memory.updated_at,
+            "accessed_at": memory.accessed_at,
+            "access_count": memory.access_count
+        })),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,33 +46,33 @@ pub async fn update_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(req): Json<UpdateRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let embedding = match state.embedder.encode(&req.content).await {
-        Ok(vec) => Some(vec),
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "EMBED_FAILED", e),
-    };
-    match state
-        .storage
-        .update_memory(&id, &req.content, embedding.as_deref())
-        .await
-    {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "updated", "id": id })),
-        ),
-        Err(e) => error_response(StatusCode::NOT_FOUND, "UPDATE_FAILED", e),
+) -> ApiResult<impl IntoResponse> {
+    if req.content.is_empty() {
+        return Err(ApiError::bad_request("content must not be empty"));
     }
+    // Existence check up front avoids burning an embedding (and an OpenAI fee)
+    // for a non-existent id.
+    if !state.storage.memory_exists(&id).await? {
+        return Err(ApiError::not_found(format!("Memory {id} not found")));
+    }
+    let embedding = state.embedder.encode(&req.content).await?;
+    state
+        .storage
+        .update_memory(&id, &req.content, Some(&embedding))
+        .await?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "status": "updated", "id": id })),
+    ))
 }
 
 pub async fn delete_memory(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    match state.storage.delete_memory(&id).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "status": "deleted", "id": id })),
-        ),
-        Err(e) => error_response(StatusCode::NOT_FOUND, "DELETE_FAILED", e),
-    }
+) -> ApiResult<impl IntoResponse> {
+    state.storage.delete_memory(&id).await?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "status": "deleted", "id": id })),
+    ))
 }

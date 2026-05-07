@@ -1,15 +1,26 @@
+//! Async HTTP client SDK for MerkurDB.
+
 use async_trait::async_trait;
-use merkur_core::{Edge, Memory, ScoredMemory};
+use merkur_core::{Edge, Memory, ScoredMemory, WriteItem};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
 
     #[error("API error: {code} — {message}")]
     Api { code: String, message: String },
+}
+
+impl From<reqwest::Error> for ClientError {
+    fn from(e: reqwest::Error) -> Self {
+        // Strip the URL out of reqwest errors so credentials embedded in URLs
+        // don't leak to consumers of the SDK.
+        ClientError::Http(format!("{e}"))
+    }
 }
 
 pub type ClientResult<T> = Result<T, ClientError>;
@@ -66,20 +77,26 @@ pub struct ForgetResponse {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ConsolidationLogEntry {
-    pub id: i64,
-    pub started_at: String,
-    pub finished_at: Option<String>,
-    pub memories_processed: i64,
-    pub edges_created: i64,
-    pub errors: i64,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct GraphResponse {
     pub center: String,
     pub neighborhood: Vec<serde_json::Value>,
     pub edges: Vec<Edge>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SearchParams {
+    pub mode: Option<String>,
+    pub limit: Option<usize>,
+    pub score_threshold: Option<f64>,
+    pub depth: Option<usize>,
+    pub degree_limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub level: Option<String>,
+    pub category: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub include_graph: Option<bool>,
+    pub context: Option<HashMap<String, String>>,
 }
 
 // ── Trait ──
@@ -90,17 +107,12 @@ pub trait MerkurClient: Send + Sync {
         &self,
         content: &str,
         context: Option<HashMap<String, String>>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> ClientResult<WriteResponse>;
 
     async fn write_batch(&self, items: &[WriteItem]) -> ClientResult<WriteBatchResponse>;
 
-    async fn search(
-        &self,
-        query: &str,
-        mode: Option<&str>,
-        limit: Option<usize>,
-        threshold: Option<f64>,
-    ) -> ClientResult<SearchResponse>;
+    async fn search(&self, query: &str, params: &SearchParams) -> ClientResult<SearchResponse>;
 
     async fn get_memory(&self, id: &str) -> ClientResult<Memory>;
 
@@ -122,17 +134,9 @@ pub trait MerkurClient: Send + Sync {
         weight: Option<f64>,
     ) -> ClientResult<()>;
 
-    async fn graph(&self, id: &str) -> ClientResult<GraphResponse>;
+    async fn graph(&self, id: &str, depth: Option<usize>) -> ClientResult<GraphResponse>;
 
     async fn health(&self) -> ClientResult<String>;
-}
-
-// ── Request types ──
-
-#[derive(Debug, Serialize)]
-pub struct WriteItem {
-    pub content: String,
-    pub context: Option<HashMap<String, String>>,
 }
 
 // ── HTTP implementation ──
@@ -140,24 +144,43 @@ pub struct WriteItem {
 pub struct HttpMerkurClient {
     client: reqwest::Client,
     base_url: String,
+    bearer: Option<String>,
 }
 
 impl HttpMerkurClient {
     pub fn new(base_url: &str) -> Self {
+        Self::with_options(base_url, None, Duration::from_secs(30))
+    }
+
+    pub fn with_token(base_url: &str, token: impl Into<String>) -> Self {
+        Self::with_options(base_url, Some(token.into()), Duration::from_secs(30))
+    }
+
+    pub fn with_options(base_url: &str, bearer: Option<String>, timeout: Duration) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("reqwest::Client::build is infallible with default settings");
         Self {
-            client: reqwest::Client::new(),
+            client,
             base_url: base_url.trim_end_matches('/').to_string(),
+            bearer,
         }
     }
 
-    async fn handle_response<T: serde::de::DeserializeOwned>(
-        &self,
-        resp: reqwest::Response,
-    ) -> ClientResult<T> {
-        if resp.status().is_success() || resp.status() == reqwest::StatusCode::CREATED {
-            Ok(resp.json().await?)
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.bearer {
+            Some(t) => req.bearer_auth(t),
+            None => req,
+        }
+    }
+
+    async fn parse_or_error(resp: reqwest::Response) -> ClientResult<serde_json::Value> {
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if status.is_success() {
+            Ok(body)
         } else {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
             let error = &body["error"];
             Err(ClientError::Api {
                 code: error["code"].as_str().unwrap_or("UNKNOWN").into(),
@@ -165,6 +188,26 @@ impl HttpMerkurClient {
             })
         }
     }
+
+    async fn handle_response<T: serde::de::DeserializeOwned>(
+        resp: reqwest::Response,
+    ) -> ClientResult<T> {
+        let value = Self::parse_or_error(resp).await?;
+        serde_json::from_value(value).map_err(|e| ClientError::Http(format!("decode: {e}")))
+    }
+
+    async fn handle_unit(resp: reqwest::Response) -> ClientResult<()> {
+        Self::parse_or_error(resp).await.map(|_| ())
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct WriteBody<'a> {
+    content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[async_trait]
@@ -173,123 +216,118 @@ impl MerkurClient for HttpMerkurClient {
         &self,
         content: &str,
         context: Option<HashMap<String, String>>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> ClientResult<WriteResponse> {
-        let resp = self
+        let req = self
             .client
             .post(format!("{}/v1/write", self.base_url))
-            .json(&serde_json::json!({ "content": content, "context": context }))
-            .send()
-            .await?;
-        self.handle_response(resp).await
+            .json(&WriteBody {
+                content,
+                context,
+                metadata,
+            });
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_response(resp).await
     }
 
     async fn write_batch(&self, items: &[WriteItem]) -> ClientResult<WriteBatchResponse> {
-        let resp = self
+        let req = self
             .client
             .post(format!("{}/v1/write-batch", self.base_url))
-            .json(&serde_json::json!({ "items": items }))
-            .send()
-            .await?;
-        self.handle_response(resp).await
+            .json(&serde_json::json!({ "items": items }));
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_response(resp).await
     }
 
-    async fn search(
-        &self,
-        query: &str,
-        mode: Option<&str>,
-        limit: Option<usize>,
-        threshold: Option<f64>,
-    ) -> ClientResult<SearchResponse> {
-        let mut params = vec![("q", query.to_string())];
-        if let Some(m) = mode {
-            params.push(("mode", m.to_string()));
+    async fn search(&self, query: &str, params: &SearchParams) -> ClientResult<SearchResponse> {
+        let mut q: Vec<(&str, String)> = vec![("q", query.to_string())];
+        if let Some(m) = &params.mode {
+            q.push(("mode", m.clone()));
         }
-        if let Some(l) = limit {
-            params.push(("limit", l.to_string()));
+        if let Some(v) = params.limit {
+            q.push(("limit", v.to_string()));
         }
-        if let Some(t) = threshold {
-            params.push(("score_threshold", t.to_string()));
+        if let Some(v) = params.score_threshold {
+            q.push(("score_threshold", v.to_string()));
         }
-        let resp = self
+        if let Some(v) = params.depth {
+            q.push(("depth", v.to_string()));
+        }
+        if let Some(v) = params.degree_limit {
+            q.push(("degree_limit", v.to_string()));
+        }
+        if let Some(v) = params.offset {
+            q.push(("offset", v.to_string()));
+        }
+        if let Some(v) = &params.level {
+            q.push(("level", v.clone()));
+        }
+        if let Some(v) = &params.category {
+            q.push(("category", v.clone()));
+        }
+        if let Some(v) = &params.from {
+            q.push(("from", v.clone()));
+        }
+        if let Some(v) = &params.to {
+            q.push(("to", v.clone()));
+        }
+        if let Some(v) = params.include_graph {
+            q.push(("include_graph", v.to_string()));
+        }
+        if let Some(ctx) = &params.context
+            && let Ok(s) = serde_json::to_string(ctx)
+        {
+            q.push(("context", s));
+        }
+        let req = self
             .client
             .get(format!("{}/v1/search", self.base_url))
-            .query(&params)
-            .send()
-            .await?;
-        self.handle_response(resp).await
+            .query(&q);
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_response(resp).await
     }
 
     async fn get_memory(&self, id: &str) -> ClientResult<Memory> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/memory/{id}", self.base_url))
-            .send()
-            .await?;
-        self.handle_response(resp).await
+        let req = self.client.get(format!("{}/v1/memory/{id}", self.base_url));
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_response(resp).await
     }
 
     async fn update_memory(&self, id: &str, content: &str) -> ClientResult<()> {
-        let resp = self
+        let req = self
             .client
             .put(format!("{}/v1/memory/{id}", self.base_url))
-            .json(&serde_json::json!({ "content": content }))
-            .send()
-            .await?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            let error = &body["error"];
-            Err(ClientError::Api {
-                code: error["code"].as_str().unwrap_or("UNKNOWN").into(),
-                message: error["message"].as_str().unwrap_or("Unknown error").into(),
-            })
-        }
+            .json(&serde_json::json!({ "content": content }));
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_unit(resp).await
     }
 
     async fn delete_memory(&self, id: &str) -> ClientResult<()> {
-        let resp = self
+        let req = self
             .client
-            .delete(format!("{}/v1/memory/{id}", self.base_url))
-            .send()
-            .await?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            let error = &body["error"];
-            Err(ClientError::Api {
-                code: error["code"].as_str().unwrap_or("UNKNOWN").into(),
-                message: error["message"].as_str().unwrap_or("Unknown error").into(),
-            })
-        }
+            .delete(format!("{}/v1/memory/{id}", self.base_url));
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_unit(resp).await
     }
 
     async fn status(&self) -> ClientResult<StatusResponse> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/status", self.base_url))
-            .send()
-            .await?;
-        self.handle_response(resp).await
+        let req = self.client.get(format!("{}/v1/status", self.base_url));
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_response(resp).await
     }
 
     async fn consolidate(&self) -> ClientResult<ConsolidateResponse> {
-        let resp = self
+        let req = self
             .client
-            .post(format!("{}/v1/consolidate", self.base_url))
-            .send()
-            .await?;
-        self.handle_response(resp).await
+            .post(format!("{}/v1/consolidate", self.base_url));
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_response(resp).await
     }
 
     async fn forget(&self) -> ClientResult<ForgetResponse> {
-        let resp = self
-            .client
-            .post(format!("{}/v1/forget", self.base_url))
-            .send()
-            .await?;
-        self.handle_response(resp).await
+        let req = self.client.post(format!("{}/v1/forget", self.base_url));
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_response(resp).await
     }
 
     async fn relate(
@@ -299,7 +337,7 @@ impl MerkurClient for HttpMerkurClient {
         relation: Option<&str>,
         weight: Option<f64>,
     ) -> ClientResult<()> {
-        let resp = self
+        let req = self
             .client
             .post(format!("{}/v1/relate", self.base_url))
             .json(&serde_json::json!({
@@ -307,36 +345,23 @@ impl MerkurClient for HttpMerkurClient {
                 "target_id": target_id,
                 "relation": relation,
                 "weight": weight,
-            }))
-            .send()
-            .await?;
-        if resp.status().is_success() || resp.status() == reqwest::StatusCode::CREATED {
-            Ok(())
-        } else {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            let error = &body["error"];
-            Err(ClientError::Api {
-                code: error["code"].as_str().unwrap_or("UNKNOWN").into(),
-                message: error["message"].as_str().unwrap_or("Unknown error").into(),
-            })
-        }
+            }));
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_unit(resp).await
     }
 
-    async fn graph(&self, id: &str) -> ClientResult<GraphResponse> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/graph/{id}", self.base_url))
-            .send()
-            .await?;
-        self.handle_response(resp).await
+    async fn graph(&self, id: &str, depth: Option<usize>) -> ClientResult<GraphResponse> {
+        let mut req = self.client.get(format!("{}/v1/graph/{id}", self.base_url));
+        if let Some(d) = depth {
+            req = req.query(&[("depth", d.to_string())]);
+        }
+        let resp = self.apply_auth(req).send().await?;
+        Self::handle_response(resp).await
     }
 
     async fn health(&self) -> ClientResult<String> {
-        let resp = self
-            .client
-            .get(format!("{}/v1/health", self.base_url))
-            .send()
-            .await?;
+        let req = self.client.get(format!("{}/v1/health", self.base_url));
+        let resp = self.apply_auth(req).send().await?;
         let body: serde_json::Value = resp.json().await?;
         Ok(body["status"].as_str().unwrap_or("unknown").to_string())
     }

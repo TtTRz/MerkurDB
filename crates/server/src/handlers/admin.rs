@@ -1,15 +1,17 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::app_state::AppState;
-use crate::handlers::write::error_response;
+use crate::error::ApiResult;
 
-pub async fn health() -> (StatusCode, Json<serde_json::Value>) {
+pub async fn health() -> impl IntoResponse {
     (
         StatusCode::OK,
-        Json(serde_json::json!({
+        Json(json!({
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION")
         })),
@@ -24,14 +26,8 @@ pub struct LogQuery {
 pub async fn consolidation_log(
     State(state): State<AppState>,
     Query(params): Query<LogQuery>,
-) -> (StatusCode, Json<serde_json::Value>) {
-    let limit = params.limit.unwrap_or(20);
-
-    match state.storage.get_consolidation_log(limit).await {
-        Ok(entries) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "entries": entries })),
-        ),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "LOG_FAILED", e),
-    }
+) -> ApiResult<impl IntoResponse> {
+    let limit = params.limit.unwrap_or(20).clamp(1, 1000);
+    let entries = state.storage.get_consolidation_log(limit).await?;
+    Ok((StatusCode::OK, Json(json!({ "entries": entries }))))
 }

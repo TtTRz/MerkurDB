@@ -75,4 +75,9 @@ pub trait Storage: Send + Sync {
     -> MerkurResult<Vec<ConsolidationLogEntry>>;
 
     async fn stats(&self) -> MerkurResult<StorageStats>;
+
+    /// Whether a memory with the given id exists. Used to validate edge
+    /// endpoints at the application layer regardless of whether the underlying
+    /// engine enforces foreign keys.
+    async fn memory_exists(&self, id: &str) -> MerkurResult<bool>;
 }

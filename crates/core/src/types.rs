@@ -6,11 +6,15 @@ use std::collections::HashMap;
 pub struct Memory {
     pub id: String,
     pub content: String,
+    #[serde(rename = "abstract")]
     pub abstract_: Option<String>,
     pub category: String,
     pub weight: f64,
     pub level: MemoryLevel,
     pub pending_consolidation: bool,
+    // Embedding is an internal detail of the storage layer; never serialize it
+    // in API responses, and default to None when absent from input.
+    #[serde(default, skip_serializing)]
     pub embedding: Option<Vec<f32>>,
     pub metadata: HashMap<String, serde_json::Value>,
     pub context: HashMap<String, String>,
@@ -21,6 +25,7 @@ pub struct Memory {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MemoryLevel {
     Full = 2,
     Summary = 1,
@@ -33,6 +38,12 @@ impl MemoryLevel {
         self as i32
     }
 
+    /// Convert a stored i32 into a MemoryLevel.
+    ///
+    /// Unknown values fall back to `Archived` (rather than the previous behaviour
+    /// of defaulting to `Full`), so corrupt rows are removed from retrieval rather
+    /// than promoted to the highest retention tier. A warning is logged so the
+    /// anomaly is still observable.
     pub fn from_i32(v: i32) -> Self {
         match v {
             2 => Self::Full,
@@ -40,8 +51,8 @@ impl MemoryLevel {
             0 => Self::Title,
             -1 => Self::Archived,
             _ => {
-                tracing::warn!("Unknown memory level {v}, defaulting to Full");
-                Self::Full
+                tracing::warn!(level = v, "Unknown memory level, coercing to Archived");
+                Self::Archived
             }
         }
     }
@@ -57,13 +68,30 @@ pub struct Edge {
     pub edge_type: EdgeType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EdgeType {
     Auto,
     Manual,
 }
 
-#[derive(Debug, Clone)]
+impl EdgeType {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            EdgeType::Auto => "auto",
+            EdgeType::Manual => "manual",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "manual" => EdgeType::Manual,
+            _ => EdgeType::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewMemory {
     pub content: String,
     pub category: Option<String>,
@@ -72,7 +100,7 @@ pub struct NewMemory {
     pub embedding: Option<Vec<f32>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewEdge {
     pub source_id: String,
     pub target_id: String,
@@ -85,6 +113,7 @@ pub struct NewEdge {
 pub struct ScoredMemory {
     pub id: String,
     pub content: String,
+    #[serde(rename = "abstract")]
     pub abstract_: Option<String>,
     pub score: f64,
     pub weight: f64,
@@ -102,7 +131,7 @@ pub struct StorageStats {
     pub by_level: HashMap<i32, usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ConsolidationReport {
     pub memories_processed: usize,
     pub edges_created: usize,
@@ -113,21 +142,15 @@ pub struct ConsolidationReport {
 
 impl ConsolidationReport {
     pub fn empty() -> Self {
-        Self {
-            memories_processed: 0,
-            edges_created: 0,
-            errors: 0,
-            new_abstracts: HashMap::new(),
-            new_edges: Vec::new(),
-        }
+        Self::default()
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsolidationLogEntry {
     pub id: i64,
-    pub started_at: String,
-    pub finished_at: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
     pub memories_processed: i64,
     pub edges_created: i64,
     pub errors: i64,
@@ -150,29 +173,43 @@ pub enum SearchMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteItem {
     pub content: String,
+    #[serde(default)]
     pub context: Option<HashMap<String, String>>,
+    #[serde(default)]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
+    pub mode: SearchMode,
     pub limit: usize,
     pub score_threshold: f64,
     pub context: Option<HashMap<String, String>>,
     pub depth: usize,
+    pub degree_limit: usize,
     pub include_graph: bool,
     pub offset: usize,
+    pub level: Option<Vec<MemoryLevel>>,
+    pub category: Option<String>,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
 }
 
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
+            mode: SearchMode::Fast,
             limit: 10,
             score_threshold: 0.3,
             context: None,
             depth: 2,
+            degree_limit: 10,
             include_graph: false,
             offset: 0,
+            level: None,
+            category: None,
+            from: None,
+            to: None,
         }
     }
 }
@@ -188,4 +225,14 @@ pub struct WriteResponse {
 pub struct WriteBatchResponse {
     pub ids: Vec<String>,
     pub count: usize,
+}
+
+/// Hard limits on user-controllable search parameters to avoid DoS.
+pub mod limits {
+    pub const MAX_SEARCH_LIMIT: usize = 1000;
+    pub const MAX_BFS_DEPTH: usize = 5;
+    pub const MAX_BFS_DEGREE: usize = 100;
+    pub const MAX_BATCH_ITEMS: usize = 500;
+    pub const MAX_CONTENT_BYTES: usize = 64 * 1024;
+    pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 }
