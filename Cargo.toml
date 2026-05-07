@@ -25,6 +25,10 @@ chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["full"] }
+# Default includes the minimum feature set a library crate might need. The
+# server binary opts in to `full` via its own dependency declaration; library
+# crates (core, storage, embedders, consolidators, forgetters, client) inherit
+# this lean set to avoid dragging net / signal / process / fs into dependents.
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
