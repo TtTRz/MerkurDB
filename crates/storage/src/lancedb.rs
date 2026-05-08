@@ -620,24 +620,6 @@ impl Storage for LanceDbStorage {
         Ok(out)
     }
 
-    async fn rebuild_vector_index(&self, _all: &[(String, Vec<f32>)]) -> MerkurResult<()> {
-        let table = self.get_table().await?;
-        let count = table
-            .count_rows(None)
-            .await
-            .map_err(|e| MerkurError::Storage(format!("Failed to count rows: {e}")))?;
-        if count < INDEX_THRESHOLD {
-            return Ok(());
-        }
-        table
-            .create_index(&["vector"], Index::Auto)
-            .execute()
-            .await
-            .map_err(|e| MerkurError::Storage(format!("Failed to build vector index: {e}")))?;
-        info!(rows = count, "LanceDB vector index rebuilt");
-        Ok(())
-    }
-
     async fn insert_edge(&self, edge: &NewEdge) -> MerkurResult<()> {
         let edge = edge.clone();
         let pool = self.sqlite_pool.clone();

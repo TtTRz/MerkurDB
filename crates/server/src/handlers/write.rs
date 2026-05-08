@@ -139,8 +139,13 @@ pub async fn write_batch(
     }
 
     let time_ms = start.elapsed().as_millis() as u64;
+    let status = if ids.is_empty() && !errors.is_empty() {
+        StatusCode::MULTI_STATUS
+    } else {
+        StatusCode::CREATED
+    };
     Ok((
-        StatusCode::CREATED,
+        status,
         Json(json!({
             "ids": ids,
             "count": ids.len(),

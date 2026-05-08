@@ -29,8 +29,18 @@ pub struct OpenAIEmbedder {
     api_key: String,
     model: String,
     dim: usize,
-    /// Optional output dimension override for `text-embedding-3-*` models.
     requested_dim: Option<usize>,
+}
+
+impl std::fmt::Debug for OpenAIEmbedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAIEmbedder")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .field("dim", &self.dim)
+            .field("api_key", &"***")
+            .finish()
+    }
 }
 
 impl OpenAIEmbedder {

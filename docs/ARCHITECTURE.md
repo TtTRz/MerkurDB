@@ -1,6 +1,6 @@
 # MerkurDB — Architecture
 
-> [中文版](ARCHITECTURE_CN.md) · v0.1.0
+> [中文版](ARCHITECTURE_CN.md) · v0.3.0
 
 ## Crate Structure & Dependencies
 
@@ -16,6 +16,28 @@ crates/
 ```
 
 **Dependency direction**: `core` ← all crates, `server` depends on all crates, `client` depends only on `core`.
+
+```mermaid
+graph TD
+    core[merkur-core]
+    storage[merkur-storage]
+    embedders[merkur-embedders]
+    consolidators[merkur-consolidators]
+    forgetters[merkur-forgetters]
+    server[merkur-server]
+    client[merkur-client]
+
+    storage --> core
+    embedders --> core
+    consolidators --> core
+    forgetters --> core
+    server --> core
+    server --> storage
+    server --> embedders
+    server --> consolidators
+    server --> forgetters
+    client --> core
+```
 
 ## Plugin Trait System
 
@@ -50,6 +72,9 @@ pub trait Storage: Send + Sync {
     async fn vector_search(&self, vec: &[f32], limit: usize) -> MerkurResult<Vec<ScoredMemory>>;
     async fn insert_edge(&self, edge: &NewEdge) -> MerkurResult<()>;
     async fn get_edges(&self, memory_id: &str) -> MerkurResult<Vec<Edge>>;
+    async fn get_edges_batch(&self, memory_ids: &[String]) -> MerkurResult<HashMap<String, Vec<Edge>>>;
+    async fn memory_exists_batch(&self, ids: &[String]) -> MerkurResult<HashSet<String>>;
+    async fn update_abstract(&self, id: &str, abstract_: &str) -> MerkurResult<()>;
     async fn bfs_expand(&self, seed_ids: &[String], depth: usize, degree_limit: usize) -> MerkurResult<Vec<ScoredMemory>>;
     async fn list_pending(&self, limit: usize) -> MerkurResult<Vec<Memory>>;
     async fn list_for_forgetting(&self, limit: usize) -> MerkurResult<Vec<Memory>>;
@@ -96,20 +121,32 @@ pub struct Edge {
 
 ### SqliteStorage (default)
 - **Metadata**: SQLite, WAL mode, r2d2 connection pool (max 10)
-- **Vector index**: `InMemoryVectorIndex` — RwLock<Vec<(id, embedding)>>, cosine similarity
+- **Vector index**: `InMemoryVectorIndex` — `parking_lot::RwLock`, parallel arrays (ids/vectors/norms) + HashMap index, O(n log k) top-k cosine search with pre-cached L2 norms
 - **Startup**: Loads all vectors from `embedding BLOB` column into memory
 - **Tables**: memories, edges, context_tags, consolidate_log (8 indexes)
 
 ### LanceDbStorage (feature gated)
 - **Metadata**: SQLite (same DDL as SqliteStorage)
-- **Vectors**: LanceDB disk index, IVF-PQ, zero-copy
-- **Search**: LanceDB `nearest_to` query, cosine distance → similarity conversion
+- **Vectors**: LanceDB disk storage, auto-builds IVF index once table exceeds 256 rows
+- **Search**: LanceDB `nearest_to` query, L2 distance → cosine similarity approximation (`1 - d²/2`)
 - **Requires**: `protoc` (build-only), `--features lancedb`
 
 ### Shared SQL Logic
 `sqlite_helpers.rs` — 12 shared functions (insert_edge, bfs_expand, search_by_context, stats, etc.), eliminating ~530 lines of duplication across both backends.
 
 ## Retrieval System
+
+```mermaid
+flowchart LR
+    Q[Query text] --> E[Embedder.encode]
+    E --> V[Vector top-k]
+    V -->|mode=fast| R[Results + metadata]
+    V -->|mode=deep| BFS[CTE BFS expand]
+    BFS --> R
+    R --> CB[Context boost]
+    CB --> TH[Threshold filter]
+    TH --> P[Paginate + return]
+```
 
 ### S1 Fast — Vector Search
 `Embedder::encode()` → `InMemoryVectorIndex::search()` cosine top-k → SQLite metadata enrichment
@@ -131,18 +168,52 @@ SELECT ... FROM bfs JOIN memories m WHERE bfs.d>0 AND m.level>=0
 
 ## Cognitive Pipeline
 
+```mermaid
+stateDiagram-v2
+    [*] --> Full: write (weight=1.0)
+    Full --> Full: access (weight refreshed)
+    Full --> Summary: weight < 0.3
+    Summary --> Title: weight < 0.2
+    Title --> Archived: weight < 0.1
+    Archived --> [*]: deleted after 30 days
+
+    Full --> Full: consolidate (abstract + edges)
+```
+
 ### Forgetting Curve (EbbinghausForgetter)
 ```
-w(t) = w₀ · α^(Δt/d) · (1 + β · log₂(1 + n))
+w(t) = w₀ · exp(-Δt · ln2 / h) · min(1 + β · log₂(1 + n), 3.0)
 ```
-- α: decay_factor (0.9), d: half_life (86400s), β: access_boost (0.1), n: access_count
+- h: half_life_seconds (86400s), β: access_boost (0.1), n: access_count
+- Access bonus capped at 3.0× to prevent immortal memories
 - Downgrade thresholds: Full→Summary (w<0.3), Summary→Title (w<0.2), Title→Archive (w<0.1)
 - `access_count` auto-increments on every `get_memory` call
 
 ### Consolidation
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant DB as Storage
+    participant LLM as Consolidator
+
+    S->>DB: list_pending(batch_size)
+    DB-->>S: Vec<Memory>
+    S->>LLM: consolidate(memories)
+    LLM-->>S: ConsolidationReport
+    loop each abstract
+        S->>DB: update_abstract(id, text)
+    end
+    loop each edge
+        S->>DB: insert_edge(edge)
+    end
+    S->>DB: mark_consolidated(successful_ids)
+    S->>DB: log_consolidation(report)
+```
+
 1. Scheduler scans `pending_consolidation=1` memories
 2. Consolidator analyzes → returns `ConsolidationReport` (abstracts + edges)
-3. Scheduler applies results: insert_context_tag + insert_edge + mark_consolidated
+3. Scheduler applies results: update_abstract + insert_edge + mark_consolidated (only successful ids)
 4. Writes `consolidate_log` audit entry
 
 ## Configuration
@@ -205,6 +276,8 @@ Environment variable override: `MERKUR_` prefix. Priority: env > config.yaml > d
 
 Error format: `{"error": {"code": "...", "message": "..."}}`
 
+All endpoints except `/v1/health` require `Authorization: Bearer <token>`. Token comparison uses the `subtle` crate for constant-time equality.
+
 ## Feature Gates
 
 | Feature | Requires | Backend |
@@ -224,7 +297,7 @@ cargo build --features openai,lancedb
 | HTTP | axum 0.8 | Tokio ecosystem, async |
 | SQLite | rusqlite 0.32 (bundled) | Zero system deps |
 | Vectors (v0) | In-memory FAISS-like | OK for <10K vectors |
-| Vectors (v1) | LanceDB 0.27 | Disk index, IVF-PQ |
+| Vectors (v1) | LanceDB 0.27 | Disk storage, auto-index after 256 rows |
 | Serialization | serde + serde_json | Rust standard |
 | Config | figment 0.10 | Multi-layer merge |
 | Logging | tracing | Structured |
@@ -235,7 +308,7 @@ cargo build --features openai,lancedb
 ## Project Scale
 
 ```
-7 crates · 31 Rust source files · ~4,500 lines
-21 tests · 0 clippy warnings
+7 crates · 31 Rust source files · ~6,400 lines
+41 tests · 0 clippy warnings
 14 API endpoints · 3 feature flags
 ```

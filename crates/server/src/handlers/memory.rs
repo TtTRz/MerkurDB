@@ -50,11 +50,6 @@ pub async fn update_memory(
     if req.content.is_empty() {
         return Err(ApiError::bad_request("content must not be empty"));
     }
-    // Existence check up front avoids burning an embedding (and an OpenAI fee)
-    // for a non-existent id.
-    if !state.storage.memory_exists(&id).await? {
-        return Err(ApiError::not_found(format!("Memory {id} not found")));
-    }
     let embedding = state.embedder.encode(&req.content).await?;
     state
         .storage

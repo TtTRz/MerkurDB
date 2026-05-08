@@ -364,11 +364,11 @@ pub fn get_consolidation_log(
     let rows = stmt
         .query_map(params![limit as i64], |row| {
             let started_at: String = row.get(1)?;
-            let finished_at: Option<String> = row.get(2)?;
+            let finished_at: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
             Ok(ConsolidationLogEntry {
                 id: row.get(0)?,
                 started_at: parse_rfc3339(&started_at),
-                finished_at: finished_at.as_deref().map(parse_rfc3339),
+                finished_at: parse_rfc3339(&finished_at),
                 memories_processed: row.get(3)?,
                 edges_created: row.get(4)?,
                 errors: row.get(5)?,

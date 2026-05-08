@@ -70,8 +70,9 @@ impl Forgetter for EbbinghausForgetter {
             1.0
         };
 
-        let access_bonus =
-            1.0 + self.config.access_boost * f64::ln(1.0 + memory.access_count as f64) / LN_2;
+        let access_bonus = (1.0
+            + self.config.access_boost * f64::ln(1.0 + memory.access_count as f64) / LN_2)
+            .min(3.0);
 
         memory.weight * decay * access_bonus
     }

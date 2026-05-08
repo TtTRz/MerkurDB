@@ -18,19 +18,25 @@ Single binary, zero runtime dependencies. Supports semantic search, graph diffus
 # Start the server (NoopEmbedder + SQLite)
 cargo run --release -p merkur-server -- --config config.example.yaml
 
+# Set your bearer token (must match config.example.yaml auth.tokens)
+export MERKUR_TOKEN='replace-me-with-a-strong-token'
+
 # Write a memory
 curl -X POST localhost:1934/v1/write \
+  -H "Authorization: Bearer $MERKUR_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"content":"v8 GC is generational","context":{"agent":"assistant"}}'
 
 # Search
-curl 'localhost:1934/v1/search?q=v8+gc&mode=fast'
+curl -H "Authorization: Bearer $MERKUR_TOKEN" \
+  'localhost:1934/v1/search?q=v8+gc&mode=fast'
 
 # Graph diffusion search
-curl 'localhost:1934/v1/search?q=v8&mode=deep&depth=2&include_graph=true'
+curl -H "Authorization: Bearer $MERKUR_TOKEN" \
+  'localhost:1934/v1/search?q=v8&mode=deep&depth=2&include_graph=true'
 
-# Status
-curl localhost:1934/v1/status
+# Health (no auth required)
+curl localhost:1934/v1/health
 ```
 
 ## Key Features
@@ -95,7 +101,7 @@ crates/
 
 ## Roadmap
 
-### Completed (v0.1.0)
+### Completed (v0.1.0 → v0.3.0)
 
 | Category | Feature |
 |----------|---------|
@@ -112,17 +118,7 @@ crates/
 | DevOps | Docker, GitHub Actions CI, OpenAPI 3.0 spec |
 | Docs | README + ARCHITECTURE + SPEC + config example |
 
-### In Progress (v0.2.0)
-
-| Priority | Feature | Description |
-|----------|---------|-------------|
-| P0 | Test coverage | LanceDB tests, LlmConsolidator mock tests, `update_memory` test |
-| P0 | Prometheus metrics | `/v1/metrics` — request count, latency, memory stats, consolidation runs |
-| P1 | Storage stats | Status endpoint: vector index memory usage, SQLite file size |
-| P1 | Rate limiting | Token bucket per IP, configurable via YAML |
-| P1 | Health details | `/v1/health` with DB connectivity check, embedder probe |
-
-### Planned (v0.3.0+)
+### Planned (v0.4.0+)
 
 | Priority | Feature | Description |
 |----------|---------|-------------|

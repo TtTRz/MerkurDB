@@ -53,37 +53,50 @@ Each mechanism maps to a known model of human memory:
 
 ## 4. Data Flow
 
-```
-Write:  Agent → POST /v1/write
-         ├─→ Embedder Plugin: generate embedding
-         ├─→ Storage: persist to SQLite + update vector index
-         └─→ Return { id, status: "ok" }
+```mermaid
+flowchart TB
+    subgraph Write Path
+        A[Agent] -->|POST /v1/write| E[Embedder]
+        E -->|embedding| S[Storage]
+        S -->|id| A
+    end
 
-Search: Agent → GET /v1/search?mode=fast|deep
-         ├─ S1 fast: Embedder → vector top-k → SQLite metadata enrichment
-         └─ S2 deep: S1 seeds → SQLite CTE BFS graph diffusion → aggregation
+    subgraph Search Path
+        A2[Agent] -->|GET /v1/search| E2[Embedder]
+        E2 -->|query vec| VS[Vector Search]
+        VS -->|mode=fast| R[Results]
+        VS -->|mode=deep| BFS[BFS Graph Diffusion]
+        BFS --> R
+    end
 
-Background: Scheduler periodic tasks
-         ├─→ Consolidator: scan pending → LLM summary → build edges
-         └─→ Forgetter: weight decay → downgrade → archive cleanup
+    subgraph Background
+        SCH[Scheduler] -->|periodic| CON[Consolidator]
+        CON -->|abstract + edges| S2[Storage]
+        SCH -->|periodic| FOR[Forgetter]
+        FOR -->|downgrade/archive| S2
+    end
 ```
 
 ## 5. Memory Lifecycle
 
+```mermaid
+stateDiagram-v2
+    [*] --> Full: POST /v1/write (weight=1.0, pending=true)
+    Full --> Full: consolidate (abstract + edges, pending=false)
+    Full --> Full: GET /v1/memory (access_count++)
+    Full --> Summary: w < 0.3
+    Summary --> Title: w < 0.2
+    Title --> Archived: w < 0.1
+    Archived --> [*]: physically deleted after 30d
 ```
-Write (Full, weight=1.0, pending=true)
-  │
-  ├─→ [Consolidator processing] → generate abstract + edges → pending=false
-  │
-  ├─→ [Every get_memory read] → access_count++, accessed_at updated
-  │
-  └─→ [Forgetter periodic evaluation]
-        w(t) = w₀ · α^(Δt/d) · (1 + β · log₂(1+n))
 
-        Full (L2)    w < 0.3 → Summary (L1)
-        Summary (L1) w < 0.2 → Title (L0)
-        Title (L0)   w < 0.1 → Archive (L-1)
-        Archive               → physically deleted after 30 days
+```
+w(t) = w₀ · exp(-Δt · ln2 / h) · min(1 + β · log₂(1+n), 3.0)
+
+Full (L2)    w < 0.3 → Summary (L1)
+Summary (L1) w < 0.2 → Title (L0)
+Title (L0)   w < 0.1 → Archive (L-1)
+Archive               → physically deleted after 30 days
 ```
 
 ## 6. Configuration-Driven

@@ -183,15 +183,24 @@ impl HttpMerkurClient {
 
     async fn parse_or_error(resp: reqwest::Response) -> ClientResult<serde_json::Value> {
         let status = resp.status();
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let text = resp.text().await.unwrap_or_default();
+        let body: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         if status.is_success() {
             Ok(body)
         } else {
             let error = &body["error"];
-            Err(ClientError::Api {
-                code: error["code"].as_str().unwrap_or("UNKNOWN").into(),
-                message: error["message"].as_str().unwrap_or("Unknown error").into(),
-            })
+            let code = error["code"].as_str().unwrap_or("UNKNOWN").into();
+            let message = error["message"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "HTTP {status}: {}",
+                        text.chars().take(200).collect::<String>()
+                    )
+                });
+            Err(ClientError::Api { code, message })
         }
     }
 

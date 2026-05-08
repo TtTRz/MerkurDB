@@ -20,12 +20,6 @@ pub enum MerkurError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
-    #[error("Unauthorized")]
-    Unauthorized,
-
-    #[error("External service timeout")]
-    Timeout,
-
     #[error("Internal error: {0}")]
     Internal(String),
 }

@@ -40,7 +40,6 @@ pub trait Storage: Send + Sync {
     async fn delete_memory(&self, id: &str) -> MerkurResult<()>;
 
     async fn vector_search(&self, vec: &[f32], limit: usize) -> MerkurResult<Vec<ScoredMemory>>;
-    async fn rebuild_vector_index(&self, all: &[(String, Vec<f32>)]) -> MerkurResult<()>;
 
     async fn insert_edge(&self, edge: &NewEdge) -> MerkurResult<()>;
     async fn get_edges(&self, memory_id: &str) -> MerkurResult<Vec<crate::Edge>>;

@@ -88,9 +88,8 @@ pub async fn search(
         }
     };
 
-    let mut filtered: Vec<_> = results
+    let mut candidates: Vec<_> = results
         .into_iter()
-        .filter(|r| r.score >= threshold)
         .filter(|r| level_filter.as_ref().is_none_or(|ls| ls.contains(&r.level)))
         .filter(|r| {
             params
@@ -106,7 +105,7 @@ pub async fn search(
         && let Ok(ctx_filter) = serde_json::from_str::<serde_json::Value>(ctx_str)
         && let Some(obj) = ctx_filter.as_object()
     {
-        for r in &mut filtered {
+        for r in &mut candidates {
             let mut boost = 0.0;
             for (k, v) in obj {
                 if let Some(val) = r.context.get(k)
@@ -117,12 +116,13 @@ pub async fn search(
             }
             r.score += boost;
         }
-        filtered.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
     }
+
+    let mut filtered: Vec<_> = candidates
+        .into_iter()
+        .filter(|r| r.score >= threshold)
+        .collect();
+    filtered.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     let total = filtered.len();
     let paginated: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();

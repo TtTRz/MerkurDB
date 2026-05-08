@@ -40,6 +40,7 @@ paths:
       tags: [Admin]
       summary: Health check
       operationId: health
+      security: []
       responses:
         "200":
           description: Service healthy
@@ -399,6 +400,18 @@ paths:
                   status:
                     type: string
                     example: edge_created
+        "400":
+          description: Self-edge or invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Source or target memory not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /relate-batch:
     post:
@@ -451,6 +464,12 @@ paths:
                     type: array
                     items:
                       type: object
+        "400":
+          description: Batch exceeds limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /consolidate:
     post:

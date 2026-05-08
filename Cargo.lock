@@ -3371,7 +3371,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -3413,6 +3412,7 @@ dependencies = [
  "merkur-storage",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tower",
  "tower-http",

@@ -262,7 +262,10 @@ async fn test_get_edges_batch() -> MerkurResult<()> {
 async fn test_update_abstract() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
     let id = storage
-        .insert_memory(&new_test_memory("deep content", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .insert_memory(&new_test_memory(
+            "deep content",
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+        ))
         .await?;
 
     storage.update_abstract(&id, "summarized").await?;

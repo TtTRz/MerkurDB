@@ -79,12 +79,6 @@ impl From<MerkurError> for ApiError {
                 code: "BAD_REQUEST",
                 message: msg,
             },
-            MerkurError::Unauthorized => ApiError::unauthorized(),
-            MerkurError::Timeout => ApiError {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                code: "TIMEOUT",
-                message: "External service timeout".into(),
-            },
             MerkurError::Config(msg) => {
                 error!("config error: {msg}");
                 ApiError::internal("Server configuration error")

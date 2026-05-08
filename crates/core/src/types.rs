@@ -150,7 +150,7 @@ impl ConsolidationReport {
 pub struct ConsolidationLogEntry {
     pub id: i64,
     pub started_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
+    pub finished_at: DateTime<Utc>,
     pub memories_processed: i64,
     pub edges_created: i64,
     pub errors: i64,

@@ -200,9 +200,10 @@ impl Storage for SqliteStorage {
         embedding: Option<&[f32]>,
     ) -> MerkurResult<()> {
         let embedding_blob = embedding.map(vec_f32_to_bytes);
-        let id_owned = id.to_string();
-        let content_owned = content.to_string();
+        let id = id.to_string();
+        let content = content.to_string();
         let pool = self.pool.clone();
+        let id_clone = id.clone();
 
         let affected = run_blocking(move || -> MerkurResult<usize> {
             let conn = pool
@@ -210,19 +211,19 @@ impl Storage for SqliteStorage {
                 .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
             conn.execute(
                 "UPDATE memories SET content = ?1, embedding = ?2, pending_consolidation = 1, updated_at = ?3 WHERE id = ?4",
-                params![content_owned, embedding_blob, Utc::now().to_rfc3339(), id_owned],
+                params![content, embedding_blob, Utc::now().to_rfc3339(), id_clone],
             )
             .map_err(|e| MerkurError::Storage(format!("Failed to update memory: {e}")))
         })
         .await?;
 
         if affected == 0 {
-            return Err(MerkurError::MemoryNotFound(id.to_string()));
+            return Err(MerkurError::MemoryNotFound(id.clone()));
         }
         if let Some(vec) = embedding {
-            self.vector_index.add(id.to_string(), vec.to_vec());
+            self.vector_index.add(id.clone(), vec.to_vec());
         } else {
-            self.vector_index.remove(id);
+            self.vector_index.remove(&id);
         }
         Ok(())
     }
@@ -443,11 +444,6 @@ impl Storage for SqliteStorage {
         });
 
         Ok(out)
-    }
-
-    async fn rebuild_vector_index(&self, all: &[(String, Vec<f32>)]) -> MerkurResult<()> {
-        self.vector_index.rebuild(all.to_vec());
-        Ok(())
     }
 
     async fn insert_edge(&self, edge: &NewEdge) -> MerkurResult<()> {
