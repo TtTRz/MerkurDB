@@ -3,6 +3,8 @@ mod auth;
 mod config;
 mod error;
 mod handlers;
+mod metrics;
+mod rate_limit;
 mod router;
 mod scheduler;
 
@@ -38,6 +40,7 @@ async fn main() -> Result<()> {
     };
 
     init_tracing(&cfg.logging);
+    metrics::init_metrics();
 
     info!(
         "MerkurDB v{} starting (host={}, port={})",
@@ -258,12 +261,15 @@ fn build_consolidator(cfg: &config::Config) -> Result<Arc<dyn Consolidator>> {
                 .as_ref()
                 .context("Missing [plugins.consolidator.llm] config")?;
             info!(
-                "Using LlmConsolidator: base_url={}, model={}",
-                lc.base_url, lc.model
+                "Using LlmConsolidator: base_url={}, model={}, backend={:?}",
+                lc.base_url,
+                lc.model,
+                lc.backend()
             );
             Ok(Arc::new(LlmConsolidator::new(
                 lc.base_url.clone(),
                 lc.model.clone(),
+                lc.backend(),
             )?))
         }
         _ => {

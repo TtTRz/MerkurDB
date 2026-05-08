@@ -8,12 +8,18 @@ use serde_json::json;
 use crate::app_state::AppState;
 use crate::error::ApiResult;
 
-pub async fn health() -> impl IntoResponse {
+pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let db_ok = state.storage.stats().await.is_ok();
+    let status = if db_ok { "ok" } else { "degraded" };
     (
         StatusCode::OK,
         Json(json!({
-            "status": "ok",
-            "version": env!("CARGO_PKG_VERSION")
+            "status": status,
+            "version": env!("CARGO_PKG_VERSION"),
+            "checks": {
+                "database": if db_ok { "ok" } else { "error" },
+                "embedder_dim": state.embedder.dim(),
+            }
         })),
     )
 }

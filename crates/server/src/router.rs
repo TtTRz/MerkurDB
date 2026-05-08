@@ -7,11 +7,13 @@ use merkur_core::limits;
 use crate::app_state::AppState;
 use crate::auth::require_auth;
 use crate::handlers;
+use crate::metrics;
+use crate::rate_limit;
 
 pub fn create_router(state: AppState) -> Router {
-    // `/v1/health` is intentionally outside the auth middleware so health checks
-    // and load balancers don't need to carry credentials.
-    let public = Router::new().route("/v1/health", get(handlers::admin::health));
+    let public = Router::new()
+        .route("/v1/health", get(handlers::admin::health))
+        .route("/v1/metrics", get(metrics::metrics_handler));
 
     let protected = Router::new()
         .route("/v1/write", post(handlers::write::write))
@@ -37,6 +39,11 @@ pub fn create_router(state: AppState) -> Router {
 
     public
         .merge(protected)
+        .layer(middleware::from_fn(metrics::track))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::check_rate_limit,
+        ))
         .layer(DefaultBodyLimit::max(limits::MAX_BODY_BYTES))
         .with_state(state)
 }

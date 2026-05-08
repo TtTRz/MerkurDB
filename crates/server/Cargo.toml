@@ -34,6 +34,10 @@ tracing-subscriber.workspace = true
 chrono.workspace = true
 anyhow = "1"
 subtle = "2"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+governor = "0.8"
+tower = "0.5"
 [dev-dependencies]
 tower = "0.5"
 tokio = { workspace = true, features = ["test-util"] }
