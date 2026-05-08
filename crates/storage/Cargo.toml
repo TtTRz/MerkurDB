@@ -29,6 +29,11 @@ futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "vector_bench"
+harness = false
 
 [features]
 lancedb = ["dep:lancedb", "dep:arrow-array", "dep:arrow-schema", "dep:futures"]
