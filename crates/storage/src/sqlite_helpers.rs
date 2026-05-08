@@ -9,6 +9,17 @@ use rusqlite::params;
 use std::collections::HashMap;
 use tracing::warn;
 
+type BfsRow = (
+    String,
+    i32,
+    f64,
+    String,
+    Option<String>,
+    i32,
+    String,
+    String,
+);
+
 /// Build a connection pool that enforces `foreign_keys=ON` on every connection.
 ///
 /// SQLite's `foreign_keys` PRAGMA is per-connection, so DDL that merely sets it
@@ -133,20 +144,28 @@ pub fn bfs_expand(
         )
         .map_err(|e| MerkurError::Storage(format!("BFS query failed: {e}")))?;
 
+    // Collect all rows first, then batch-fetch context_tags.
     let mut seen = std::collections::HashSet::new();
-    let mut results = Vec::new();
+    let mut intermediate: Vec<BfsRow> = Vec::new();
     for row in rows {
-        let (id, bfs_depth, weight, content, abstract_, level_i32, category, created_at) =
-            row.map_err(|e| MerkurError::Storage(format!("Row error: {e}")))?;
-        if !seen.insert(id.clone()) {
+        let tuple = row.map_err(|e| MerkurError::Storage(format!("Row error: {e}")))?;
+        if !seen.insert(tuple.0.clone()) {
             continue;
         }
+        intermediate.push(tuple);
+    }
 
+    let neighbor_ids: Vec<String> = intermediate.iter().map(|t| t.0.clone()).collect();
+    let mut ctx_map = get_context_tags_batch(pool, &neighbor_ids)?;
+
+    let mut results = Vec::with_capacity(intermediate.len());
+    for (id, bfs_depth, weight, content, abstract_, level_i32, category, created_at) in intermediate
+    {
         let level = MemoryLevel::from_i32(level_i32);
         let decay = 0.5_f64.powi(bfs_depth);
         let score = decay * weight;
         let created_at = parse_rfc3339(&created_at);
-        let context = get_context_tags(pool, &id)?;
+        let context = ctx_map.remove(&id).unwrap_or_default();
 
         results.push(ScoredMemory {
             id,
@@ -266,11 +285,7 @@ pub fn list_forgetting_ids(
         .collect())
 }
 
-/// Mark memories as consolidated.
-///
-/// The list of ids is sent as a single JSON parameter via `json_each(?)`,
-/// avoiding the positional-placeholder bookkeeping that would otherwise bump
-/// against SQLite's `SQLITE_MAX_VARIABLE_NUMBER`.
+/// Mark memories as consolidated via `json_each(?1)`.
 pub fn mark_consolidated(pool: &Pool<SqliteConnectionManager>, ids: &[String]) -> MerkurResult<()> {
     if ids.is_empty() {
         return Ok(());
@@ -437,6 +452,42 @@ pub fn get_context_tags(
     Ok(context)
 }
 
+/// Batch-fetch context tags for multiple memories via `json_each(?1)`.
+pub fn get_context_tags_batch(
+    pool: &Pool<SqliteConnectionManager>,
+    memory_ids: &[String],
+) -> MerkurResult<HashMap<String, HashMap<String, String>>> {
+    if memory_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids_json = serde_json::to_string(memory_ids)
+        .map_err(|e| MerkurError::Storage(format!("Failed to encode ids: {e}")))?;
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT memory_id, key, value FROM context_tags
+             WHERE memory_id IN (SELECT value FROM json_each(?1))",
+        )
+        .map_err(|e| MerkurError::Storage(format!("Failed to prepare ctx batch: {e}")))?;
+    let rows = stmt
+        .query_map(params![ids_json], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| MerkurError::Storage(format!("Ctx batch failed: {e}")))?;
+    let mut by_id: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for r in rows {
+        let (mid, k, v) = r.map_err(|e| MerkurError::Storage(format!("Row error: {e}")))?;
+        by_id.entry(mid).or_default().insert(k, v);
+    }
+    Ok(by_id)
+}
+
 /// Get edges for a memory (both as source and target).
 pub fn get_edges(pool: &Pool<SqliteConnectionManager>, memory_id: &str) -> MerkurResult<Vec<Edge>> {
     let conn = pool
@@ -469,8 +520,7 @@ pub fn get_edges(pool: &Pool<SqliteConnectionManager>, memory_id: &str) -> Merku
     Ok(edges)
 }
 
-/// Batch-fetch edges for a set of memory IDs, returning (memory_id, edge) pairs
-/// so the caller can group them. Uses a single query with `IN`.
+/// Batch-fetch edges for a set of memory IDs via `json_each(?1)`.
 pub fn get_edges_batch(
     pool: &Pool<SqliteConnectionManager>,
     memory_ids: &[String],
@@ -521,15 +571,8 @@ pub fn get_edges_batch(
     Ok(by_mem)
 }
 
-/// Update access tracking for a batch of memories.
-///
-/// Errors are logged and swallowed — access bookkeeping must never fail a read
-/// request — but every failure still surfaces a `warn!` record so the problem
-/// is observable via the log pipeline.
-///
-/// Uses `json_each(?)` so the list of ids is sent as a single parameter
-/// regardless of size, sidestepping SQLite's `SQLITE_MAX_VARIABLE_NUMBER` and
-/// the bookkeeping of emitting positional placeholders.
+/// Update access tracking for a batch of memories. Errors are logged, not
+/// propagated — access bookkeeping must never fail a read request.
 pub fn update_access(pool: &Pool<SqliteConnectionManager>, ids: &[String]) {
     if ids.is_empty() {
         return;
@@ -557,9 +600,7 @@ pub fn update_access(pool: &Pool<SqliteConnectionManager>, ids: &[String]) {
     }
 }
 
-/// Confirm a memory exists, returning `MemoryNotFound` otherwise. Useful for
-/// validating foreign-key-like preconditions at the application level on top of
-/// whatever the schema enforces.
+/// Check if a memory exists.
 pub fn memory_exists(pool: &Pool<SqliteConnectionManager>, id: &str) -> MerkurResult<bool> {
     let conn = pool
         .get()
@@ -572,4 +613,55 @@ pub fn memory_exists(pool: &Pool<SqliteConnectionManager>, id: &str) -> MerkurRe
         )
         .map_err(|e| MerkurError::Storage(format!("memory_exists failed: {e}")))?;
     Ok(count > 0)
+}
+
+/// Batch existence check via `json_each(?1)`. Returns the subset of `ids`
+/// that exist in the `memories` table.
+pub fn memory_exists_batch(
+    pool: &Pool<SqliteConnectionManager>,
+    ids: &[String],
+) -> MerkurResult<std::collections::HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let ids_json = serde_json::to_string(ids)
+        .map_err(|e| MerkurError::Storage(format!("Failed to encode ids: {e}")))?;
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM memories
+             WHERE id IN (SELECT value FROM json_each(?1))",
+        )
+        .map_err(|e| MerkurError::Storage(format!("memory_exists_batch prepare failed: {e}")))?;
+    let rows = stmt
+        .query_map(params![ids_json], |row| row.get::<_, String>(0))
+        .map_err(|e| MerkurError::Storage(format!("memory_exists_batch query failed: {e}")))?;
+    let mut found = std::collections::HashSet::new();
+    for r in rows {
+        found.insert(r.map_err(|e| MerkurError::Storage(format!("Row error: {e}")))?);
+    }
+    Ok(found)
+}
+
+/// Set the consolidation abstract on a memory.
+pub fn update_abstract(
+    pool: &Pool<SqliteConnectionManager>,
+    id: &str,
+    abstract_: &str,
+) -> MerkurResult<()> {
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+    let affected = conn
+        .execute(
+            "UPDATE memories SET abstract = ?1, updated_at = ?2 WHERE id = ?3",
+            params![abstract_, Utc::now().to_rfc3339(), id],
+        )
+        .map_err(|e| MerkurError::Storage(format!("update_abstract failed: {e}")))?;
+    if affected == 0 {
+        return Err(MerkurError::MemoryNotFound(id.to_string()));
+    }
+    Ok(())
 }

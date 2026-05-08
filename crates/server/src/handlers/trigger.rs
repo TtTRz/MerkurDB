@@ -110,11 +110,40 @@ pub async fn relate_batch(
             limits::MAX_BATCH_ITEMS
         )));
     }
+
+    let mut id_pool: HashSet<String> = HashSet::new();
+    for r in &req.edges {
+        id_pool.insert(r.source_id.clone());
+        id_pool.insert(r.target_id.clone());
+    }
+    let id_pool_vec: Vec<String> = id_pool.iter().cloned().collect();
+    let existing = state.storage.memory_exists_batch(&id_pool_vec).await?;
+
     let mut created = 0;
     let mut errors = Vec::new();
     for (i, r) in req.edges.iter().enumerate() {
-        if let Err(e) = validate_edge(&state, &r.source_id, &r.target_id).await {
-            errors.push(json!({"index": i, "code": e.code, "message": e.message}));
+        if r.source_id == r.target_id {
+            errors.push(json!({
+                "index": i,
+                "code": "BAD_REQUEST",
+                "message": "source_id and target_id must differ (no self-edges)"
+            }));
+            continue;
+        }
+        if !existing.contains(&r.source_id) {
+            errors.push(json!({
+                "index": i,
+                "code": "NOT_FOUND",
+                "message": format!("source memory {} not found", r.source_id)
+            }));
+            continue;
+        }
+        if !existing.contains(&r.target_id) {
+            errors.push(json!({
+                "index": i,
+                "code": "NOT_FOUND",
+                "message": format!("target memory {} not found", r.target_id)
+            }));
             continue;
         }
         let edge = NewEdge {
@@ -163,18 +192,20 @@ pub async fn get_graph(
     let seeds = std::slice::from_ref(&id);
     let neighborhood = state.storage.bfs_expand(seeds, depth, degree_limit).await?;
 
-    // Include edges for every node in the neighborhood plus the center, so the
-    // returned graph reflects the actual local structure rather than a star.
     let mut node_ids: HashSet<String> = neighborhood.iter().map(|m| m.id.clone()).collect();
     node_ids.insert(id.clone());
+    let node_id_list: Vec<String> = node_ids.iter().cloned().collect();
+    let edges_by_node = state
+        .storage
+        .get_edges_batch(&node_id_list)
+        .await
+        .unwrap_or_default();
     let mut all_edges = Vec::new();
     let mut seen_edge_ids: HashSet<i64> = HashSet::new();
-    for nid in &node_ids {
-        if let Ok(edges) = state.storage.get_edges(nid).await {
-            for e in edges {
-                if seen_edge_ids.insert(e.id) {
-                    all_edges.push(e);
-                }
+    for edges in edges_by_node.values() {
+        for e in edges {
+            if seen_edge_ids.insert(e.id) {
+                all_edges.push(e.clone());
             }
         }
     }

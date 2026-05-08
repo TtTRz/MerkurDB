@@ -3335,7 +3335,7 @@ dependencies = [
 
 [[package]]
 name = "merkur-client"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3349,7 +3349,7 @@ dependencies = [
 
 [[package]]
 name = "merkur-consolidators"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3363,7 +3363,7 @@ dependencies = [
 
 [[package]]
 name = "merkur-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3376,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "merkur-embedders"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "merkur-core",
@@ -3391,7 +3391,7 @@ dependencies = [
 
 [[package]]
 name = "merkur-forgetters"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "merkur-core",
@@ -3400,7 +3400,7 @@ dependencies = [
 
 [[package]]
 name = "merkur-server"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3422,7 +3422,7 @@ dependencies = [
 
 [[package]]
 name = "merkur-storage"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",

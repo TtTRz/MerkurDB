@@ -196,3 +196,118 @@ async fn test_memory_exists() -> MerkurResult<()> {
     assert!(!storage.memory_exists("mem_zzz").await?);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_memory_exists_batch() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let id1 = storage
+        .insert_memory(&new_test_memory("A", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+    let id2 = storage
+        .insert_memory(&new_test_memory("B", Some(vec![0.0, 1.0, 0.0, 0.0])))
+        .await?;
+
+    let candidates = vec![id1.clone(), id2.clone(), "mem_nonexistent".to_string()];
+    let existing = storage.memory_exists_batch(&candidates).await?;
+    assert!(existing.contains(&id1));
+    assert!(existing.contains(&id2));
+    assert!(!existing.contains("mem_nonexistent"));
+    assert_eq!(existing.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_edges_batch() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let a = storage
+        .insert_memory(&new_test_memory("A", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+    let b = storage
+        .insert_memory(&new_test_memory("B", Some(vec![0.0, 1.0, 0.0, 0.0])))
+        .await?;
+    let c = storage
+        .insert_memory(&new_test_memory("C", Some(vec![0.0, 0.0, 1.0, 0.0])))
+        .await?;
+
+    storage
+        .insert_edge(&NewEdge {
+            source_id: a.clone(),
+            target_id: b.clone(),
+            weight: Some(1.0),
+            relation: None,
+            edge_type: EdgeType::Auto,
+        })
+        .await?;
+    storage
+        .insert_edge(&NewEdge {
+            source_id: b.clone(),
+            target_id: c.clone(),
+            weight: Some(0.5),
+            relation: None,
+            edge_type: EdgeType::Auto,
+        })
+        .await?;
+
+    let batch = storage
+        .get_edges_batch(&[a.clone(), b.clone(), c.clone()])
+        .await?;
+    // 'a' has outgoing edge to b
+    assert!(!batch.get(&a).unwrap_or(&vec![]).is_empty());
+    // 'b' has edges in both directions
+    assert!(!batch.get(&b).unwrap_or(&vec![]).is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_update_abstract() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let id = storage
+        .insert_memory(&new_test_memory("deep content", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+
+    storage.update_abstract(&id, "summarized").await?;
+
+    let mem = storage.get_memory(&id).await?.unwrap();
+    assert_eq!(mem.abstract_.as_deref(), Some("summarized"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_get_memory_no_embedding() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let id = storage
+        .insert_memory(&new_test_memory(
+            "test embedding exclusion",
+            Some(vec![1.0, 2.0, 3.0, 4.0]),
+        ))
+        .await?;
+
+    // get_memory should NOT return the embedding blob (HV7 optimization).
+    let mem = storage.get_memory(&id).await?.unwrap();
+    assert!(
+        mem.embedding.is_none(),
+        "get_memory should not return embedding"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_norms_consistent_after_upsert_remove() -> MerkurResult<()> {
+    use merkur_storage::InMemoryVectorIndex;
+
+    let idx = InMemoryVectorIndex::new(3);
+    idx.add("a".into(), vec![3.0, 4.0, 0.0]); // norm = 5
+    idx.add("b".into(), vec![0.0, 0.0, 1.0]); // norm = 1
+    idx.add("c".into(), vec![1.0, 1.0, 1.0]); // norm ≈ 1.732
+
+    // Remove 'a' (swap-removes with 'c'). After removal, search must still
+    // return correct cosine scores for 'b' and 'c'.
+    idx.remove("a");
+    assert_eq!(idx.len(), 2);
+
+    let results = idx.search(&[0.0, 0.0, 1.0], 2);
+    // 'b' should rank first (perfectly aligned)
+    assert_eq!(results[0].0, "b");
+    assert!((results[0].1 - 1.0).abs() < 1e-9);
+    Ok(())
+}

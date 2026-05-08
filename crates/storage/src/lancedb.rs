@@ -3,6 +3,7 @@ use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use chrono::Utc;
+use lancedb::index::Index;
 use merkur_core::{
     ConsolidationLogEntry, ConsolidationReport, Edge, Memory, MemoryLevel, MerkurError,
     MerkurResult, NewEdge, NewMemory, ScoredMemory, Storage, StorageStats,
@@ -12,13 +13,12 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::sqlite_helpers;
 
-/// Same DDL semantics as `SqliteStorage`. The pool's init hook (in
-/// `sqlite_helpers::build_pool`) takes care of `foreign_keys` and `journal_mode`.
 const DDL: &str = "
 CREATE TABLE IF NOT EXISTS memories (
     id                     TEXT PRIMARY KEY,
@@ -77,11 +77,15 @@ CREATE TABLE IF NOT EXISTS consolidate_log (
 
 const VECTOR_TABLE: &str = "vectors";
 
+/// Minimum rows before auto-building a vector index.
+const INDEX_THRESHOLD: usize = 256;
+
 pub struct LanceDbStorage {
     db: lancedb::Connection,
     sqlite_pool: Pool<SqliteConnectionManager>,
     table_name: String,
     dim: usize,
+    index_building: Arc<AtomicBool>,
 }
 
 async fn run_blocking<F, T>(f: F) -> MerkurResult<T>
@@ -115,6 +119,7 @@ impl LanceDbStorage {
             sqlite_pool,
             table_name: VECTOR_TABLE.to_string(),
             dim,
+            index_building: Arc::new(AtomicBool::new(false)),
         };
 
         storage.ensure_vector_table().await?;
@@ -157,11 +162,46 @@ impl LanceDbStorage {
             .await
             .map_err(|e| MerkurError::Storage(format!("Failed to create vector table: {e}")))?;
 
-        // Note: we deliberately do not call `create_index` on an empty table.
-        // LanceDB recommends building the index after at least a few hundred
-        // rows are present. Index creation is deferred to a runtime trigger
-        // (rebuild_vector_index or a future periodic job).
         Ok(())
+    }
+
+    fn spawn_index_builder(&self) {
+        if self.index_building.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let db = self.db.clone();
+        let table_name = self.table_name.clone();
+        let flag = self.index_building.clone();
+
+        tokio::spawn(async move {
+            let result = async {
+                let table = db
+                    .open_table(&table_name)
+                    .execute()
+                    .await
+                    .map_err(|e| format!("open table: {e}"))?;
+                let count = table
+                    .count_rows(None)
+                    .await
+                    .map_err(|e| format!("count rows: {e}"))?;
+                if count < INDEX_THRESHOLD {
+                    return Ok::<(), String>(());
+                }
+                table
+                    .create_index(&["vector"], Index::Auto)
+                    .execute()
+                    .await
+                    .map_err(|e| format!("create index: {e}"))?;
+                info!(rows = count, "LanceDB vector index built/rebuilt");
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = result {
+                warn!("LanceDB index build failed: {e}");
+            }
+            flag.store(false, Ordering::Release);
+        });
     }
 
     async fn get_table(&self) -> MerkurResult<lancedb::Table> {
@@ -243,11 +283,6 @@ impl Storage for LanceDbStorage {
 
             let table = self.get_table().await?;
             if let Err(e) = table.add(vec![batch]).execute().await {
-                // Best-effort rollback of SQLite to avoid orphaned rows. We
-                // delete the memory we just inserted so the subsequent retry
-                // isn't blocked by a unique-id collision. If the rollback
-                // itself fails (swallowed below), the row stays — hence error!
-                // rather than warn! so the incident shows up in alert queries.
                 error!("LanceDB add failed after SQLite insert; rolling back: {e}");
                 let pool2 = self.sqlite_pool.clone();
                 let id_owned = id.clone();
@@ -267,6 +302,8 @@ impl Storage for LanceDbStorage {
                 )));
             }
         }
+
+        self.spawn_index_builder();
 
         Ok(id)
     }
@@ -301,11 +338,10 @@ impl Storage for LanceDbStorage {
         let table = self.get_table().await?;
         let safe_id = Self::quote_id_strict(id)?;
         let filter = format!("id = {safe_id}");
-        // Always remove the prior vector. If the caller supplied a new one,
-        // insert it. If they didn't (embedding = None), the row in LanceDB is
-        // dropped — keeping semantics aligned with SqliteStorage, which clears
-        // the embedding column when None is passed.
-        let _ = table.delete(&filter).await;
+        table
+            .delete(&filter)
+            .await
+            .map_err(|e| MerkurError::Storage(format!("Failed to delete old vector: {e}")))?;
 
         if let Some(vec) = embedding_vec {
             let schema = self.vector_schema();
@@ -429,8 +465,6 @@ impl Storage for LanceDbStorage {
 
         let table = self.get_table().await?;
 
-        // Oversample so post-filtering of archived rows doesn't shrink output
-        // below the caller's `limit`.
         let oversample = limit.saturating_mul(2).max(limit);
         let results: Vec<_> = table
             .query()
@@ -444,10 +478,7 @@ impl Storage for LanceDbStorage {
             .await
             .map_err(|e| MerkurError::Storage(format!("Failed to collect results: {e}")))?;
 
-        // Map LanceDB L2 distance to a cosine-style similarity in [-1, 1] for
-        // L2-normalized vectors using the identity cos = 1 - d^2 / 2. For
-        // unnormalized vectors this is approximate; callers should normalize
-        // their embeddings if the absolute score matters.
+        // cos = 1 - d² / 2 (exact for L2-normalized vectors).
         let mut id_score: HashMap<String, f64> = HashMap::new();
         for batch in results {
             let id_col = batch
@@ -590,6 +621,20 @@ impl Storage for LanceDbStorage {
     }
 
     async fn rebuild_vector_index(&self, _all: &[(String, Vec<f32>)]) -> MerkurResult<()> {
+        let table = self.get_table().await?;
+        let count = table
+            .count_rows(None)
+            .await
+            .map_err(|e| MerkurError::Storage(format!("Failed to count rows: {e}")))?;
+        if count < INDEX_THRESHOLD {
+            return Ok(());
+        }
+        table
+            .create_index(&["vector"], Index::Auto)
+            .execute()
+            .await
+            .map_err(|e| MerkurError::Storage(format!("Failed to build vector index: {e}")))?;
+        info!(rows = count, "LanceDB vector index rebuilt");
         Ok(())
     }
 
@@ -603,6 +648,15 @@ impl Storage for LanceDbStorage {
         let id_owned = memory_id.to_string();
         let pool = self.sqlite_pool.clone();
         run_blocking(move || sqlite_helpers::get_edges(&pool, &id_owned)).await
+    }
+
+    async fn get_edges_batch(
+        &self,
+        memory_ids: &[String],
+    ) -> MerkurResult<HashMap<String, Vec<Edge>>> {
+        let ids = memory_ids.to_vec();
+        let pool = self.sqlite_pool.clone();
+        run_blocking(move || sqlite_helpers::get_edges_batch(&pool, &ids)).await
     }
 
     async fn bfs_expand(
@@ -672,6 +726,14 @@ impl Storage for LanceDbStorage {
         let id_owned = id.to_string();
         let pool = self.sqlite_pool.clone();
         run_blocking(move || sqlite_helpers::update_level(&pool, &id_owned, level)).await
+    }
+
+    async fn update_abstract(&self, id: &str, abstract_: &str) -> MerkurResult<()> {
+        let id_owned = id.to_string();
+        let abstract_owned = abstract_.to_string();
+        let pool = self.sqlite_pool.clone();
+        run_blocking(move || sqlite_helpers::update_abstract(&pool, &id_owned, &abstract_owned))
+            .await
     }
 
     async fn delete_archived_older_than(&self, days: i32) -> MerkurResult<usize> {
@@ -748,5 +810,14 @@ impl Storage for LanceDbStorage {
         let id_owned = id.to_string();
         let pool = self.sqlite_pool.clone();
         run_blocking(move || sqlite_helpers::memory_exists(&pool, &id_owned)).await
+    }
+
+    async fn memory_exists_batch(
+        &self,
+        ids: &[String],
+    ) -> MerkurResult<std::collections::HashSet<String>> {
+        let ids = ids.to_vec();
+        let pool = self.sqlite_pool.clone();
+        run_blocking(move || sqlite_helpers::memory_exists_batch(&pool, &ids)).await
     }
 }

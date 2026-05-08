@@ -12,9 +12,11 @@ pub struct InMemoryVectorIndex {
 }
 
 struct Inner {
-    /// Parallel storage: `ids[i]` corresponds to `vectors[i]`.
+    /// Parallel storage: `ids[i]` corresponds to `vectors[i]` and `norms[i]`.
     ids: Vec<String>,
     vectors: Vec<Vec<f32>>,
+    /// Pre-computed L2 norms — avoids O(dim) per candidate during search.
+    norms: Vec<f64>,
     /// id → index position in the vectors array.
     index_of: HashMap<String, usize>,
 }
@@ -24,33 +26,38 @@ impl Inner {
         Self {
             ids: Vec::new(),
             vectors: Vec::new(),
+            norms: Vec::new(),
             index_of: HashMap::new(),
         }
     }
 
     fn upsert(&mut self, id: String, vec: Vec<f32>) {
+        let norm = l2_norm(&vec);
         if let Some(&idx) = self.index_of.get(&id) {
             self.vectors[idx] = vec;
+            self.norms[idx] = norm;
         } else {
             let idx = self.ids.len();
             self.index_of.insert(id.clone(), idx);
             self.ids.push(id);
             self.vectors.push(vec);
+            self.norms.push(norm);
         }
     }
 
     fn remove(&mut self, id: &str) {
         if let Some(idx) = self.index_of.remove(id) {
-            // Swap-remove to keep O(1); patch the moved entry's index.
             let last = self.ids.len() - 1;
             if idx != last {
                 self.ids.swap(idx, last);
                 self.vectors.swap(idx, last);
+                self.norms.swap(idx, last);
                 let moved_id = self.ids[idx].clone();
                 self.index_of.insert(moved_id, idx);
             }
             self.ids.pop();
             self.vectors.pop();
+            self.norms.pop();
         }
     }
 
@@ -99,13 +106,11 @@ impl InMemoryVectorIndex {
         }
         let inner = self.inner.read();
 
-        // Min-heap: smallest score at the top so we can pop it when a better
-        // candidate arrives. Stores (TotalF64, index_in_ids).
         let mut heap: BinaryHeap<std::cmp::Reverse<(TotalF64, usize)>> =
             BinaryHeap::with_capacity(limit + 1);
         let query_norm = l2_norm(query);
         for (i, vec) in inner.vectors.iter().enumerate() {
-            let score = cosine_similarity(query, vec, query_norm);
+            let score = cosine_similarity(query, vec, query_norm, inner.norms[i]);
             heap.push(std::cmp::Reverse((TotalF64(score), i)));
             if heap.len() > limit {
                 heap.pop();
@@ -116,9 +121,6 @@ impl InMemoryVectorIndex {
             .into_iter()
             .map(|std::cmp::Reverse((TotalF64(score), i))| (inner.ids[i].clone(), score))
             .collect();
-        // Sort descending by score for stable output. Using total_cmp keeps
-        // NaN at the bottom (largest via total order semantics), matching
-        // the heap's eviction policy.
         results.sort_by(|a, b| b.1.total_cmp(&a.1));
         results
     }
@@ -175,8 +177,8 @@ fn l2_norm(v: &[f32]) -> f64 {
         .sqrt()
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32], norm_a: f64) -> f64 {
-    if a.len() != b.len() {
+fn cosine_similarity(a: &[f32], b: &[f32], norm_a: f64, norm_b: f64) -> f64 {
+    if a.len() != b.len() || norm_a == 0.0 || norm_b == 0.0 {
         return 0.0;
     }
     let dot: f64 = a
@@ -184,10 +186,6 @@ fn cosine_similarity(a: &[f32], b: &[f32], norm_a: f64) -> f64 {
         .zip(b.iter())
         .map(|(x, y)| f64::from(*x) * f64::from(*y))
         .sum();
-    let norm_b = l2_norm(b);
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
     dot / (norm_a * norm_b)
 }
 
@@ -214,7 +212,6 @@ mod tests {
         idx.add("c".into(), vec![1.0, 1.0]);
         idx.remove("a");
         assert_eq!(idx.len(), 2);
-        // Remaining entries still searchable.
         let r = idx.search(&[0.0, 1.0], 2);
         let ids: Vec<_> = r.iter().map(|(id, _)| id.clone()).collect();
         assert!(ids.contains(&"b".to_string()));

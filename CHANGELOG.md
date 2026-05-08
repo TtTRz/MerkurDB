@@ -2,6 +2,40 @@
 
 All notable changes to MerkurDB. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-05-08
+
+Performance and correctness pass: 1 critical data-loss fix, 9 high-severity N+1/performance fixes, 1 medium logic bug.
+
+### Added
+
+- **`Storage::memory_exists_batch`** — validates a batch of ids in a single `json_each(?1)` query instead of N individual lookups. Used by `relate_batch` handler.
+- **`Storage::get_edges_batch`** — fetches edges for multiple memory ids in one query. Used by `search` (`include_graph=true`) and `get_graph` handlers.
+- **`Storage::update_abstract`** — writes consolidation abstracts directly to the `memories.abstract` column instead of misrouting them to context_tags.
+- **Pre-computed L2 norms** in `InMemoryVectorIndex`: avoids recomputing `‖b‖₂` on every cosine similarity comparison during search (O(dim) saved per candidate).
+- **LanceDB automatic index builder**: `spawn_index_builder` triggers a background `Index::Auto` build once row count crosses 256. Guarded by `AtomicBool` to prevent concurrent builds.
+- **`rebuild_vector_index`** now actually creates the LanceDB vector index (previously a no-op stub).
+- **6 new tests**: `test_memory_exists_batch`, `test_get_edges_batch`, `test_update_abstract`, `test_get_memory_no_embedding`, `test_norms_consistent_after_upsert_remove`. Total: **41 passing**.
+
+### Changed
+
+- **`bfs_expand` eliminates N+1 context_tags queries** (HV1): collects all BFS neighbor ids, then fetches context_tags in a single batch via `get_context_tags_batch`.
+- **`write_batch` uses `encode_batch`** (HV2): one embedder round-trip instead of N individual `encode` calls.
+- **`search` handler `include_graph`** (HV3) and **`get_graph` handler** (HV4): use `get_edges_batch` instead of per-id `get_edges` loops.
+- **`relate_batch`** (HV5): validates all source/target ids in a single `memory_exists_batch` call (was 3N SQL queries).
+- **`get_memory`** (HV7): no longer fetches the `embedding` BLOB column — saves bandwidth and avoids deserializing large vectors that are never returned to clients.
+
+### Fixed
+
+- **CRITICAL: `run_consolidation_once` data loss** (CV1): previously marked ALL candidate memories as consolidated even when `update_abstract` failed. Now only successfully-processed ids are marked, using the new `update_abstract` method that writes to `memories.abstract` column directly.
+- **Consolidator wrote abstracts to context_tags** (MV1): consolidation results are now stored in the proper `memories.abstract` column via `Storage::update_abstract`.
+- **LanceDB `update_memory` silently swallowed delete failures** (HV8): errors now propagate so callers can retry or alert.
+
+### Migration notes (BREAKING)
+
+- `Storage` trait has 3 new required methods: `get_edges_batch`, `memory_exists_batch`, `update_abstract`. External implementations must add them.
+- `get_memory` no longer returns the `embedding` field (always `None`). Callers that relied on reading embeddings back must use the vector search path instead.
+- Workspace version bumped to `0.3.0`.
+
 ## [0.2.0] — 2026-05-07
 
 Cross-stack hardening pass. BREAKING changes touch HTTP response bodies, config keys, trait surface, and enum serialization; see the bottom of this entry for migration notes.

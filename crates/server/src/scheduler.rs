@@ -93,15 +93,18 @@ impl Scheduler {
             }
         };
 
+        // Only mark memories whose abstracts were actually persisted.
+        let mut consolidated_ids: Vec<String> = Vec::new();
         for (id, abstract_) in &report.new_abstracts {
-            if let Err(e) = storage.insert_context_tag(id, "abstract", abstract_).await {
-                error!("Failed to update abstract for {id}: {e}");
-                report.errors += 1;
+            match storage.update_abstract(id, abstract_).await {
+                Ok(()) => consolidated_ids.push(id.clone()),
+                Err(e) => {
+                    error!("Failed to update abstract for {id}: {e}");
+                    report.errors += 1;
+                }
             }
         }
 
-        // Track edges actually inserted vs proposed; this is what gets returned
-        // to the client and persisted to the consolidate_log table.
         let mut actually_created = 0;
         for edge in &report.new_edges {
             match storage.insert_edge(edge).await {
@@ -117,8 +120,9 @@ impl Scheduler {
         }
         report.edges_created = actually_created;
 
-        let ids: Vec<String> = pending.iter().map(|m| m.id.clone()).collect();
-        if let Err(e) = storage.mark_consolidated(&ids).await {
+        if !consolidated_ids.is_empty()
+            && let Err(e) = storage.mark_consolidated(&consolidated_ids).await
+        {
             error!("Failed to mark consolidated: {e}");
             report.errors += 1;
         }

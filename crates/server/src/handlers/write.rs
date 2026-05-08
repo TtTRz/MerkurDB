@@ -79,20 +79,48 @@ pub async fn write_batch(
         )));
     }
 
-    let mut ids = Vec::new();
     let mut errors = Vec::new();
+    let mut eligible: Vec<(usize, &WriteItem)> = Vec::with_capacity(req.items.len());
     for (i, item) in req.items.iter().enumerate() {
-        if let Err(e) = check_content(&item.content) {
-            errors.push(json!({"index": i, "code": e.code, "message": e.message}));
-            continue;
+        match check_content(&item.content) {
+            Ok(()) => eligible.push((i, item)),
+            Err(e) => errors.push(json!({"index": i, "code": e.code, "message": e.message})),
         }
-        let embedding = match state.embedder.encode(&item.content).await {
+    }
+
+    let texts: Vec<String> = eligible
+        .iter()
+        .map(|(_, item)| item.content.clone())
+        .collect();
+    let embeddings = if texts.is_empty() {
+        Vec::new()
+    } else {
+        match state.embedder.encode_batch(&texts).await {
             Ok(v) => v,
             Err(e) => {
-                errors.push(json!({"index": i, "code": "EMBED_FAILED", "message": e.to_string()}));
-                continue;
+                for (i, _) in &eligible {
+                    errors.push(json!({
+                        "index": *i,
+                        "code": "EMBED_FAILED",
+                        "message": e.to_string()
+                    }));
+                }
+                return Ok((
+                    StatusCode::CREATED,
+                    Json(json!({
+                        "ids": Vec::<String>::new(),
+                        "count": 0,
+                        "requested": req.items.len(),
+                        "errors": errors,
+                        "time_ms": start.elapsed().as_millis() as u64
+                    })),
+                ));
             }
-        };
+        }
+    };
+
+    let mut ids = Vec::with_capacity(eligible.len());
+    for ((i, item), embedding) in eligible.iter().zip(embeddings.into_iter()) {
         let new_mem = NewMemory {
             content: item.content.clone(),
             category: None,
@@ -102,9 +130,11 @@ pub async fn write_batch(
         };
         match state.storage.insert_memory(&new_mem).await {
             Ok(id) => ids.push(id),
-            Err(e) => {
-                errors.push(json!({"index": i, "code": "WRITE_FAILED", "message": e.to_string()}))
-            }
+            Err(e) => errors.push(json!({
+                "index": *i,
+                "code": "WRITE_FAILED",
+                "message": e.to_string()
+            })),
         }
     }
 

@@ -72,9 +72,6 @@ pub async fn search(
     let from_date: Option<chrono::DateTime<chrono::Utc>> = parse_optional_rfc3339(&params.from)?;
     let to_date: Option<chrono::DateTime<chrono::Utc>> = parse_optional_rfc3339(&params.to)?;
 
-    // Parse the `level` query parameter once into typed `MemoryLevel` values.
-    // Unknown level tokens are dropped silently (rather than 400) because
-    // comma-separated filters are historically permissive.
     let level_filter: Option<Vec<MemoryLevel>> = params.level.as_deref().map(parse_level_list);
 
     let query_vec = state.embedder.encode(&params.q).await?;
@@ -132,18 +129,21 @@ pub async fn search(
 
     let graph = if params.include_graph == Some(true) && !paginated.is_empty() {
         let result_ids: Vec<String> = paginated.iter().map(|r| r.id.clone()).collect();
+        let by_id = state
+            .storage
+            .get_edges_batch(&result_ids)
+            .await
+            .unwrap_or_default();
         let mut graph_edges = Vec::new();
-        for memory_id in &result_ids {
-            if let Ok(edges) = state.storage.get_edges(memory_id).await {
-                for e in edges {
-                    graph_edges.push(json!({
-                        "source_id": e.source_id,
-                        "target_id": e.target_id,
-                        "weight": e.weight,
-                        "relation": e.relation,
-                        "edge_type": e.edge_type,
-                    }));
-                }
+        for edges in by_id.values() {
+            for e in edges {
+                graph_edges.push(json!({
+                    "source_id": e.source_id,
+                    "target_id": e.target_id,
+                    "weight": e.weight,
+                    "relation": e.relation,
+                    "edge_type": e.edge_type,
+                }));
             }
         }
         Some(json!({
@@ -195,11 +195,8 @@ fn parse_optional_rfc3339(s: &Option<String>) -> ApiResult<Option<chrono::DateTi
     }
 }
 
-/// Parse a comma-separated level filter into typed `MemoryLevel` values.
-///
-/// Unknown / empty tokens are skipped rather than rejected; passing
-/// `"full,garbage,summary"` yields `[Full, Summary]` so a typo does not
-/// accidentally zero the result set.
+/// Parse comma-separated level filter into typed values. Unknown tokens are
+/// silently skipped.
 fn parse_level_list(s: &str) -> Vec<MemoryLevel> {
     s.split(',')
         .map(str::trim)
