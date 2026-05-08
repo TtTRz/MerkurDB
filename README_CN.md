@@ -1,62 +1,72 @@
 # MerkurDB
 
+[![CI](https://github.com/TtTRz/MerkurDB/actions/workflows/ci.yml/badge.svg)](https://github.com/TtTRz/MerkurDB/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.92+-orange.svg)](rust-toolchain.toml)
+
 > [English](README.md)
 
-外挂式认知记忆服务 — 为 AI Agent 提供长时记忆。受神经科学启发，Rust 全栈实现。
+面向 AI Agent 的独立认知记忆服务。灵感源自神经科学，使用 Rust 构建。
 
-单个二进制，零运行时依赖。支持语义检索、图扩散、记忆巩固和 Ebbinghaus 遗忘曲线。
+单一二进制，零运行时依赖。支持语义搜索、图扩散、记忆巩固和艾宾浩斯遗忘曲线。
 
-> 设计理念: [SPEC_CN.md](docs/SPEC_CN.md) · 技术架构: [ARCHITECTURE_CN.md](docs/ARCHITECTURE_CN.md)
+> 设计哲学：[SPEC_CN.md](docs/SPEC_CN.md) · 技术架构：[ARCHITECTURE_CN.md](docs/ARCHITECTURE_CN.md)
 
 ## 快速开始
 
 ```bash
-# 启动服务 (NoopEmbedder + SQLite)
+# 启动服务（NoopEmbedder + SQLite）
 cargo run --release -p merkur-server -- --config config.example.yaml
+
+# 设置 Bearer token（必须与 config.example.yaml 中 auth.tokens 匹配）
+export MERKUR_TOKEN='replace-me-with-a-strong-token'
 
 # 写入记忆
 curl -X POST localhost:1934/v1/write \
+  -H "Authorization: Bearer $MERKUR_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"content":"v8 GC 是分代式的","context":{"agent":"assistant"}}'
+  -d '{"content":"v8 GC is generational","context":{"agent":"assistant"}}'
 
-# 检索
-curl 'localhost:1934/v1/search?q=v8+gc&mode=fast'
+# 搜索
+curl -H "Authorization: Bearer $MERKUR_TOKEN" \
+  'localhost:1934/v1/search?q=v8+gc&mode=fast'
 
-# 图扩散检索
-curl 'localhost:1934/v1/search?q=v8&mode=deep&depth=2&include_graph=true'
+# 图扩散搜索
+curl -H "Authorization: Bearer $MERKUR_TOKEN" \
+  'localhost:1934/v1/search?q=v8&mode=deep&depth=2&include_graph=true'
 
-# 统计
-curl localhost:1934/v1/status
+# 健康检查（无需认证）
+curl localhost:1934/v1/health
 ```
 
 ## 核心特性
 
-- **双系统检索**: S1 Fast (向量 top-k) + S2 Deep (SQLite CTE BFS 图扩散)
-- **Ebbinghaus 遗忘曲线**: 权重指数衰减、访问加成、层级降级 (Full→Summary→Title→Archive)
-- **离线记忆巩固**: LLM 摘要生成 + 实体提取 + 自动建边
-- **插件化架构**: Embedder / Storage / Consolidator / Forgetter — trait + 配置注入, 独立可替换
-- **双存储后端**: SQLite (默认) + LanceDB 磁盘索引 (feature gated)
-- **Rust SDK**: `merkur-client` crate, `MerkurClient` trait + `HttpMerkurClient`
-- **OpenAPI 3.0**: 多语言 SDK 代码生成
+- **双路检索**：S1 快速（向量 top-k）+ S2 深度（SQLite CTE BFS 图扩散）
+- **艾宾浩斯遗忘曲线**：指数权重衰减、访问加成、级联降级（Full→Summary→Title→Archive）
+- **离线巩固**：LLM 驱动的摘要生成、实体提取和自动边创建
+- **插件架构**：Embedder / Storage / Consolidator / Forgetter — 通过 trait + 配置注入独立替换
+- **双存储**：SQLite（默认）+ LanceDB 磁盘索引（feature gate）
+- **Rust SDK**：`merkur-client` crate，含 `MerkurClient` trait 和 `HttpMerkurClient`
+- **OpenAPI 3.0**：多语言 SDK 代码生成
 
 ## API
 
-| 方法 | 路径 | 说明 |
-|--------|------|-------------|
+| 方法 | 路径 | 描述 |
+|------|------|------|
 | `GET` | `/v1/health` | 健康检查 |
 | `POST` | `/v1/write` | 写入记忆 |
 | `POST` | `/v1/write-batch` | 批量写入 |
-| `GET` | `/v1/search` | 检索 (level/category/日期过滤) |
-| `GET` | `/v1/memory/{id}` | 获取详情 |
-| `PUT` | `/v1/memory/{id}` | 更新 (自动重嵌) |
-| `DELETE` | `/v1/memory/{id}` | 删除 (级联边+标签) |
-| `GET` | `/v1/status` | 统计 + uptime |
-| `POST` | `/v1/consolidate` | 手动合并 |
-| `GET` | `/v1/consolidate/log` | 合并审计日志 |
-| `POST` | `/v1/forget` | 手动遗忘 |
-| `POST` | `/v1/relate` | 建边 |
-| `POST` | `/v1/relate-batch` | 批量建边 |
-| `GET` | `/v1/graph/{id}` | 图邻域 (含边详情) |
+| `GET` | `/v1/search` | 搜索（level/category/日期过滤） |
+| `GET` | `/v1/memory/{id}` | 获取记忆详情 |
+| `PUT` | `/v1/memory/{id}` | 更新（自动重嵌入） |
+| `DELETE` | `/v1/memory/{id}` | 删除（级联 edges + tags） |
+| `GET` | `/v1/status` | 存储统计 + 运行时间 |
+| `POST` | `/v1/consolidate` | 触发巩固 |
+| `GET` | `/v1/consolidate/log` | 巩固审计日志 |
+| `POST` | `/v1/forget` | 触发遗忘 |
+| `POST` | `/v1/relate` | 创建边 |
+| `POST` | `/v1/relate-batch` | 批量创建边 |
+| `GET` | `/v1/graph/{id}` | 图邻域（含边详情） |
 
 ## Docker
 
@@ -85,60 +95,73 @@ crates/
 ├── embedders/         # Noop / Ollama / OpenAI
 ├── consolidators/     # Noop / LLM
 ├── forgetters/        # Ebbinghaus
-├── server/            # HTTP 服务 + 调度器
+├── server/            # HTTP 服务 + scheduler
 └── client/            # Rust SDK
 ```
 
-## Roadmap
+## 路线图
 
-### 已完成 (v0.1.0)
+### 已完成
 
-| 类别 | 功能 |
-|----------|---------|
-| Core | 类型系统 (Memory, Edge, MemoryLevel), 4 个 Plugin Trait, MerkurError |
-| Storage | SqliteStorage (WAL + r2d2), InMemoryVectorIndex (cosine similarity) |
-| Storage | LanceDbStorage (磁盘 IVF-PQ, feature gated) |
-| Embedders | NoopEmbedder (测试), OllamaEmbedder, OpenAIEmbedder (feature gated) |
-| Retrieval | S1 Fast (向量 top-k), S2 Deep (CTE BFS 图扩散) |
-| Consolidation | NoopConsolidator, LlmConsolidator (LLM 摘要 + 实体提取) |
-| Forgetting | EbbinghausForgetter (衰减 + 访问加成 + 级联降级) |
-| Scheduler | 后台合并 + 遗忘循环, 手动触发端点 |
-| API | 14 个 REST 端点, CORS, 优雅关闭 |
-| SDK | `merkur-client` crate: MerkurClient trait + HttpMerkurClient |
-| DevOps | Docker, GitHub Actions CI, OpenAPI 3.0 |
-| Docs | README + ARCHITECTURE + SPEC + config example |
+#### v0.1.0 — 基础
 
-### 开发中 (v0.2.0)
+| 类别 | 特性 |
+|------|------|
+| Core | 类型系统（Memory, Edge, MemoryLevel），4 个插件 trait，MerkurError |
+| Storage | SqliteStorage（WAL + r2d2），InMemoryVectorIndex（余弦相似度） |
+| Storage | LanceDbStorage（磁盘向量搜索，feature gate） |
+| Embedders | NoopEmbedder，OllamaEmbedder，OpenAIEmbedder（feature gate） |
+| Retrieval | S1 快速（向量 top-k），S2 深度（CTE BFS 图扩散） |
+| Consolidation | NoopConsolidator，LlmConsolidator（LLM 摘要 + 边创建） |
+| Forgetting | EbbinghausForgetter（指数衰减 + 访问加成 + 级联） |
+| Server | 14 REST 端点，CORS，Scheduler，优雅关闭 |
+| SDK | `merkur-client` crate，OpenAPI 3.0 spec |
+| DevOps | Docker，GitHub Actions CI |
 
-| 优先级 | 功能 | 说明 |
-|----------|---------|-------------|
-| P0 | 测试补缺 | LanceDB 测试, LlmConsolidator mock 测试, update_memory 测试 |
-| P0 | Prometheus metrics | `/v1/metrics` — 请求数、延迟、记忆统计、合并运行 |
-| P1 | 存储统计 | status: 向量索引内存占用、SQLite 文件大小 |
-| P1 | 请求限流 | Token bucket, YAML 可配 |
-| P1 | 健康详情 | `/v1/health` 带 DB 连接检查、嵌入器探活 |
+#### v0.2.0 — 加固
 
-### 计划中 (v0.3.0+)
+| 类别 | 特性 |
+|------|------|
+| Security | Bearer-token 认证中间件，恒定时间比较 |
+| Safety | 每连接 `foreign_keys=ON`，所有 SQLite 操作 `spawn_blocking` |
+| Correctness | 艾宾浩斯公式修正（真半衰期），BFS 环检测 |
+| Performance | 有界最小堆 top-k，批量 `json_each` 查询 |
+| Config | Figment 多层合并，运行时校验 |
+| API | 结构化错误响应，请求体限制（10 MiB） |
 
-| 优先级 | 功能 | 说明 |
-|----------|---------|-------------|
-| P1 | MCP adapter | Model Context Protocol 集成, Agent 直接接入 |
-| P1 | gRPC API | tonic 高性能流式 API, 与 REST 并行 |
+#### v0.3.0 — 性能与可靠性
+
+| 类别 | 特性 |
+|------|------|
+| 关键修复 | 巩固不再将失败的记忆标记为已完成 |
+| Performance | 5 条热路径 N+1 消除（bfs, write_batch, search, graph, relate） |
+| Performance | 向量索引预缓存 L2 范数，LanceDB 256 行自动建索引 |
+| Security | `subtle` crate 恒定时间 token 比较 |
+| API | `write_batch` 全失败返回 207，上下文 boost 先于阈值过滤 |
+| Cleanup | 删除死代码（Timeout/Unauthorized variants, rebuild_vector_index） |
+| Docs | Mermaid 图（crate 依赖、检索流程、生命周期、巩固时序） |
+
+### 规划中 (v0.4.0+)
+
+| 优先级 | 特性 | 描述 |
+|--------|------|------|
+| P1 | MCP adapter | Model Context Protocol 集成，Agent 直接访问 |
+| P1 | gRPC API | 基于 `tonic` 的高性能流式 API |
 | P2 | 静态加密 | SQLCipher 或应用层 embedding 列加密 |
-| P2 | 数据库迁移 | Schema 版本管理, `merkur migrate` CLI |
-| P2 | PostgreSQL 后端 | PG 存储后端 (通过 Storage trait) |
-| P2 | Rust CLI | `merkurctl` — 管理操作 (触发合并、查询状态、备份) |
-| P3 | Web Dashboard | Tauri/Yew SPA — 记忆图可视化、配置编辑器 |
-| P3 | 多模态 | 图片 embedding 支持 (CLIP 等) |
-| P3 | 分布式合并 | 多 worker 并行合并, 大规模记忆库 |
+| P2 | DB 迁移工具 | Schema 版本化，`merkur migrate` CLI |
+| P2 | PostgreSQL 后端 | 通过 Storage trait 的 PG 存储后端 |
+| P2 | Rust CLI | `merkurctl` — 管理操作（触发巩固、查询状态、备份） |
+| P3 | Web 仪表盘 | Tauri/Yew SPA — 记忆图可视化、配置编辑器 |
+| P3 | 多模态 | 图像嵌入支持（CLIP 等） |
+| P3 | 分布式巩固 | 多 Worker 并行巩固 |
 
 ## 文档
 
-- [SPEC_CN.md](docs/SPEC_CN.md) — 设计理念、认知科学背景、产品路线
-- [ARCHITECTURE_CN.md](docs/ARCHITECTURE_CN.md) — 技术架构、数据模型、API 规格
-- [openapi.yaml](openapi.yaml) — OpenAPI 3.0 完整 spec
-- [CHANGELOG.md](CHANGELOG.md) — 变更记录
+- [SPEC_CN.md](docs/SPEC_CN.md) — 设计哲学、认知科学背景、产品路线
+- [ARCHITECTURE_CN.md](docs/ARCHITECTURE_CN.md) — 技术架构、数据模型、API 规范
+- [openapi.yaml](openapi.yaml) — OpenAPI 3.0 规范
+- [CHANGELOG.md](CHANGELOG.md) — 变更日志
 
-## License
+## 许可证
 
 MIT

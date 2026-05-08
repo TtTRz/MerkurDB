@@ -1,101 +1,114 @@
-# MerkurDB — 设计 Spec
+# MerkurDB — 设计规范
 
-> [English](SPEC.md) · v1.0
+> [English](SPEC.md) · v0.3.0
 
 ## 1. 定位
 
-MerkurDB 是一个**外挂式、认知科学启发的独立记忆服务**，为 AI Agent 提供长时记忆。
+MerkurDB 是面向 AI Agent 的**独立认知记忆服务**，灵感源自神经科学。
 
-与现有方案的根本区别：
+与现有方案的差异：
 
-| | 业界 | MerkurDB |
-|--|------|----------|
-| 哲学 | 工程驱动 — 怎么存得更多、搜得更准 | **认知驱动 — 人脑怎么记，我们就怎么做** |
-| 遗忘 | 视为 bug, 尽量避开 | **第一公民 — 有策略地遗忘比记住一切重要** |
-| 巩固 | 写入即完成, 不做离线处理 | **核心机制 — 离线摘要、实体提取、关联建图** |
-| 检索 | 单一模式 (向量 top-k) | **双系统 — S1 快检索 + S2 图扩散** |
-| 架构 | 多数内嵌 Agent 框架 | **外挂独立服务, 不绑定任何框架** |
-| 部署 | Python 栈, 依赖复杂 | **单个 Rust 二进制, 零运行时依赖** |
+| | 行业现状 | MerkurDB |
+|--|----------|----------|
+| 理念 | 工程驱动 — 存更多、搜更快 | **认知驱动 — 模拟大脑的记忆方式** |
+| 遗忘 | 视为 bug | **一等公民 — 策略性遗忘优于记住一切** |
+| 巩固 | 写即结束，无离线处理 | **核心机制 — 离线摘要、实体提取、图构建** |
+| 检索 | 单一模式（向量 top-k） | **双系统 — S1 快 + S2 深** |
+| 架构 | 多嵌入在 Agent 框架中 | **独立服务，框架无关** |
+| 部署 | Python 栈，依赖复杂 | **单个 Rust 二进制，零运行时依赖** |
 
 ## 2. 背景
 
-### 2.1 竞品分析发现的系统性缺陷
+### 2.1 现有方案的系统性缺陷
 
-经过对 Zep、Memobase、GraphRAG、Letta、OpenViking 等已有方案的审查：
+对 Zep、Memobase、GraphRAG、Letta、OpenViking 等的分析：
 
-| 缺陷 | 说明 | 业界状态 |
-|------|------|---------|
-| 无巩固机制 | 写入即完成, 不做离线压缩/推理 | **无人做** |
-| 无遗忘策略 | 要么全存, 要么粗粒度窗口截断 | **无人做** |
-| 无双系统检索 | 只用向量 top-k, 没有快/慢分离 | **无人做** |
-| 无情境感知 | 检索不看编码时上下文 | 仅 Zep 有时序 |
-| 内嵌式架构 | 记忆绑定 Agent 框架, 不可互换 | 部分已外挂 |
+| 缺陷 | 描述 | 行业状态 |
+|------|------|----------|
+| 无巩固 | 写即结束，无离线压缩/推理 | **无人实现** |
+| 无遗忘策略 | 全量存储或粗粒度窗口截断 | **无人实现** |
+| 无双路检索 | 仅向量 top-k，无快/慢分离 | **无人实现** |
+| 无上下文感知 | 检索忽略编码时上下文 | 仅 Zep 有时序 |
+| 嵌入式架构 | 记忆绑定在 Agent 框架中，不可替换 | 部分解耦 |
 
-### 2.2 认知科学驱动力
+### 2.2 认知科学基础
 
-每个机制对应已知的人脑记忆模型：
+每个机制对应一个已知的人类记忆模型：
 
-| 机制 | 认知科学依据 | 实现 |
-|------|------------|------|
-| Ebbinghaus 遗忘曲线 | 记忆强度随时间指数衰减, 重复访问增强 | `Forgetter` trait |
-| 记忆巩固 (Consolidation) | 海马体→皮层转移, 离线重组 | `Consolidator` trait |
-| 双系统检索 | Kahneman 系统1 (快) / 系统2 (慢) | S1 Fast / S2 Deep |
-| 层级降级 | Full → Summary → Title → Archive | `MemoryLevel` 枚举 |
-| 情境依赖记忆 | 编码时的 context 影响检索 | context tags + soft filtering |
+| 机制 | 认知基础 | 实现 |
+|------|----------|------|
+| 艾宾浩斯遗忘曲线 | 记忆强度指数衰减；重复访问增强 | `Forgetter` trait |
+| 记忆巩固 | 海马体→皮层转移，离线重组 | `Consolidator` trait |
+| 双过程理论 | Kahneman 系统 1（快）/ 系统 2（慢） | S1 Fast / S2 Deep |
+| 层级退化 | 完整 → 摘要 → 标题 → 遗忘 | `MemoryLevel` enum |
+| 上下文依赖记忆 | 编码时上下文影响检索 | Context tags + 软过滤 |
 
 ## 3. 设计原则
 
-- **外挂优先** — 独立 HTTP 服务, 不嵌入任何 Agent 框架
-- **认知科学驱动** — 每个机制对应已知的人脑记忆模型
-- **模块可拆卸** — 每层可替换实现 (trait + 配置注入), 不强制绑定技术栈
-- **遗忘是第一公民** — 有策略地遗忘比记住一切重要
-- **零依赖部署** — 单个 Rust 二进制, 通过 Docker 或裸机运行
+- **独立优先** — 独立 HTTP 服务，不嵌入任何 Agent 框架
+- **认知驱动** — 每个机制对应一个已知的人类记忆模型
+- **可插拔模块** — 每层可替换（trait + 配置注入），无厂商锁定
+- **遗忘是特性** — 策略性遗忘优于记住一切
+- **零依赖部署** — 单个 Rust 二进制，裸机或 Docker 运行
 
 ## 4. 数据流
 
-```
-写入:  Agent → POST /v1/write
-         ├─→ Embedder Plugin: 生成 embedding
-         ├─→ Storage: 存 SQLite + 更新向量索引
-         └─→ 返回 { id, status: "ok" }
+```mermaid
+flowchart TB
+    subgraph Write Path
+        A[Agent] -->|POST /v1/write| E[Embedder]
+        E -->|embedding| S[Storage]
+        S -->|id| A
+    end
 
-检索:  Agent → GET /v1/search?mode=fast|deep
-         ├─ S1 fast: Embedder → 向量 top-k → SQLite 补充元数据
-         └─ S2 deep: S1 种子 → SQLite CTE BFS 图扩散 → 聚合
+    subgraph Search Path
+        A2[Agent] -->|GET /v1/search| E2[Embedder]
+        E2 -->|query vec| VS[Vector Search]
+        VS -->|mode=fast| R[Results]
+        VS -->|mode=deep| BFS[BFS Graph Diffusion]
+        BFS --> R
+    end
 
-后台:  Scheduler 定时触发
-         ├─→ Consolidator: 扫描 pending → 摘要 + 实体 → 建边
-         └─→ Forgetter: 权重衰减 → 降级 → 归档清理
+    subgraph Background
+        SCH[Scheduler] -->|periodic| CON[Consolidator]
+        CON -->|abstract + edges| S2[Storage]
+        SCH -->|periodic| FOR[Forgetter]
+        FOR -->|downgrade/archive| S2
+    end
 ```
 
 ## 5. 记忆生命周期
 
+```mermaid
+stateDiagram-v2
+    [*] --> Full: POST /v1/write (weight=1.0, pending=true)
+    Full --> Full: consolidate (abstract + edges, pending=false)
+    Full --> Full: GET /v1/memory (access_count++)
+    Full --> Summary: w < 0.3
+    Summary --> Title: w < 0.2
+    Title --> Archived: w < 0.1
+    Archived --> [*]: physically deleted after 30d
 ```
-写入 (Full, weight=1.0, pending=true)
-  │
-  ├─→ [Consolidator 处理] → 生成摘要 + 建边 → pending=false
-  │
-  ├─→ [每次 get_memory 读取] → access_count++, accessed_at 更新
-  │
-  └─→ [Forgetter 定时评估]
-        w(t) = w₀ · α^(Δt/d) · (1 + β · log₂(1+n))
-        
-        Full (L2)    w < 0.3 → Summary (L1)
-        Summary (L1) w < 0.2 → Title (L0)
-        Title (L0)   w < 0.1 → Archive (L-1)
-        Archive               → 30天后物理删除
+
+```
+w(t) = w₀ · exp(-Δt · ln2 / h) · min(1 + β · log₂(1+n), 3.0)
+
+Full (L2)    w < 0.3 → Summary (L1)
+Summary (L1) w < 0.2 → Title (L0)
+Title (L0)   w < 0.1 → Archive (L-1)
+Archive               → 30 天后物理删除
 ```
 
 ## 6. 配置驱动
 
-所有插件在启动时通过配置选择, 可替换且不重新编译：
+所有插件通过配置选择，无需重新编译即可替换：
 
 ```yaml
 plugins:
   embedder:
     type: "ollama"          # ollama | openai | noop
   consolidator:
-    type: "noop"            # noop | llm (LLM 需要外部 API)
+    type: "noop"            # noop | llm（LLM 需要外部 API）
   forgetter:
     type: "ebbinghaus"      # ebbinghaus | noop
   storage:
@@ -104,14 +117,14 @@ plugins:
 
 ## 7. SDK 策略
 
-**混合方案**: Rust trait (参考实现) + OpenAPI 3.0 spec (多语言代码生成)
+**混合方案**：Rust trait（参考实现）+ OpenAPI 3.0 spec（多语言代码生成）
 
-- MerkurDB 维护 `merkur-client` crate (`MerkurClient` trait + `HttpMerkurClient`)
-- 提供 `openapi.yaml`, 用户用 openapi-generator 生成 Python/TypeScript/Go SDK
-- 第三方可通过 REST API 直接集成
+- MerkurDB 维护 `merkur-client` crate（`MerkurClient` trait + `HttpMerkurClient`）
+- `openapi.yaml` 供 openapi-generator 使用：Python、TypeScript、Go 等
+- 第三方可直接通过 REST API 集成
 
 ```rust
-// Rust 调用示例
+// Rust 用法
 let client = HttpMerkurClient::new("http://localhost:1934");
 let resp = client.write("hello world", None).await?;
 let results = client.search("hello", Some("fast"), Some(10), None).await?;
@@ -120,47 +133,47 @@ let results = client.search("hello", Some("fast"), Some(10), None).await?;
 ## 8. 阶段路线
 
 ### Phase 0 — 已完成
-- 工程骨架 + 类型系统 + SQLite 存储 + Ollama/Noop 嵌入器
-- HTTP 服务器 (write, search, memory CRUD, status)
-- 21 个单元/集成测试
+- 项目脚手架 + 类型系统 + SQLite 存储 + Ollama/Noop 嵌入器
+- HTTP 服务（write、search、memory CRUD、status）
+- 21 个集成测试
 
 ### Phase 1 — 已完成
-- S2 Deep Search (CTE BFS)
-- Ebbinghaus 遗忘曲线
+- S2 深度搜索（CTE BFS）
+- 艾宾浩斯遗忘曲线
 - LlmConsolidator
-- 后台 Scheduler (consolidate + forget)
+- 后台 Scheduler（巩固 + 遗忘）
 - 手动触发端点
 
 ### Phase 2 — 已完成
-- LanceDB 存储后端 (feature gated)
-- OpenAI embedder (feature gated)
-- Rust SDK (`merkur-client` crate)
-- 合并审计日志、图形端点、搜索过滤
+- LanceDB 存储后端（feature gate）
+- OpenAI 嵌入器（feature gate）
+- Rust SDK（`merkur-client` crate）
+- 巩固审计日志、图端点、搜索过滤器
 - Docker + CI/CD
 
 ### Phase 3 — 规划中
-- gRPC API (tonic)
+- gRPC API（tonic）
 - PostgreSQL 后端
-- MCP adapter (Agent 协议接入)
-- 分布式 consolidation
-- Web UI dashboard
-- 多模态支持 (图片 embedding)
-- 静态加密 (at-rest encryption)
+- MCP adapter（Agent 协议集成）
+- 分布式巩固
+- Web UI 仪表盘
+- 多模态支持（图像嵌入）
+- 静态加密
 - 请求限流
 
-## 9. 编程语言决策
+## 9. 语言选择
 
-选择 **Rust 全栈**的理由：
+**全栈 Rust** 理由：
 
-| 考量 | 结论 |
+| 因素 | 理由 |
 |------|------|
-| 部署 | 单个 8MB 二进制, 零运行时依赖 (无 Python/Node) |
-| 并发 | tokio async, 无 GIL, 编译期保证并发安全 |
-| 安全性 | 编译期内存安全, 减少生产事故 |
-| embedding | 调外部 API (Ollama/OpenAI), 业界标准做法 |
-| 开发成本 | 比 Python 慢 2-3x, 但 MerkurDB 代码量可控 (~4500 行) |
-| AI 生态 | 通过外部 API 调用规避 Rust AI 生态不足 |
+| 部署 | 单个 8MB 二进制，零运行时依赖（无 Python/Node） |
+| 并发 | tokio 异步，无 GIL，编译期安全 |
+| 安全 | 编译期内存安全，更少生产事故 |
+| 嵌入 | 外部 API 调用（Ollama/OpenAI）— 行业标准 |
+| 开发成本 | 比 Python 慢 2-3 倍，但 MerkurDB 规模仅 ~6,400 行 |
+| AI 生态 | 通过外部 API 调用缓解 |
 
-## 10. License
+## 10. 许可证
 
 MIT
