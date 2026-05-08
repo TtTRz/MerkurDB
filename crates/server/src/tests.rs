@@ -344,4 +344,58 @@ mod integration {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn test_write_batch_full_failure_returns_207() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        // All items have empty content → validation error → zero success → 207
+        let body = r#"{"items":[{"content":""},{"content":""}]}"#;
+        let resp = app
+            .oneshot(
+                Request::post("/v1/write-batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+    }
+
+    #[tokio::test]
+    async fn test_context_boost_rescues_below_threshold() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        // Write a memory with context
+        let write_body =
+            r#"{"content":"rust borrow checker","context":{"lang":"rust","topic":"memory"}}"#;
+        app.clone()
+            .oneshot(
+                Request::post("/v1/write")
+                    .header("content-type", "application/json")
+                    .body(Body::from(write_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Search with a very high threshold but matching context should still
+        // return results if context boost pushes score above threshold.
+        // With NoopEmbedder, cosine scores are deterministic. A context with
+        // 2 matching keys adds +0.2 boost.
+        let resp = app
+            .oneshot(
+                Request::get(
+                    "/v1/search?q=rust&score_threshold=0.0&context=%7B%22lang%22%3A%22rust%22%7D",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }

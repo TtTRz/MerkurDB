@@ -314,3 +314,22 @@ async fn test_norms_consistent_after_upsert_remove() -> MerkurResult<()> {
     assert!((results[0].1 - 1.0).abs() < 1e-9);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_update_memory_nonexistent_returns_error() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let result = storage
+        .update_memory(
+            "mem_does_not_exist",
+            "new content",
+            Some(&[1.0, 0.0, 0.0, 0.0]),
+        )
+        .await;
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, merkur_core::MerkurError::MemoryNotFound(_)),
+        "expected MemoryNotFound, got {err:?}"
+    );
+    Ok(())
+}

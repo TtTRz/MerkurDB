@@ -243,4 +243,19 @@ mod tests {
         let action = f.decide(&mem, now);
         assert!(matches!(action, LevelAction::Archive));
     }
+
+    #[test]
+    fn test_access_bonus_capped_at_3() {
+        let config = EbbinghausConfig {
+            access_boost: 0.1,
+            ..Default::default()
+        };
+        let f = EbbinghausForgetter::new(config);
+        let now = Utc::now();
+        let mem = make_memory(now, 1.0, MemoryLevel::Full, 10_000_000);
+        let weight = f.compute_weight(&mem, now);
+        // delta_t=0 → decay=1.0, so weight = 1.0 * 1.0 * min(access_bonus, 3.0)
+        assert!(weight <= 3.0 + 1e-9, "weight {weight} exceeds cap of 3.0");
+        assert!(weight >= 2.9, "weight {weight} unexpectedly low");
+    }
 }
