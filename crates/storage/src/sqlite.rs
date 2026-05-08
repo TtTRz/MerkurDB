@@ -88,6 +88,8 @@ impl SqliteStorage {
             .map_err(|e| MerkurError::Storage(format!("Failed to init schema: {e}")))?;
         drop(conn);
 
+        crate::migration::migrate(&pool)?;
+
         let vector_index = Arc::new(InMemoryVectorIndex::new(embedding_dim));
 
         let storage = Self { pool, vector_index };

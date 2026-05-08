@@ -1,3 +1,4 @@
+pub mod migration;
 pub mod sqlite;
 pub mod sqlite_helpers;
 pub mod vector_index;
