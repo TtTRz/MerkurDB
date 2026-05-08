@@ -2,6 +2,36 @@
 
 All notable changes to MerkurDB. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-05-08
+
+Feature expansion: observability, tooling, and AI agent integration.
+
+### Added
+
+- **Prometheus metrics endpoint** (`/v1/metrics`) — request count, latency histogram, exposed via `metrics` + `metrics-exporter-prometheus` crates.
+- **Health endpoint enhanced** — `/v1/health` now probes database connectivity and reports embedder dimension; returns `"ok"` or `"degraded"`.
+- **Rate limiting** via `governor` crate — configurable token bucket (`rate_limit.enabled`, `rate_limit.requests_per_second`), disabled by default.
+- **`merkurctl` CLI** — admin tool with subcommands: `health`, `status`, `consolidate`, `forget`, `search`, `write`, `delete`, `graph`, `migrate`.
+- **LlmConsolidator OpenAI backend** — `consolidator.llm.backend = "openai"` routes to `/v1/chat/completions` with `response_format: json_object`.
+- **MCP adapter** (`merkur-mcp` binary) — Model Context Protocol server over stdio; tools: `write_memory`, `search_memory`, `get_memory`, `delete_memory`, `relate`.
+- **DB migration framework** — `merkur_meta` table tracks schema version; `migrate()` runs on startup; `merkurctl migrate` for manual execution.
+- **Criterion benchmarks** — `vector_search_10k_top100`, `bfs_expand_1k`, `upsert_remove_10k`.
+- **CI bench compile check** step in GitHub Actions.
+
+### Changed
+
+- **Vector index uses `Arc<str>`** for id storage — O(1) clone during search instead of O(len).
+- **Context boost applied before threshold filter** — low-scoring memories with matching context can now survive the threshold.
+- **`write_batch` returns 207** Multi-Status when all items fail (was 201).
+- **`access_bonus` capped at 3.0×** — prevents immortal memories under extreme access counts.
+- **Dockerfile** includes `merkurctl` and `merkur-mcp` binaries.
+
+### Migration notes
+
+- Workspace version bumped to `0.4.0`.
+- `merkur_meta` table auto-created on first startup (backward-compatible).
+- New config keys: `rate_limit.*`, `consolidator.llm.backend`.
+
 ## [0.3.0] — 2026-05-08
 
 Performance and correctness pass: 1 critical data-loss fix, 9 high-severity N+1/performance fixes, 1 medium logic bug.
