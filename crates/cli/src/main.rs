@@ -25,31 +25,80 @@ enum Commands {
     Consolidate,
     /// Trigger forgetting evaluation
     Forget,
+    /// Search memories
+    Search {
+        /// Query text
+        query: String,
+        /// Search mode (fast|deep)
+        #[arg(short, long, default_value = "fast")]
+        mode: String,
+        /// Max results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+    /// Write a memory
+    Write {
+        /// Memory content
+        content: String,
+    },
+    /// Delete a memory by id
+    Delete {
+        /// Memory ID
+        id: String,
+    },
+    /// Get graph neighborhood
+    Graph {
+        /// Center memory ID
+        id: String,
+        /// BFS depth
+        #[arg(short, long, default_value = "2")]
+        depth: usize,
+    },
+    /// Run database migrations
+    Migrate,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let client = reqwest::Client::new();
+    let base = cli.url.trim_end_matches('/').to_string();
 
-    let path = match &cli.command {
-        Commands::Health => "/v1/health",
-        Commands::Status => "/v1/status",
-        Commands::Consolidate => "/v1/consolidate",
-        Commands::Forget => "/v1/forget",
+    let resp = match &cli.command {
+        Commands::Health => send(&client, &base, &cli.token, "GET", "/v1/health", None).await?,
+        Commands::Status => send(&client, &base, &cli.token, "GET", "/v1/status", None).await?,
+        Commands::Consolidate => {
+            send(&client, &base, &cli.token, "POST", "/v1/consolidate", None).await?
+        }
+        Commands::Forget => send(&client, &base, &cli.token, "POST", "/v1/forget", None).await?,
+        Commands::Search { query, mode, limit } => {
+            let path = format!(
+                "/v1/search?q={}&mode={}&limit={}",
+                urlenc(query),
+                mode,
+                limit
+            );
+            send(&client, &base, &cli.token, "GET", &path, None).await?
+        }
+        Commands::Write { content } => {
+            let body = serde_json::json!({"content": content});
+            send(&client, &base, &cli.token, "POST", "/v1/write", Some(body)).await?
+        }
+        Commands::Delete { id } => {
+            let path = format!("/v1/memory/{id}");
+            send(&client, &base, &cli.token, "DELETE", &path, None).await?
+        }
+        Commands::Graph { id, depth } => {
+            let path = format!("/v1/graph/{id}?depth={depth}");
+            send(&client, &base, &cli.token, "GET", &path, None).await?
+        }
+        Commands::Migrate => {
+            eprintln!("Migration runs automatically on server startup.");
+            eprintln!("To force-migrate, restart the server.");
+            std::process::exit(0);
+        }
     };
 
-    let url = format!("{}{}", cli.url.trim_end_matches('/'), path);
-    let mut req = match &cli.command {
-        Commands::Health | Commands::Status => client.get(&url),
-        Commands::Consolidate | Commands::Forget => client.post(&url),
-    };
-
-    if let Some(ref token) = cli.token {
-        req = req.header("Authorization", format!("Bearer {token}"));
-    }
-
-    let resp = req.send().await?;
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     let pretty = serde_json::to_string_pretty(&body)?;
@@ -62,4 +111,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn urlenc(s: &str) -> String {
+    s.replace(' ', "+").replace('&', "%26").replace('=', "%3D")
+}
+
+async fn send(
+    client: &reqwest::Client,
+    base: &str,
+    token: &Option<String>,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<reqwest::Response, Box<dyn std::error::Error>> {
+    let url = format!("{base}{path}");
+    let mut req = match method {
+        "POST" => client.post(&url),
+        "DELETE" => client.delete(&url),
+        _ => client.get(&url),
+    };
+    if let Some(token) = token {
+        req = req.header("Authorization", format!("Bearer {token}"));
+    }
+    if let Some(b) = body {
+        req = req.header("Content-Type", "application/json").json(&b);
+    }
+    Ok(req.send().await?)
 }
