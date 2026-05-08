@@ -75,6 +75,62 @@ docker build -t merkurdb .
 docker run -p 1934:1934 -v ./data:/var/lib/merkur/data merkurdb
 ```
 
+## MCP 集成
+
+`merkur-mcp` 将 MerkurDB 作为 Model Context Protocol 服务器通过 stdio 暴露。AI 助手（Claude Desktop、Cursor 等）可直接读写记忆。
+
+```bash
+# 构建
+cargo build --release -p merkur-mcp
+
+# 独立运行（默认使用 NoopEmbedder）
+MERKUR_DB_PATH=~/.merkur/data/merkur.db merkur-mcp
+```
+
+### Claude Desktop
+
+添加到 `~/Library/Application Support/Claude/claude_desktop_config.json`：
+
+```json
+{
+  "mcpServers": {
+    "merkurdb": {
+      "command": "/path/to/merkur-mcp",
+      "env": {
+        "MERKUR_DB_PATH": "~/.merkur/data/merkur.db"
+      }
+    }
+  }
+}
+```
+
+### Cursor
+
+添加到项目中的 `.cursor/mcp.json`：
+
+```json
+{
+  "mcpServers": {
+    "merkurdb": {
+      "command": "/path/to/merkur-mcp",
+      "env": {
+        "MERKUR_DB_PATH": "~/.merkur/data/merkur.db"
+      }
+    }
+  }
+}
+```
+
+### 可用工具
+
+| 工具 | 描述 |
+|------|------|
+| `write_memory` | 写入新记忆 |
+| `search_memory` | 语义相似度搜索 |
+| `get_memory` | 按 ID 获取记忆 |
+| `delete_memory` | 按 ID 删除记忆 |
+| `relate` | 创建记忆间的关联边 |
+
 ## 开发
 
 ```bash

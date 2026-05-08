@@ -75,6 +75,62 @@ docker build -t merkurdb .
 docker run -p 1934:1934 -v ./data:/var/lib/merkur/data merkurdb
 ```
 
+## MCP Integration
+
+`merkur-mcp` exposes MerkurDB as a Model Context Protocol server over stdio. AI assistants (Claude Desktop, Cursor, etc.) can directly read/write memories.
+
+```bash
+# Build
+cargo build --release -p merkur-mcp
+
+# Run standalone (uses NoopEmbedder by default)
+MERKUR_DB_PATH=~/.merkur/data/merkur.db merkur-mcp
+```
+
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "merkurdb": {
+      "command": "/path/to/merkur-mcp",
+      "env": {
+        "MERKUR_DB_PATH": "~/.merkur/data/merkur.db"
+      }
+    }
+  }
+}
+```
+
+### Cursor
+
+Add to `.cursor/mcp.json` in your project:
+
+```json
+{
+  "mcpServers": {
+    "merkurdb": {
+      "command": "/path/to/merkur-mcp",
+      "env": {
+        "MERKUR_DB_PATH": "~/.merkur/data/merkur.db"
+      }
+    }
+  }
+}
+```
+
+### Available Tools
+
+| Tool | Description |
+|------|-------------|
+| `write_memory` | Write a new memory |
+| `search_memory` | Semantic similarity search |
+| `get_memory` | Get memory by ID |
+| `delete_memory` | Delete memory by ID |
+| `relate` | Create edge between memories |
+
 ## Development
 
 ```bash
