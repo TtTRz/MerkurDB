@@ -17,25 +17,30 @@ COPY crates/embedders/Cargo.toml crates/embedders/
 COPY crates/consolidators/Cargo.toml crates/consolidators/
 COPY crates/forgetters/Cargo.toml crates/forgetters/
 COPY crates/server/Cargo.toml crates/server/
+COPY crates/client/Cargo.toml crates/client/
+COPY crates/cli/Cargo.toml crates/cli/
 
 # Create dummy source files for dependency-only build
 RUN mkdir -p crates/core/src crates/storage/src crates/embedders/src \
-    crates/consolidators/src crates/forgetters/src crates/server/src && \
-    for d in core storage embedders consolidators forgetters server; do \
+    crates/consolidators/src crates/forgetters/src crates/server/src \
+    crates/client/src crates/cli/src && \
+    for d in core storage embedders consolidators forgetters server client; do \
         echo "fn main() {}" > crates/$d/src/lib.rs; \
     done && \
-    echo "fn main() {}" > crates/server/src/main.rs
+    echo "fn main() {}" > crates/server/src/main.rs && \
+    echo "fn main() {}" > crates/cli/src/main.rs
 
 # Build dependencies only (this layer is cached)
-RUN cargo build --release -p merkur-server && \
-    rm -rf target/release/deps/merkur* target/release/merkur-server
+RUN cargo build --release -p merkur-server -p merkurctl && \
+    rm -rf target/release/deps/merkur* target/release/merkur-server target/release/merkurctl
 
 # Copy actual source
 COPY crates/ crates/
 
-# Build the actual binary (with ollama and openai features)
-RUN cargo build --release -p merkur-server --features ollama,openai && \
-    cp target/release/merkur-server /usr/local/bin/
+# Build binaries
+RUN cargo build --release -p merkur-server -p merkurctl --features ollama,openai && \
+    cp target/release/merkur-server /usr/local/bin/ && \
+    cp target/release/merkurctl /usr/local/bin/
 
 # Stage 2: Runtime
 FROM debian:bookworm-slim
@@ -46,6 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/merkur-server /usr/local/bin/merkur-server
+COPY --from=builder /usr/local/bin/merkurctl /usr/local/bin/merkurctl
 
 RUN mkdir -p /var/lib/merkur/data
 
