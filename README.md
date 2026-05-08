@@ -101,22 +101,45 @@ crates/
 
 ## Roadmap
 
-### Completed (v0.1.0 → v0.3.0)
+### Completed
+
+#### v0.1.0 — Foundation
 
 | Category | Feature |
 |----------|---------|
 | Core | Type system (Memory, Edge, MemoryLevel), 4 plugin traits, MerkurError |
 | Storage | SqliteStorage (WAL + r2d2), InMemoryVectorIndex (cosine similarity) |
-| Storage | LanceDbStorage (disk-based IVF-PQ, feature gated) |
-| Embedders | NoopEmbedder (test), OllamaEmbedder, OpenAIEmbedder (feature gated) |
+| Storage | LanceDbStorage (disk-based vector search, feature gated) |
+| Embedders | NoopEmbedder, OllamaEmbedder, OpenAIEmbedder (feature gated) |
 | Retrieval | S1 Fast (vector top-k), S2 Deep (CTE BFS graph diffusion) |
-| Consolidation | NoopConsolidator, LlmConsolidator (LLM summary + entity extraction) |
-| Forgetting | EbbinghausForgetter (decay + access boost + cascade downgrade) |
-| Scheduler | Background consolidation + forgetting loop, manual triggers |
-| API | 14 REST endpoints, CORS, graceful shutdown (SIGTERM) |
-| SDK | `merkur-client` crate: MerkurClient trait + HttpMerkurClient |
-| DevOps | Docker, GitHub Actions CI, OpenAPI 3.0 spec |
-| Docs | README + ARCHITECTURE + SPEC + config example |
+| Consolidation | NoopConsolidator, LlmConsolidator (LLM summary + edge creation) |
+| Forgetting | EbbinghausForgetter (exponential decay + access boost + cascade) |
+| Server | 14 REST endpoints, CORS, Scheduler, graceful shutdown |
+| SDK | `merkur-client` crate, OpenAPI 3.0 spec |
+| DevOps | Docker, GitHub Actions CI |
+
+#### v0.2.0 — Hardening
+
+| Category | Feature |
+|----------|---------|
+| Security | Bearer-token auth middleware, constant-time comparison |
+| Safety | `foreign_keys=ON` per-connection, `spawn_blocking` for all SQLite |
+| Correctness | Ebbinghaus formula fixed (true half-life), BFS cycle detection |
+| Performance | Bounded min-heap top-k, batch `json_each` queries |
+| Config | Figment multi-layer merge, runtime validation |
+| API | Structured error responses, request body limit (10 MiB) |
+
+#### v0.3.0 — Performance & Reliability
+
+| Category | Feature |
+|----------|---------|
+| Critical fix | Consolidation no longer marks failed memories as complete |
+| Performance | N+1 eliminated in 5 hot paths (bfs, write_batch, search, graph, relate) |
+| Performance | Pre-cached L2 norms in vector index, LanceDB auto-index at 256 rows |
+| Security | `subtle` crate for constant-time token comparison |
+| API | `write_batch` returns 207 on full failure, context boost before threshold |
+| Cleanup | Dead code removed (Timeout/Unauthorized variants, rebuild_vector_index) |
+| Docs | Mermaid diagrams (crate deps, retrieval flow, lifecycle, consolidation) |
 
 ### Planned (v0.4.0+)
 
