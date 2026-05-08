@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use std::collections::{BinaryHeap, HashMap};
+use std::sync::Arc;
 
 /// In-memory vector index with O(1) id-keyed update and O(n log k) top-k search.
 ///
@@ -12,13 +13,10 @@ pub struct InMemoryVectorIndex {
 }
 
 struct Inner {
-    /// Parallel storage: `ids[i]` corresponds to `vectors[i]` and `norms[i]`.
-    ids: Vec<String>,
+    ids: Vec<Arc<str>>,
     vectors: Vec<Vec<f32>>,
-    /// Pre-computed L2 norms — avoids O(dim) per candidate during search.
     norms: Vec<f64>,
-    /// id → index position in the vectors array.
-    index_of: HashMap<String, usize>,
+    index_of: HashMap<Arc<str>, usize>,
 }
 
 impl Inner {
@@ -33,13 +31,14 @@ impl Inner {
 
     fn upsert(&mut self, id: String, vec: Vec<f32>) {
         let norm = l2_norm(&vec);
-        if let Some(&idx) = self.index_of.get(&id) {
+        let arc_id: Arc<str> = Arc::from(id.as_str());
+        if let Some(&idx) = self.index_of.get(&*arc_id) {
             self.vectors[idx] = vec;
             self.norms[idx] = norm;
         } else {
             let idx = self.ids.len();
-            self.index_of.insert(id.clone(), idx);
-            self.ids.push(id);
+            self.index_of.insert(arc_id.clone(), idx);
+            self.ids.push(arc_id);
             self.vectors.push(vec);
             self.norms.push(norm);
         }
@@ -119,7 +118,7 @@ impl InMemoryVectorIndex {
 
         let mut results: Vec<(String, f64)> = heap
             .into_iter()
-            .map(|std::cmp::Reverse((TotalF64(score), i))| (inner.ids[i].clone(), score))
+            .map(|std::cmp::Reverse((TotalF64(score), i))| (inner.ids[i].to_string(), score))
             .collect();
         results.sort_by(|a, b| b.1.total_cmp(&a.1));
         results
