@@ -28,7 +28,7 @@ arrow-schema = { version = "57", optional = true }
 futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]
