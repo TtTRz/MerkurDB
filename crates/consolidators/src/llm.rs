@@ -7,14 +7,21 @@ use std::collections::HashSet;
 use std::time::Duration;
 use tracing::warn;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmBackend {
+    Ollama,
+    OpenAI,
+}
+
 pub struct LlmConsolidator {
     base_url: String,
     model: String,
     client: reqwest::Client,
+    backend: LlmBackend,
 }
 
 impl LlmConsolidator {
-    pub fn new(base_url: String, model: String) -> MerkurResult<Self> {
+    pub fn new(base_url: String, model: String, backend: LlmBackend) -> MerkurResult<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .build()
@@ -23,7 +30,82 @@ impl LlmConsolidator {
             base_url: base_url.trim_end_matches('/').to_string(),
             model,
             client,
+            backend,
         })
+    }
+
+    async fn call_llm(&self, prompt: &str) -> MerkurResult<String> {
+        match self.backend {
+            LlmBackend::Ollama => self.call_ollama(prompt).await,
+            LlmBackend::OpenAI => self.call_openai(prompt).await,
+        }
+    }
+
+    async fn call_ollama(&self, prompt: &str) -> MerkurResult<String> {
+        let resp = self
+            .client
+            .post(format!("{}/api/generate", self.base_url))
+            .json(&serde_json::json!({
+                "model": &self.model,
+                "prompt": prompt,
+                "stream": false,
+                "format": "json",
+            }))
+            .send()
+            .await
+            .map_err(|e| MerkurError::Consolidation(format!("LLM request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MerkurError::Consolidation(format!(
+                "LLM returned {status}: {body}"
+            )));
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| MerkurError::Consolidation(format!("Failed to parse LLM body: {e}")))?;
+
+        body["response"].as_str().map(str::to_owned).ok_or_else(|| {
+            MerkurError::Consolidation("LLM response missing 'response' field".into())
+        })
+    }
+
+    async fn call_openai(&self, prompt: &str) -> MerkurResult<String> {
+        let resp = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": &self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+            }))
+            .send()
+            .await
+            .map_err(|e| MerkurError::Consolidation(format!("LLM request failed: {e}")))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(MerkurError::Consolidation(format!(
+                "LLM returned {status}: {body}"
+            )));
+        }
+
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| MerkurError::Consolidation(format!("Failed to parse LLM body: {e}")))?;
+
+        body["choices"][0]["message"]["content"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                MerkurError::Consolidation("LLM response missing choices[0].message.content".into())
+            })
     }
 }
 
@@ -83,38 +165,8 @@ impl Consolidator for LlmConsolidator {
         }
 
         let prompt = build_prompt(memories)?;
-
-        let resp = self
-            .client
-            .post(format!("{}/api/generate", self.base_url))
-            .json(&serde_json::json!({
-                "model": &self.model,
-                "prompt": &prompt,
-                "stream": false,
-                "format": "json",
-            }))
-            .send()
-            .await
-            .map_err(|e| MerkurError::Consolidation(format!("LLM request failed: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(MerkurError::Consolidation(format!(
-                "LLM returned {status}: {body}"
-            )));
-        }
-
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| MerkurError::Consolidation(format!("Failed to parse LLM body: {e}")))?;
-
-        let response_text = body["response"].as_str().ok_or_else(|| {
-            MerkurError::Consolidation("LLM response missing 'response' field".into())
-        })?;
-
-        let cleaned = extract_json_object(response_text);
+        let response_text = self.call_llm(&prompt).await?;
+        let cleaned = extract_json_object(&response_text);
         let parsed: LlmResponse = serde_json::from_str(cleaned).map_err(|e| {
             MerkurError::Consolidation(format!("Failed to parse LLM JSON output: {e}"))
         })?;

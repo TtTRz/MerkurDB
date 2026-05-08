@@ -25,6 +25,8 @@ pub struct Config {
     pub forgetting: ForgettingConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub rate_limit: RateLimitConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -103,6 +105,21 @@ fn default_consolidator() -> String {
 pub struct LlmConsolidatorConfig {
     pub base_url: String,
     pub model: String,
+    #[serde(default = "default_llm_backend")]
+    pub backend: String,
+}
+
+fn default_llm_backend() -> String {
+    "ollama".to_string()
+}
+
+impl LlmConsolidatorConfig {
+    pub fn backend(&self) -> merkur_consolidators::LlmBackend {
+        match self.backend.as_str() {
+            "openai" => merkur_consolidators::LlmBackend::OpenAI,
+            _ => merkur_consolidators::LlmBackend::Ollama,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -151,6 +168,27 @@ pub struct AuthConfig {
     /// `server.dev_mode = true` to bind 0.0.0.0 or use `*` CORS.
     #[serde(default)]
     pub disabled: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_rps")]
+    pub requests_per_second: u32,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+fn default_rps() -> u32 {
+    100
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_second: default_rps(),
+            enabled: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
