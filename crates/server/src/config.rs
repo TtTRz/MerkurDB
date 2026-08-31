@@ -24,6 +24,8 @@ pub struct Config {
     #[serde(default)]
     pub forgetting: ForgettingConfig,
     #[serde(default)]
+    pub write: WriteConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
@@ -219,6 +221,38 @@ pub struct ForgettingConfig {
     pub threshold_to_l0: f64,
     #[serde(default = "default_threshold_archive")]
     pub threshold_archive: f64,
+    #[serde(default = "default_threshold_upgrade")]
+    pub threshold_upgrade: f64,
+    #[serde(default = "default_upgrade_min_access_count")]
+    pub upgrade_min_access_count: u64,
+}
+
+/// Write-time dedup (P2-8).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WriteConfig {
+    /// Top-1 cosine similarity above which a write NOOPs onto the existing
+    /// memory. `0.92` mirrors mem0's published threshold.
+    #[serde(default = "default_dedup_threshold")]
+    pub dedup_threshold: f64,
+    /// Master switch; disabling restores plain insert behavior.
+    #[serde(default = "default_dedup_enabled")]
+    pub dedup_enabled: bool,
+}
+
+impl Default for WriteConfig {
+    fn default() -> Self {
+        Self {
+            dedup_threshold: 0.92,
+            dedup_enabled: true,
+        }
+    }
+}
+
+fn default_dedup_threshold() -> f64 {
+    0.92
+}
+fn default_dedup_enabled() -> bool {
+    true
 }
 
 // Serde requires free functions for field-level defaults. Keep them named for
@@ -257,6 +291,12 @@ fn default_threshold_to_l0() -> f64 {
 fn default_threshold_archive() -> f64 {
     0.1
 }
+fn default_threshold_upgrade() -> f64 {
+    0.6
+}
+fn default_upgrade_min_access_count() -> u64 {
+    3
+}
 
 impl Default for ConsolidationConfig {
     fn default() -> Self {
@@ -279,6 +319,8 @@ impl Default for ForgettingConfig {
             threshold_to_l1: 0.3,
             threshold_to_l0: 0.2,
             threshold_archive: 0.1,
+            threshold_upgrade: 0.6,
+            upgrade_min_access_count: 3,
         }
     }
 }

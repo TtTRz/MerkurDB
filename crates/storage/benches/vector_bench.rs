@@ -41,6 +41,63 @@ fn bench_upsert_remove(c: &mut Criterion) {
     });
 }
 
+fn bench_hybrid_recall(c: &mut Criterion) {
+    use merkur_core::{NewMemory, Storage, hybrid_recall};
+    use merkur_storage::SqliteStorage;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let storage = SqliteStorage::new("file:bench_hybrid?mode=memory&cache=shared", 4).unwrap();
+    rt.block_on(async {
+        for i in 0..1_000 {
+            let content = if i % 10 == 0 {
+                format!("postgres vacuum tuning guide episode {i} 中文记忆内容混合")
+            } else {
+                format!("unrelated filler memory number {i}")
+            };
+            let vec = vec![i as f32 % 4.0, 1.0, 0.0, 0.0];
+            storage
+                .insert_memory(&NewMemory {
+                    content,
+                    category: None,
+                    context: Default::default(),
+                    metadata: Default::default(),
+                    embedding: Some(vec),
+                    namespace: merkur_core::DEFAULT_NAMESPACE.to_string(),
+                })
+                .await
+                .unwrap();
+        }
+    });
+
+    let bm25_only = || {
+        rt.block_on(async {
+            black_box(storage.text_search("vacuum tuning", merkur_core::DEFAULT_NAMESPACE, 20).await.unwrap());
+        });
+    };
+
+    c.bench_function("text_search_bm25_1k", |b| b.iter(bm25_only));
+
+    let full_hybrid = || {
+        rt.block_on(async {
+            // NoopEmbedder's deterministic vectors make the query vector
+            // meaningless here — the point is the end-to-end cost of both
+            // channels plus the RRF fuse and record assembly.
+            let query_vec = vec![1.0f32, 1.0, 0.0, 0.0];
+            black_box(
+                hybrid_recall(&storage, &query_vec, "postgres vacuum tuning", merkur_core::DEFAULT_NAMESPACE, 20)
+                    .await
+                    .unwrap(),
+            );
+        });
+    };
+
+    c.bench_function("hybrid_recall_end_to_end_1k", |b| b.iter(full_hybrid));
+}
+
 fn bench_bfs_expand(c: &mut Criterion) {
     use merkur_core::{EdgeType, NewEdge, NewMemory, Storage};
     use merkur_storage::SqliteStorage;
@@ -63,6 +120,7 @@ fn bench_bfs_expand(c: &mut Criterion) {
                     context: Default::default(),
                     metadata: Default::default(),
                     embedding: Some(vec![i as f32, 0.0, 0.0, 0.0]),
+                    namespace: merkur_core::DEFAULT_NAMESPACE.to_string(),
                 })
                 .await
                 .unwrap();
@@ -96,6 +154,7 @@ criterion_group!(
     benches,
     bench_vector_search,
     bench_upsert_remove,
-    bench_bfs_expand
+    bench_bfs_expand,
+    bench_hybrid_recall
 );
 criterion_main!(benches);

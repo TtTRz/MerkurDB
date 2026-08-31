@@ -8,6 +8,7 @@ use serde_json::json;
 
 use crate::app_state::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::handlers::namespace::Namespace;
 
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
@@ -31,11 +32,12 @@ pub struct SearchQuery {
 }
 
 fn default_mode() -> String {
-    "fast".to_string()
+    "hybrid".to_string()
 }
 
 pub async fn search(
     State(state): State<AppState>,
+    ns: Namespace,
     Query(params): Query<SearchQuery>,
 ) -> ApiResult<impl IntoResponse> {
     let start = std::time::Instant::now();
@@ -43,6 +45,7 @@ pub async fn search(
         return Err(ApiError::bad_request("q must not be empty"));
     }
     let mode = match params.mode.as_str() {
+        "hybrid" => SearchMode::Hybrid,
         "fast" => SearchMode::Fast,
         "deep" => SearchMode::Deep,
         other => {
@@ -77,13 +80,26 @@ pub async fn search(
     let query_vec = state.embedder.encode(&params.q).await?;
 
     let results = match mode {
-        SearchMode::Fast => state.storage.vector_search(&query_vec, limit * 2).await?,
+        // Hybrid is the two-channel recall (BM25 x vector, RRF-fused with
+        // normalized scores). Level/category/date filtering and the context
+        // boost below apply to fused results exactly as they did to cosine.
+        SearchMode::Hybrid => {
+            merkur_core::hybrid_recall(state.storage.as_ref(), &query_vec, &params.q, &ns.0, limit)
+                .await?
+        }
+        SearchMode::Fast => state
+            .storage
+            .vector_search_ns(&query_vec, &ns.0, limit * 2)
+            .await?,
         SearchMode::Deep => {
-            let seeds = state.storage.vector_search(&query_vec, limit).await?;
+            let seeds = state
+                .storage
+                .vector_search_ns(&query_vec, &ns.0, limit)
+                .await?;
             let seed_ids: Vec<String> = seeds.iter().map(|s| s.id.clone()).collect();
             state
                 .storage
-                .bfs_expand(&seed_ids, depth, degree_limit)
+                .bfs_expand_ns(&seed_ids, &ns.0, depth, degree_limit)
                 .await?
         }
     };
@@ -170,7 +186,9 @@ pub async fn search(
                     "level": r.level,
                     "category": r.category,
                     "context": r.context,
-                    "created_at": r.created_at
+                    "created_at": r.created_at,
+                    "namespace": r.namespace,
+                    "importance": r.importance
                 })
             }).collect::<Vec<_>>(),
             "total": total,

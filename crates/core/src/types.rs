@@ -22,6 +22,16 @@ pub struct Memory {
     pub updated_at: DateTime<Utc>,
     pub accessed_at: DateTime<Utc>,
     pub access_count: u64,
+    /// Logical isolation bucket. `NewMemory` defaults to `"default"`; rows
+    /// written before the namespace column existed are backfilled to it.
+    /// This is a *logical* isolation — search/BFS/FTS filter by it — not a
+    /// security boundary (any authenticated caller may claim any bucket).
+    pub namespace: String,
+    /// System-learned salience in [0, 1], written **only** by the Consolidator
+    /// during consolidation. New memories carry the neutral 0.5 prior until a
+    /// consolidator forms an opinion; clients cannot self-report it through
+    /// the write path.
+    pub importance: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +108,21 @@ pub struct NewMemory {
     pub context: HashMap<String, String>,
     pub metadata: HashMap<String, serde_json::Value>,
     pub embedding: Option<Vec<f32>>,
+    /// Target bucket; an empty or whitespace-only value falls back to the
+    /// `"default"` bucket at insert time.
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+}
+
+/// Bucket assigned when the caller does not name one.
+pub const DEFAULT_NAMESPACE: &str = "default";
+
+/// Salience assigned to memories no consolidator has assessed yet. Deliberately
+/// the midpoint: unassessed must neither outrank nor sink beneath assessed rows.
+pub const NEUTRAL_IMPORTANCE: f64 = 0.5;
+
+fn default_namespace() -> String {
+    DEFAULT_NAMESPACE.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +146,12 @@ pub struct ScoredMemory {
     pub category: String,
     pub context: HashMap<String, String>,
     pub created_at: DateTime<Utc>,
+    /// Bucket this hit came from; always populated so clients can render
+    /// isolation visually without re-fetching the memory.
+    pub namespace: String,
+    /// Consolidator-assessed salience, surfaced so clients can render it
+    /// alongside the composite score.
+    pub importance: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +169,9 @@ pub struct ConsolidationReport {
     pub errors: usize,
     pub new_abstracts: HashMap<String, String>,
     pub new_edges: Vec<NewEdge>,
+    /// Consolidator-assessed importance per memory id; absent entries keep
+    /// their prior. Only successfully persisted entries are applied.
+    pub new_importance: HashMap<String, f64>,
 }
 
 impl ConsolidationReport {
@@ -159,6 +193,11 @@ pub struct ConsolidationLogEntry {
 #[derive(Debug, Clone)]
 pub enum LevelAction {
     Downgrade(MemoryLevel),
+    /// Access-driven promotion back up the ladder (e.g. Title -> Summary).
+    /// Firing this requires demonstrated demand — a derived weight well above
+    /// the downgrade bars plus a minimum access count — so a memory oscillates
+    /// around no single boundary (hysteresis).
+    Upgrade(MemoryLevel),
     Archive,
     Keep,
 }
@@ -166,7 +205,13 @@ pub enum LevelAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchMode {
+    /// BM25 x vector retrieval fused via reciprocal rank fusion. The default,
+    /// because a memory store's out-of-the-box path should always be its best
+    /// retrieval.
+    Hybrid,
+    /// Pure cosine similarity over embeddings. Lowest latency escape hatch.
     Fast,
+    /// Vector seeds expanded through the memory graph via BFS.
     Deep,
 }
 
@@ -198,7 +243,7 @@ pub struct SearchOptions {
 impl Default for SearchOptions {
     fn default() -> Self {
         Self {
-            mode: SearchMode::Fast,
+            mode: SearchMode::Hybrid,
             limit: 10,
             score_threshold: 0.3,
             context: None,

@@ -105,6 +105,17 @@ impl Scheduler {
             }
         }
 
+        // Importance follows the same persistence contract as abstracts:
+        // only assessments for memories whose abstract landed are applied.
+        for id in &consolidated_ids {
+            if let Some(importance) = report.new_importance.get(id)
+                && let Err(e) = storage.update_importance(id, *importance).await
+            {
+                error!("Failed to update importance for {id}: {e}");
+                report.errors += 1;
+            }
+        }
+
         let mut actually_created = 0;
         for edge in &report.new_edges {
             match storage.insert_edge(edge).await {
@@ -157,22 +168,23 @@ impl Scheduler {
         forgetter: &(dyn Forgetter + Send + Sync),
         batch_size: usize,
         archive_days: i32,
-    ) -> (usize, usize, usize) {
+    ) -> (usize, usize, usize, usize) {
         let memories = match storage.list_for_forgetting(batch_size).await {
             Ok(m) => m,
             Err(e) => {
                 error!("Failed to list memories for forgetting: {e}");
-                return (0, 0, 0);
+                return (0, 0, 0, 0);
             }
         };
 
         if memories.is_empty() {
-            return (0, 0, 0);
+            return (0, 0, 0, 0);
         }
 
         let now = chrono::Utc::now();
         let mut archived = 0;
         let mut downgraded = 0;
+        let mut upgraded = 0;
 
         for memory in &memories {
             let action = forgetter.decide(memory, now);
@@ -192,14 +204,22 @@ impl Scheduler {
                         debug!("Downgraded {} to {:?}", memory.id, level);
                     }
                 }
+                LevelAction::Upgrade(level) => {
+                    if let Err(e) = storage.update_level(&memory.id, level.to_i32()).await {
+                        error!("Failed to upgrade {}: {e}", memory.id);
+                    } else {
+                        upgraded += 1;
+                        debug!("Upgraded {} to {:?}", memory.id, level);
+                    }
+                }
                 LevelAction::Keep => {}
             }
         }
 
-        if archived > 0 || downgraded > 0 {
+        if archived > 0 || downgraded > 0 || upgraded > 0 {
             info!(
-                "Forgetting tick: archived={}, downgraded={}",
-                archived, downgraded
+                "Forgetting tick: archived={}, downgraded={}, upgraded={}",
+                archived, downgraded, upgraded
             );
         }
 
@@ -211,7 +231,7 @@ impl Scheduler {
             info!("Cleaned up {cleaned} archived memories");
         }
 
-        (archived, downgraded, cleaned)
+        (archived, downgraded, upgraded, cleaned)
     }
 
     async fn run_forgetting(&self) {

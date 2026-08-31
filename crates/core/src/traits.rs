@@ -30,6 +30,20 @@ pub trait Forgetter: Send + Sync {
 #[async_trait]
 pub trait Storage: Send + Sync {
     async fn insert_memory(&self, mem: &NewMemory) -> MerkurResult<String>;
+
+    /// Insert with a write-time dedup short-circuit (P2-8).
+    ///
+    /// Before inserting, the implementation looks up the top-1 most similar
+    /// memory **in the same namespace**. If its cosine similarity clears
+    /// `threshold`, the write is a NOOP: no new row is created and the id of
+    /// the existing memory is returned instead. This is the ADD/NOOP half of
+    /// mem0's write governance; UPDATE/DELETE adjudication stays with the
+    /// asynchronous Consolidator.
+    ///
+    /// Implementations may skip the check when the new memory carries no
+    /// embedding (there is nothing to compare).
+    async fn insert_memory_dedup(&self, mem: &NewMemory, threshold: f64)
+    -> MerkurResult<String>;
     async fn update_memory(
         &self,
         id: &str,
@@ -39,7 +53,35 @@ pub trait Storage: Send + Sync {
     async fn get_memory(&self, id: &str) -> MerkurResult<Option<Memory>>;
     async fn delete_memory(&self, id: &str) -> MerkurResult<()>;
 
+    /// Pure cosine channel over **every** bucket. Kept for the rare
+    /// cross-namespace audit path; new callers should prefer
+    /// [`Storage::vector_search_ns`].
     async fn vector_search(&self, vec: &[f32], limit: usize) -> MerkurResult<Vec<ScoredMemory>>;
+
+    /// Cosine channel restricted to one bucket.
+    async fn vector_search_ns(
+        &self,
+        vec: &[f32],
+        namespace: &str,
+        limit: usize,
+    ) -> MerkurResult<Vec<ScoredMemory>>;
+
+    /// Full-text (BM25) channel for hybrid retrieval, best match first.
+    ///
+    /// Implementations tokenize with FTS5's trigram tokenizer, so CJK and
+    /// unsegmented scripts are matched by substring. Queries shorter than
+    /// three characters (after trimming) cannot produce any trigram and yield
+    /// an empty result — the vector channel is expected to cover those.
+    /// Returned scores are raw SQLite `bm25()` values where smaller means more
+    /// relevant; only ordering is meaningful to callers.
+    ///
+    /// Restricted to one bucket.
+    async fn text_search(
+        &self,
+        query: &str,
+        namespace: &str,
+        limit: usize,
+    ) -> MerkurResult<Vec<(String, f64)>>;
 
     async fn insert_edge(&self, edge: &NewEdge) -> MerkurResult<()>;
     async fn get_edges(&self, memory_id: &str) -> MerkurResult<Vec<crate::Edge>>;
@@ -56,9 +98,20 @@ pub trait Storage: Send + Sync {
         memory_ids: &[String],
     ) -> MerkurResult<HashMap<String, Vec<crate::Edge>>>;
 
+    /// Graph traversal over **every** bucket (legacy, cross-bucket).
     async fn bfs_expand(
         &self,
         seed_ids: &[String],
+        depth: usize,
+        degree_limit: usize,
+    ) -> MerkurResult<Vec<ScoredMemory>>;
+
+    /// Graph traversal restricted to one bucket: edges whose endpoints live
+    /// in other buckets are silently not followed.
+    async fn bfs_expand_ns(
+        &self,
+        seed_ids: &[String],
+        namespace: &str,
         depth: usize,
         degree_limit: usize,
     ) -> MerkurResult<Vec<ScoredMemory>>;
@@ -80,6 +133,11 @@ pub trait Storage: Send + Sync {
     /// the LLM-generated summary, rather than tunnelling it through the
     /// `context_tags` side-table.
     async fn update_abstract(&self, id: &str, abstract_: &str) -> MerkurResult<()>;
+
+    /// Persist a Consolidator-assessed importance score. This is the **only**
+    /// write path for importance — the public write API has no such field, so
+    /// salience stays system-learned rather than client-reported.
+    async fn update_importance(&self, id: &str, importance: f64) -> MerkurResult<()>;
 
     async fn delete_archived_older_than(&self, days: i32) -> MerkurResult<usize>;
 

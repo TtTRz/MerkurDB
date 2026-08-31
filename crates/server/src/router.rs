@@ -19,6 +19,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/v1/write", post(handlers::write::write))
         .route("/v1/write-batch", post(handlers::write::write_batch))
         .route("/v1/search", get(handlers::search::search))
+        .route("/v1/context", post(handlers::context::assemble_context))
         .route("/v1/memory/{id}", get(handlers::memory::get_memory))
         .route("/v1/memory/{id}", put(handlers::memory::update_memory))
         .route("/v1/memory/{id}", delete(handlers::memory::delete_memory))

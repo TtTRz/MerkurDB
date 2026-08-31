@@ -17,6 +17,14 @@ pub struct EbbinghausConfig {
     pub threshold_to_l1: f64,
     pub threshold_to_l0: f64,
     pub threshold_archive: f64,
+    /// Derived-weight bar for promoting a demoted memory one rung back up.
+    /// Sits deliberately above the downgrade thresholds so that noise around
+    /// any single value cannot flip-flop a memory between levels
+    /// (hysteresis: down at <=0.3, back up only at >=0.6 by default).
+    pub threshold_upgrade: f64,
+    /// Minimum lifetime access count before a memory is eligible for
+    /// promotion. One lucky hit is not demand; repeated retrieval is.
+    pub upgrade_min_access_count: u64,
 }
 
 impl Default for EbbinghausConfig {
@@ -28,6 +36,8 @@ impl Default for EbbinghausConfig {
             threshold_to_l1: 0.3,
             threshold_to_l0: 0.2,
             threshold_archive: 0.1,
+            threshold_upgrade: 0.6,
+            upgrade_min_access_count: 3,
         }
     }
 }
@@ -84,6 +94,20 @@ impl Forgetter for EbbinghausForgetter {
             return LevelAction::Archive;
         }
 
+        // Access-driven promotion: frequent *and* recent retrieval lifts a
+        // demoted memory one rung. Archived rows never rise from here — they
+        // are on the physical-deletion countdown and are not even listed into
+        // forgetting ticks (`level >= 0` filter).
+        if memory.access_count >= self.config.upgrade_min_access_count
+            && new_weight >= self.config.threshold_upgrade
+        {
+            match memory.level {
+                MemoryLevel::Title => return LevelAction::Upgrade(MemoryLevel::Summary),
+                MemoryLevel::Summary => return LevelAction::Upgrade(MemoryLevel::Full),
+                _ => {}
+            }
+        }
+
         match memory.level {
             MemoryLevel::Full => {
                 if new_weight < self.config.threshold_to_l1 {
@@ -137,6 +161,8 @@ mod tests {
             updated_at: accessed_at,
             accessed_at,
             access_count,
+            namespace: merkur_core::DEFAULT_NAMESPACE.to_string(),
+            importance: merkur_core::NEUTRAL_IMPORTANCE,
         }
     }
 
@@ -257,5 +283,89 @@ mod tests {
         // delta_t=0 → decay=1.0, so weight = 1.0 * 1.0 * min(access_bonus, 3.0)
         assert!(weight <= 3.0 + 1e-9, "weight {weight} exceeds cap of 3.0");
         assert!(weight >= 2.9, "weight {weight} unexpectedly low");
+    }
+
+    #[test]
+    fn test_decide_upgrades_summary_to_full() {
+        // Fresh, frequently accessed, high derived weight -> promotion.
+        let config = EbbinghausConfig {
+            half_life_seconds: f64::MAX,
+            ..Default::default()
+        };
+        let f = EbbinghausForgetter::new(config);
+        let now = Utc::now();
+        let mem = make_memory(now - Duration::seconds(10), 0.5, MemoryLevel::Summary, 10);
+        assert!(matches!(
+            f.decide(&mem, now),
+            LevelAction::Upgrade(MemoryLevel::Full)
+        ));
+    }
+
+    #[test]
+    fn test_decide_upgrades_title_to_summary() {
+        let config = EbbinghausConfig {
+            half_life_seconds: f64::MAX,
+            ..Default::default()
+        };
+        let f = EbbinghausForgetter::new(config);
+        let now = Utc::now();
+        let mem = make_memory(now - Duration::seconds(10), 0.5, MemoryLevel::Title, 10);
+        assert!(matches!(
+            f.decide(&mem, now),
+            LevelAction::Upgrade(MemoryLevel::Summary)
+        ));
+    }
+
+    #[test]
+    fn test_decide_needs_min_access_count_for_upgrade() {
+        // Fresh but accessed only once: no demonstrated demand, keep as-is.
+        let config = EbbinghausConfig {
+            half_life_seconds: f64::MAX,
+            ..Default::default()
+        };
+        let f = EbbinghausForgetter::new(config);
+        let now = Utc::now();
+        let mem = make_memory(now - Duration::seconds(10), 0.5, MemoryLevel::Summary, 1);
+        assert_eq!(f.config.upgrade_min_access_count, 3);
+        assert!(matches!(f.decide(&mem, now), LevelAction::Keep));
+    }
+
+    #[test]
+    fn test_decide_upgrade_is_blocked_when_weight_below_bar() {
+        // Accessed plenty but long ago: decay sank the derived weight under
+        // the promotion bar; without a fresh signal there is no promotion.
+        let config = EbbinghausConfig {
+            half_life_seconds: 3600.0, // 1h half-life
+            ..Default::default()
+        };
+        let f = EbbinghausForgetter::new(config);
+        let now = Utc::now();
+        // Two half-lives (1h) old -> decay = 0.25; bonus ~1.58 for 50 hits.
+        // Derived weight lands at ~0.4: inside the hysteresis band
+        // [threshold_to_l0=0.2, threshold_upgrade=0.6) -> Keep.
+        let mem = make_memory(
+            now - Duration::seconds(7200),
+            1.0,
+            MemoryLevel::Summary,
+            50,
+        );
+        let w = f.compute_weight(&mem, now);
+        assert!(
+            (0.2..0.6).contains(&w),
+            "expected weight inside the hysteresis band, got {w}"
+        );
+        assert!(matches!(f.decide(&mem, now), LevelAction::Keep));
+    }
+
+    #[test]
+    fn test_archived_memories_are_never_promoted() {
+        let config = EbbinghausConfig {
+            half_life_seconds: f64::MAX,
+            ..Default::default()
+        };
+        let f = EbbinghausForgetter::new(config);
+        let now = Utc::now();
+        let mem = make_memory(now, 1.0, MemoryLevel::Archived, 100);
+        assert!(matches!(f.decide(&mem, now), LevelAction::Keep));
     }
 }

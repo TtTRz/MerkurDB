@@ -61,6 +61,8 @@ async fn main() -> Result<()> {
             threshold_to_l1: cfg.forgetting.threshold_to_l1,
             threshold_to_l0: cfg.forgetting.threshold_to_l0,
             threshold_archive: cfg.forgetting.threshold_archive,
+            threshold_upgrade: cfg.forgetting.threshold_upgrade,
+            upgrade_min_access_count: cfg.forgetting.upgrade_min_access_count,
         },
     ));
 

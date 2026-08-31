@@ -77,6 +77,7 @@ impl MerkurMcp {
             context: Default::default(),
             metadata: Default::default(),
             embedding,
+            namespace: merkur_core::DEFAULT_NAMESPACE.to_string(),
         };
         match self.storage.insert_memory(&mem).await {
             Ok(id) => format!(r#"{{"id":"{id}","status":"ok"}}"#),
@@ -84,14 +85,15 @@ impl MerkurMcp {
         }
     }
 
-    #[tool(description = "Search memories by semantic similarity")]
+    #[tool(description = "Search memories by hybrid BM25 + vector relevance")]
     async fn search_memory(&self, args: Parameters<SearchArgs>) -> String {
         let args = args.0;
         let vec = match self.embedder.encode(&args.query).await {
             Ok(v) => v,
             Err(e) => return format!("Embedding error: {e}"),
         };
-        match self.storage.vector_search(&vec, args.limit).await {
+        match merkur_core::hybrid_recall(self.storage.as_ref(), &vec, &args.query, merkur_core::DEFAULT_NAMESPACE, args.limit).await
+        {
             Ok(results) => {
                 serde_json::to_string_pretty(&results).unwrap_or_else(|e| format!("Error: {e}"))
             }

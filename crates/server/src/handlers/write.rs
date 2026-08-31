@@ -5,6 +5,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+
+use crate::handlers::namespace::Namespace;
 use merkur_core::{NewMemory, WriteItem, limits};
 use serde::Deserialize;
 use serde_json::json;
@@ -39,6 +41,7 @@ fn check_content(content: &str) -> ApiResult<()> {
 
 pub async fn write(
     State(state): State<AppState>,
+    ns: Namespace,
     Json(req): Json<WriteRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let start = Instant::now();
@@ -52,9 +55,17 @@ pub async fn write(
         context: req.context.unwrap_or_default(),
         metadata: req.metadata.unwrap_or_default(),
         embedding: Some(embedding),
+        namespace: ns.0.clone(),
     };
 
-    let id = state.storage.insert_memory(&new_mem).await?;
+    let id = if state.config.write.dedup_enabled {
+        state
+            .storage
+            .insert_memory_dedup(&new_mem, state.config.write.dedup_threshold)
+            .await?
+    } else {
+        state.storage.insert_memory(&new_mem).await?
+    };
     let time_ms = start.elapsed().as_millis() as u64;
     Ok((
         StatusCode::CREATED,
@@ -69,6 +80,7 @@ pub async fn write(
 
 pub async fn write_batch(
     State(state): State<AppState>,
+    ns: Namespace,
     Json(req): Json<WriteBatchRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let start = Instant::now();
@@ -127,8 +139,17 @@ pub async fn write_batch(
             context: item.context.clone().unwrap_or_default(),
             metadata: item.metadata.clone().unwrap_or_default(),
             embedding: Some(embedding),
+            namespace: ns.0.clone(),
         };
-        match state.storage.insert_memory(&new_mem).await {
+        let inserted = if state.config.write.dedup_enabled {
+            state
+                .storage
+                .insert_memory_dedup(&new_mem, state.config.write.dedup_threshold)
+                .await
+        } else {
+            state.storage.insert_memory(&new_mem).await
+        };
+        match inserted {
             Ok(id) => ids.push(id),
             Err(e) => errors.push(json!({
                 "index": *i,

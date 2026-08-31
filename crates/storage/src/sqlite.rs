@@ -4,6 +4,7 @@ use merkur_core::{
     ConsolidationLogEntry, ConsolidationReport, Edge, Memory, MemoryLevel, MerkurError,
     MerkurResult, NewEdge, NewMemory, ScoredMemory, Storage, StorageStats,
 };
+use merkur_core::{escape_fts_query, is_bm25_viable};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
@@ -159,6 +160,11 @@ impl Storage for SqliteStorage {
         let embedding_blob = mem.embedding.as_ref().map(|v| vec_f32_to_bytes(v));
         let context = mem.context.clone();
         let content = mem.content.clone();
+        let namespace = if mem.namespace.trim().is_empty() {
+            merkur_core::DEFAULT_NAMESPACE.to_string()
+        } else {
+            mem.namespace.clone()
+        };
 
         let pool = self.pool.clone();
         let id_for_db = id.clone();
@@ -170,9 +176,9 @@ impl Storage for SqliteStorage {
                 .transaction()
                 .map_err(|e| MerkurError::Storage(format!("begin tx failed: {e}")))?;
             tx.execute(
-                "INSERT INTO memories (id, content, category, weight, level, pending_consolidation, embedding, metadata, created_at, updated_at, accessed_at)
-                 VALUES (?1, ?2, ?3, 1.0, 2, 1, ?4, ?5, ?6, ?6, ?6)",
-                params![id_for_db, content, category, embedding_blob, metadata, now],
+                "INSERT INTO memories (id, content, category, weight, level, pending_consolidation, embedding, metadata, created_at, updated_at, accessed_at, namespace)
+                 VALUES (?1, ?2, ?3, 1.0, 2, 1, ?4, ?5, ?6, ?6, ?6, ?7)",
+                params![id_for_db, content, category, embedding_blob, metadata, now, namespace],
             )
             .map_err(|e| MerkurError::Storage(format!("Failed to insert memory: {e}")))?;
             for (k, v) in &context {
@@ -193,6 +199,31 @@ impl Storage for SqliteStorage {
         }
 
         Ok(id)
+    }
+
+    async fn insert_memory_dedup(
+        &self,
+        mem: &NewMemory,
+        threshold: f64,
+    ) -> MerkurResult<String> {
+        // Only the vector channel can answer "is this near-duplicate?"; a
+        // memory without an embedding has no dedup signal and inserts plainly.
+        if let Some(embedding) = mem.embedding.as_deref() {
+            let top = self
+                .vector_search_ns(embedding, &mem.namespace, 1)
+                .await?;
+            if let Some(hit) = top.first()
+                && hit.score >= threshold
+            {
+                tracing::debug!(
+                    existing_id = hit.id.as_str(),
+                    similarity = hit.score,
+                    "write-time dedup: NOOP onto existing memory"
+                );
+                return Ok(hit.id.clone());
+            }
+        }
+        self.insert_memory(mem).await
     }
 
     async fn update_memory(
@@ -240,7 +271,7 @@ impl Storage for SqliteStorage {
                 .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, content, abstract, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, access_count
+                    "SELECT id, content, abstract, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, access_count, namespace, importance
                      FROM memories WHERE id = ?1",
                 )
                 .map_err(|e| MerkurError::Storage(format!("Failed to prepare statement: {e}")))?;
@@ -260,6 +291,8 @@ impl Storage for SqliteStorage {
                     row.get::<_, String>(9)?,
                     row.get::<_, String>(10)?,
                     row.get::<_, i64>(11)? as u64,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, f64>(13)?,
                 ))
             });
 
@@ -277,6 +310,8 @@ impl Storage for SqliteStorage {
                     updated_at,
                     accessed_at,
                     access_count,
+                    namespace,
+                    importance,
                 )) => {
                     let level = MemoryLevel::from_i32(level_i32);
                     let metadata: HashMap<String, serde_json::Value> =
@@ -297,6 +332,8 @@ impl Storage for SqliteStorage {
                         updated_at: sqlite_helpers::parse_rfc3339(&updated_at),
                         accessed_at: sqlite_helpers::parse_rfc3339(&accessed_at),
                         access_count,
+                        namespace,
+                        importance,
                     }))
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -326,9 +363,33 @@ impl Storage for SqliteStorage {
         Ok(())
     }
 
-    async fn vector_search(&self, vec: &[f32], limit: usize) -> MerkurResult<Vec<ScoredMemory>> {
+    async fn text_search(
+        &self,
+        query: &str,
+        namespace: &str,
+        limit: usize,
+    ) -> MerkurResult<Vec<(String, f64)>> {
+        if !is_bm25_viable(query) {
+            return Ok(Vec::new());
+        }
+        let expr = escape_fts_query(query);
+        let namespace = namespace.to_string();
+        let pool = self.pool.clone();
+        run_blocking(move || {
+            sqlite_helpers::text_search_bm25(&pool, &expr, &namespace, limit)
+        })
+        .await
+    }
+
+    async fn vector_search_ns(
+        &self,
+        vec: &[f32],
+        namespace: &str,
+        limit: usize,
+    ) -> MerkurResult<Vec<ScoredMemory>> {
         let oversample = limit.saturating_mul(2).max(limit);
         let scored_ids = self.vector_index.search(vec, oversample);
+        let namespace = namespace.to_string();
         if scored_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -338,7 +399,7 @@ impl Storage for SqliteStorage {
         let scores: HashMap<String, f64> = scored_ids.into_iter().collect();
         let ids_for_query = ids.clone();
 
-        let memories = run_blocking(move || -> MerkurResult<Vec<(String, String, Option<String>, String, f64, i32, String)>> {
+        let memories = run_blocking(move || -> MerkurResult<Vec<(String, String, Option<String>, String, f64, i32, String, String, f64)>> {
             let conn = pool
                 .get()
                 .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
@@ -346,14 +407,14 @@ impl Storage for SqliteStorage {
                 .map_err(|e| MerkurError::Storage(format!("Failed to encode ids: {e}")))?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, content, abstract, category, weight, level, created_at
+                    "SELECT id, content, abstract, category, weight, level, created_at, namespace, importance
                      FROM memories
                      WHERE id IN (SELECT value FROM json_each(?1))
-                       AND level >= 0",
+                       AND level >= 0 AND namespace = ?2",
                 )
                 .map_err(|e| MerkurError::Storage(format!("Failed to prepare batch query: {e}")))?;
             let rows = stmt
-                .query_map(params![ids_json], |row| {
+                .query_map(params![ids_json, namespace], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -362,6 +423,8 @@ impl Storage for SqliteStorage {
                         row.get::<_, f64>(4)?,
                         row.get::<_, i32>(5)?,
                         row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, f64>(8)?,
                     ))
                 })
                 .map_err(|e| MerkurError::Storage(format!("Batch query failed: {e}")))?;
@@ -413,7 +476,7 @@ impl Storage for SqliteStorage {
         let mut out: Vec<ScoredMemory> = memories
             .into_iter()
             .map(
-                |(id, content, abstract_, category, weight, level_i32, created_at)| {
+                |(id, content, abstract_, category, weight, level_i32, created_at, namespace, importance)| {
                     let level = MemoryLevel::from_i32(level_i32);
                     let score = scores.get(&id).copied().unwrap_or(0.0);
                     let context = ctx_map.get(&id).cloned().unwrap_or_default();
@@ -427,6 +490,8 @@ impl Storage for SqliteStorage {
                         category,
                         context,
                         created_at: sqlite_helpers::parse_rfc3339(&created_at),
+                        namespace,
+                        importance,
                     }
                 },
             )
@@ -438,6 +503,9 @@ impl Storage for SqliteStorage {
         });
         out.truncate(limit);
 
+        // NOTE: the fire-and-forget access bump below sees only this
+        // bucket's hits — intentional: a retrieval only counts as demand
+        // inside the bucket it actually answered.
         let pool3 = self.pool.clone();
         let touched: Vec<String> = out.iter().map(|s| s.id.clone()).collect();
         tokio::spawn(async move {
@@ -446,6 +514,15 @@ impl Storage for SqliteStorage {
         });
 
         Ok(out)
+    }
+
+    async fn vector_search(&self, vec: &[f32], limit: usize) -> MerkurResult<Vec<ScoredMemory>> {
+        // Legacy cross-bucket audit path. Until a dedicated audit endpoint
+        // exists we delegate to the default bucket, which holds every row
+        // written without an explicit namespace — behavior stays compatible
+        // with pre-namespace callers.
+        self.vector_search_ns(vec, merkur_core::DEFAULT_NAMESPACE, limit)
+            .await
     }
 
     async fn insert_edge(&self, edge: &NewEdge) -> MerkurResult<()> {
@@ -475,9 +552,30 @@ impl Storage for SqliteStorage {
         depth: usize,
         degree_limit: usize,
     ) -> MerkurResult<Vec<ScoredMemory>> {
+        // Legacy cross-bucket traversal — retained only for callers that
+        // have not adopted namespaces yet.
         let seeds = seed_ids.to_vec();
         let pool = self.pool.clone();
-        run_blocking(move || sqlite_helpers::bfs_expand(&pool, &seeds, depth, degree_limit)).await
+        run_blocking(move || {
+            sqlite_helpers::bfs_expand(&pool, &seeds, None, depth, degree_limit)
+        })
+        .await
+    }
+
+    async fn bfs_expand_ns(
+        &self,
+        seed_ids: &[String],
+        namespace: &str,
+        depth: usize,
+        degree_limit: usize,
+    ) -> MerkurResult<Vec<ScoredMemory>> {
+        let seeds = seed_ids.to_vec();
+        let namespace = namespace.to_string();
+        let pool = self.pool.clone();
+        run_blocking(move || {
+            sqlite_helpers::bfs_expand(&pool, &seeds, Some(&namespace), depth, degree_limit)
+        })
+        .await
     }
 
     async fn insert_context_tag(
@@ -543,6 +641,13 @@ impl Storage for SqliteStorage {
         let abstract_owned = abstract_.to_string();
         let pool = self.pool.clone();
         run_blocking(move || sqlite_helpers::update_abstract(&pool, &id_owned, &abstract_owned))
+            .await
+    }
+
+    async fn update_importance(&self, id: &str, importance: f64) -> MerkurResult<()> {
+        let id_owned = id.to_string();
+        let pool = self.pool.clone();
+        run_blocking(move || sqlite_helpers::update_importance(&pool, &id_owned, importance))
             .await
     }
 

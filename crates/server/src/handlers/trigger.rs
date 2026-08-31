@@ -31,7 +31,7 @@ pub async fn trigger_consolidate(State(state): State<AppState>) -> ApiResult<imp
 }
 
 pub async fn trigger_forget(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
-    let (archived, downgraded, cleaned) = scheduler::Scheduler::run_forgetting_once(
+    let (archived, downgraded, upgraded, cleaned) = scheduler::Scheduler::run_forgetting_once(
         &*state.storage,
         &*state.forgetter,
         state.config.forgetting.batch_size,
@@ -44,6 +44,7 @@ pub async fn trigger_forget(State(state): State<AppState>) -> ApiResult<impl Int
             "status": "ok",
             "archived": archived,
             "downgraded": downgraded,
+            "upgraded": upgraded,
             "cleaned": cleaned
         })),
     ))

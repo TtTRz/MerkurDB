@@ -18,6 +18,8 @@ type BfsRow = (
     i32,
     String,
     String,
+    String,
+    f64,
 );
 
 /// Build a connection pool that enforces `foreign_keys=ON` on every connection.
@@ -78,6 +80,7 @@ pub fn insert_edge(pool: &Pool<SqliteConnectionManager>, edge: &NewEdge) -> Merk
 pub fn bfs_expand(
     pool: &Pool<SqliteConnectionManager>,
     seed_ids: &[String],
+    namespace: Option<&str>,
     depth: usize,
     degree_limit: usize,
 ) -> MerkurResult<Vec<ScoredMemory>> {
@@ -97,7 +100,15 @@ pub fn bfs_expand(
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
 
     // Path delimiters guarantee that LIKE '%,<id>,%' matches whole IDs only.
-    let sql = "WITH RECURSIVE
+    // Namespace filtering lives in the terminal JOIN: edges crossing buckets
+    // are still traversed (they exist), but their far endpoint never lands in
+    // the result set, so a bucket's neighborhood stays its own.
+    let ns_clause = if namespace.is_some() {
+        " AND m.namespace = ?4"
+    } else {
+        ""
+    };
+    let sql = format!("WITH RECURSIVE
             bfs(id, d, w, path) AS (
                 SELECT value, 0, 1.0, ',' || value || ','
                 FROM (SELECT DISTINCT value FROM json_each(?1))
@@ -116,33 +127,45 @@ pub fn bfs_expand(
                 WHERE bfs.d < ?2
                   AND bfs.path NOT LIKE '%,' || (CASE WHEN e.source_id = bfs.id THEN e.target_id ELSE e.source_id END) || ',%'
             )
-        SELECT bfs.id, bfs.d, bfs.w, m.content, m.abstract, m.level, m.category, m.created_at
+        SELECT bfs.id, bfs.d, bfs.w, m.content, m.abstract, m.level, m.category, m.created_at, m.namespace, m.importance
         FROM bfs
         JOIN memories m ON m.id = bfs.id
-        WHERE bfs.d > 0 AND m.level >= 0
+        WHERE bfs.d > 0 AND m.level >= 0{ns_clause}
         ORDER BY bfs.d, bfs.w DESC
-        LIMIT ?3";
+        LIMIT ?3");
+
+    fn bfs_row_mapper(row: &rusqlite::Row) -> rusqlite::Result<BfsRow> {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i32>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, i32>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, f64>(9)?,
+        ))
+    }
 
     let mut stmt = conn
-        .prepare(sql)
+        .prepare(&sql)
         .map_err(|e| MerkurError::Storage(format!("Failed to prepare BFS query: {e}")))?;
-    let rows = stmt
-        .query_map(
-            params![seeds_json, depth as i64, degree_limit as i64],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i32>(1)?,
-                    row.get::<_, f64>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, i32>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                ))
-            },
-        )
-        .map_err(|e| MerkurError::Storage(format!("BFS query failed: {e}")))?;
+    let rows = match namespace {
+        Some(ns) => stmt
+            .query_map(
+                params![seeds_json, depth as i64, degree_limit as i64, ns],
+                bfs_row_mapper,
+            )
+            .map_err(|e| MerkurError::Storage(format!("BFS query failed: {e}")))?,
+        None => stmt
+            .query_map(
+                params![seeds_json, depth as i64, degree_limit as i64],
+                bfs_row_mapper,
+            )
+            .map_err(|e| MerkurError::Storage(format!("BFS query failed: {e}")))?,
+    };
 
     // Collect all rows first, then batch-fetch context_tags.
     let mut seen = std::collections::HashSet::new();
@@ -159,7 +182,7 @@ pub fn bfs_expand(
     let mut ctx_map = get_context_tags_batch(pool, &neighbor_ids)?;
 
     let mut results = Vec::with_capacity(intermediate.len());
-    for (id, bfs_depth, weight, content, abstract_, level_i32, category, created_at) in intermediate
+    for (id, bfs_depth, weight, content, abstract_, level_i32, category, created_at, namespace, importance) in intermediate
     {
         let level = MemoryLevel::from_i32(level_i32);
         let decay = 0.5_f64.powi(bfs_depth);
@@ -177,6 +200,8 @@ pub fn bfs_expand(
             category,
             context,
             created_at,
+            namespace,
+            importance,
         });
     }
 
@@ -663,5 +688,59 @@ pub fn update_abstract(
     if affected == 0 {
         return Err(MerkurError::MemoryNotFound(id.to_string()));
     }
+    Ok(())
+}
+
+/// BM25 (FTS5) lookup backing `Storage::text_search` for both backends.
+///
+/// `match_expr` must already be an escaped FTS5 MATCH expression (see
+/// `merkur_core::escape_fts_query`). Scores are raw `bm25()` values — smaller
+/// means more relevant, so rows come out best-first and callers should treat
+/// only the ordering as meaningful.
+pub fn text_search_bm25(
+    pool: &Pool<SqliteConnectionManager>,
+    match_expr: &str,
+    namespace: &str,
+    limit: usize,
+) -> MerkurResult<Vec<(String, f64)>> {
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.id, bm25(memories_fts) AS score
+             FROM memories_fts f
+             JOIN memories m ON m.id = f.id
+             WHERE memories_fts MATCH ?1 AND m.level >= 0 AND m.namespace = ?3
+             ORDER BY score
+             LIMIT ?2",
+        )
+        .map_err(|e| MerkurError::Storage(format!("Failed to prepare text search: {e}")))?;
+    let rows = stmt
+        .query_map(params![match_expr, limit as i64, namespace], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })
+        .map_err(|e| MerkurError::Storage(format!("Text search failed: {e}")))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| MerkurError::Storage(format!("Row error: {e}")))?);
+    }
+    Ok(out)
+}
+
+/// Persist a Consolidator-assessed importance score (P1-5).
+pub fn update_importance(
+    pool: &Pool<SqliteConnectionManager>,
+    id: &str,
+    importance: f64,
+) -> MerkurResult<()> {
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+    conn.execute(
+        "UPDATE memories SET importance = ?1, updated_at = ?2 WHERE id = ?3",
+        params![importance, Utc::now().to_rfc3339(), id],
+    )
+    .map_err(|e| MerkurError::Storage(format!("Failed to update importance: {e}")))?;
     Ok(())
 }

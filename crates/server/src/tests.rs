@@ -6,7 +6,7 @@ mod integration {
     use axum::http::Request;
     use axum::http::StatusCode;
     use merkur_consolidators::NoopConsolidator;
-    use merkur_core::{Consolidator, Forgetter};
+    use merkur_core::{Consolidator, Forgetter, MemoryLevel};
     use merkur_embedders::NoopEmbedder;
     use merkur_forgetters::{EbbinghausConfig, EbbinghausForgetter};
     use merkur_storage::SqliteStorage;
@@ -397,5 +397,330 @@ mod integration {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ------------------------------------------------------------------
+    // Hybrid retrieval (BM25 x vector, RRF-fused). Enabled by P1-4.
+    // ------------------------------------------------------------------
+
+    /// Omitting the `mode` parameter must resolve to hybrid search — the
+    /// out-of-the-box path should always be the best retrieval we have.
+    #[tokio::test]
+    async fn test_default_search_mode_is_hybrid() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/write")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content":"the rrf fusion test memory"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                Request::get("/v1/search?q=rrf+fusion+test+memory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["mode"], "hybrid");
+        assert!(json["total"].as_u64().unwrap() > 0);
+    }
+
+    /// Query text equal to a stored memory's content: the exact-match memory
+    /// must come back first with the normalized ceiling score of 1.0 (rank-1
+    /// in both channels), regardless of what pseudo-random neighbors the
+    /// embedder contributes.
+    #[tokio::test]
+    async fn test_hybrid_search_ranks_exact_match_first_with_unit_score() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        for content in [
+            "trigram bm25 exact match target sentence",
+            "an unrelated filler memory about databases",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/write")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"content":"{content}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        let resp = app
+            .oneshot(
+                Request::get("/v1/search?q=trigram+bm25+exact+match+target+sentence&mode=hybrid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "'hybrid' must be an accepted search mode"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let results = json["results"].as_array().unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0]["content"].as_str().unwrap(), "trigram bm25 exact match target sentence");
+        // P1-5: the visible score is the composite, not raw RRF. A rank-1
+        // dual hit (fused=1.0) on a fresh memory (weight=1.0, importance
+        // prior 0.5) yields 0.5*1.0 + 0.2*1.0 + 0.3*0.5 = 0.85.
+        let top_score = results[0]["score"].as_f64().unwrap();
+        assert!(
+            (top_score - 0.85).abs() < 1e-9,
+            "composite of fused=1.0, weight=1.0, importance=0.5 must be 0.85, got {top_score}"
+        );
+    }
+
+    /// P0-2: access-driven promotion. A demoted memory that keeps getting
+    /// retrieved must climb back one rung on the next forgetting tick.
+    /// P0-2: access-driven promotion. A demoted memory that keeps getting
+    /// retrieved must climb back one rung on the next forgetting tick. The
+    /// custom forgetter keeps this wiring test independent of the async timing
+    /// of vector_search's background access bumps.
+    #[tokio::test]
+    async fn test_forgetting_tick_promotes_frequently_accessed_memory() {
+        use merkur_core::NewMemory;
+
+        let state = test_app().await;
+        let dim = 16;
+
+        let mem = NewMemory {
+            content: "hot memory that keeps getting retrieved".into(),
+            category: Some("general".into()),
+            context: Default::default(),
+            metadata: Default::default(),
+            embedding: Some(vec![1.0; dim]),
+            namespace: merkur_core::DEFAULT_NAMESPACE.to_string(),
+        };
+        let id = state.storage.insert_memory(&mem).await.unwrap();
+        // Force the memory down to Title to simulate an old, demoted row.
+        state.storage.update_level(&id, 0).await.unwrap();
+        assert_eq!(
+            state.storage.get_memory(&id).await.unwrap().unwrap().level,
+            MemoryLevel::Title
+        );
+
+        // A couple of retrieval hits demonstrate demand; their access-bump
+        // lands asynchronously, which the bar below tolerates.
+        let query_vec = vec![1.0f32; dim];
+        for _ in 0..2 {
+            let hits = state.storage.vector_search(&query_vec, 5).await.unwrap();
+            assert!(hits.iter().any(|h| h.id == id));
+        }
+        let forgetter = Arc::new(EbbinghausForgetter::new(EbbinghausConfig {
+            half_life_seconds: f64::MAX,
+            threshold_upgrade: 0.2,
+            upgrade_min_access_count: 1,
+            ..Default::default()
+        }));
+
+        let (archived, downgraded, upgraded, cleaned) =
+            crate::scheduler::Scheduler::run_forgetting_once(
+                &*state.storage,
+                &*forgetter,
+                100,
+                30,
+            )
+            .await;
+        assert!(
+            upgraded >= 1,
+            "expected a promotion, got (archived={archived}, downgraded={downgraded}, upgraded={upgraded}, cleaned={cleaned})"
+        );
+        assert_eq!(
+            state.storage.get_memory(&id).await.unwrap().unwrap().level,
+            MemoryLevel::Summary
+        );
+    }
+
+    /// P0-3: `X-Merkur-Namespace` routes the whole request into one bucket.
+    #[tokio::test]
+    async fn test_namespace_header_isolates_search_results() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        // Write identical content into two buckets via the header.
+        for ns in ["alpha", "beta"] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/write")
+                        .header("content-type", "application/json")
+                        .header("x-merkur-namespace", ns)
+                        .body(Body::from(r#"{"content":"bucket isolation probe sentence"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        // Search alpha — must see exactly its own copy.
+        let resp = app
+            .oneshot(
+                Request::get("/v1/search?q=bucket+isolation+probe")
+                    .header("x-merkur-namespace", "alpha")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["results"].as_array().unwrap().len(),
+            1,
+            "alpha bucket must contain exactly its own copy, got {json}"
+        );
+    }
+
+    /// No header → default bucket, matching pre-namespace behavior.
+    #[tokio::test]
+    async fn test_search_without_namespace_header_uses_default_bucket() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/write")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content":"plain default bucket memory"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = app
+            .oneshot(
+                Request::get("/v1/search?q=plain+default+bucket")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["results"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            json["results"][0]["namespace"].as_str(),
+            Some("default"),
+            "unscoped writes must land in and surface from the default bucket"
+        );
+    }
+
+    /// P1-6: POST /v1/context assembles a prompt-ready digest under a token
+    /// budget, deduplicated and packed greedily.
+    #[tokio::test]
+    async fn test_context_endpoint_packs_digest_under_budget() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        // Two near-duplicates (Jaccard > 0.8) + one distinct memory.
+        for content in [
+            "the user prefers Rust for systems work",
+            "the user prefers Rust for systems work today",
+            "an unrelated note about coffee",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/write")
+                        .header("content-type", "application/json")
+                        .body(Body::from(format!(r#"{{"content":"{content}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        let resp = app
+            .oneshot(
+                Request::post("/v1/context")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"q":"rust preference","token_budget":100}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Digest is present and non-empty.
+        let digest = json["digest"].as_str().unwrap();
+        assert!(!digest.is_empty());
+        // Near-duplicate was dropped: at most 2 items survive.
+        let items = json["items"].as_array().unwrap();
+        assert!(items.len() <= 2, "near-duplicate must be deduped, got {items:?}");
+        // Token estimate respects the budget.
+        let est = json["token_estimate"].as_u64().unwrap();
+        assert!(est <= 100, "estimate {est} exceeds budget");
+        // Dropped count is surfaced.
+        assert!(json["dropped"].as_u64().is_some());
+    }
+
+    /// Context endpoint respects the namespace header like search does.
+    #[tokio::test]
+    async fn test_context_endpoint_respects_namespace() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        for (ns, content) in [
+            ("alpha", "alpha bucket rust note"),
+            ("beta", "beta bucket rust note"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/v1/write")
+                        .header("content-type", "application/json")
+                        .header("x-merkur-namespace", ns)
+                        .body(Body::from(format!(r#"{{"content":"{content}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        let resp = app
+            .oneshot(
+                Request::post("/v1/context")
+                    .header("content-type", "application/json")
+                    .header("x-merkur-namespace", "alpha")
+                    .body(Body::from(r#"{"q":"rust note","token_budget":50}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 16384).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["namespace"].as_str(), Some("alpha"));
     }
 }

@@ -122,6 +122,9 @@ struct AbstractResult {
     id: String,
     #[serde(rename = "abstract")]
     abstract_: String,
+    /// Consolidator-assessed salience in [0, 1]; missing or out-of-range
+    /// values fall back to the neutral prior at application time.
+    importance: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +192,17 @@ impl Consolidator for LlmConsolidator {
             report
                 .new_abstracts
                 .insert(m.id.clone(), m.abstract_.clone());
+            if let Some(imp) = m.importance {
+                if (0.0..=1.0).contains(&imp) {
+                    report.new_importance.insert(m.id.clone(), imp);
+                } else {
+                    warn!(
+                        id = m.id.as_str(),
+                        importance = imp,
+                        "LLM proposed out-of-range importance; keeping prior"
+                    );
+                }
+            }
         }
 
         for e in &parsed.edges {
@@ -253,8 +267,11 @@ Use ONLY the ids from the input list. Do not invent ids.
 
 Memories: {items_json}
 
+3. An importance score in [0, 1] for each memory: how central this fact is to the
+   user's long-term goals (1 = core identity/preference, 0 = ephemeral trivia).
+
 Respond with JSON only:
-{{"memories":[{{"id":"...","abstract":"..."}}],"edges":[{{"source_id":"...","target_id":"...","relation":"...","weight":0.8}}]}}"#
+{{"memories":[{{"id":"...","abstract":"...","importance":0.7}}],"edges":[{{"source_id":"...","target_id":"...","relation":"...","weight":0.8}}]}}"#
     ))
 }
 
@@ -278,5 +295,35 @@ mod tests {
     fn test_extract_json_object_with_prose() {
         let s = "Here is the result:\n{\"a\":1}\nThanks";
         assert_eq!(extract_json_object(s), "{\"a\":1}");
+    }
+
+    fn test_memory(id: &str, content: &str) -> Memory {
+        let now = chrono::Utc::now();
+        Memory {
+            id: id.into(),
+            content: content.into(),
+            abstract_: None,
+            category: "general".into(),
+            weight: 1.0,
+            level: merkur_core::MemoryLevel::Full,
+            pending_consolidation: true,
+            embedding: None,
+            metadata: Default::default(),
+            context: Default::default(),
+            created_at: now,
+            updated_at: now,
+            accessed_at: now,
+            access_count: 0,
+            namespace: merkur_core::DEFAULT_NAMESPACE.to_string(),
+            importance: merkur_core::NEUTRAL_IMPORTANCE,
+        }
+    }
+
+    #[test]
+    fn test_prompt_requests_importance() {
+        let m = test_memory("m1", "user prefers rust");
+        let prompt = build_prompt(&[m]).unwrap();
+        assert!(prompt.contains("importance"));
+        assert!(prompt.contains("[0, 1]"));
     }
 }
