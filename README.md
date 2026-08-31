@@ -27,7 +27,11 @@ curl -X POST localhost:1934/v1/write \
   -H 'Content-Type: application/json' \
   -d '{"content":"v8 GC is generational","context":{"agent":"assistant"}}'
 
-# Search
+# Search (hybrid BM25 x vector fusion — the default)
+curl -H "Authorization: Bearer $MERKUR_TOKEN" \
+  'localhost:1934/v1/search?q=v8+gc'
+
+# Low-latency vector-only search
 curl -H "Authorization: Bearer $MERKUR_TOKEN" \
   'localhost:1934/v1/search?q=v8+gc&mode=fast'
 
@@ -41,13 +45,34 @@ curl localhost:1934/v1/health
 
 ## Key Features
 
-- **Dual Retrieval**: S1 Fast (vector top-k) + S2 Deep (BFS graph diffusion via SQLite CTE)
-- **Ebbinghaus Forgetting Curve**: Exponential weight decay, access boost, cascade downgrade (Full→Summary→Title→Archive)
+- **Hybrid Retrieval (default)**: FTS5 trigram full-text (BM25) x vector cosine, fused with Reciprocal Rank Fusion; results re-ranked by a composite of relevance, stored weight, and **system-learned importance** (Consolidator-assessed, never client-reported). Works on CJK/unsegmented text out of the box; see [Hybrid Search](#hybrid-search)
+- **Fast & Deep modes**: `mode=fast` for pure vector top-k, `mode=deep` for BFS graph diffusion via SQLite CTE
+- **Ebbinghaus Forgetting Curve**: Exponential weight decay, access boost, cascade downgrade (Full→Summary→Title→Archive) with hysteresis-based promotion back up on repeated retrieval
+- **Write-time Dedup**: near-duplicate writes (top-1 cosine ≥ 0.92 in the same bucket) NOOP onto the existing memory — mem0's ADD/NOOP governance without an LLM in the write path
+- **Context Assembly**: `POST /v1/context` packs a token-budgeted, deduplicated, prompt-ready digest from hybrid recall — the MCP-friendly entry point
 - **Offline Consolidation**: LLM-driven summarization, entity extraction, and automatic edge creation
+- **Logical Namespaces**: `X-Merkur-Namespace` header scopes writes & all search modes to one bucket; hybrid retrieval stays isolated per bucket. Logical isolation, not a security boundary
 - **Plugin Architecture**: Embedder / Storage / Consolidator / Forgetter — independently replaceable via trait + config injection
 - **Dual Storage**: SQLite (default) + LanceDB disk-based index (feature gated)
 - **Rust SDK**: `merkur-client` crate with `MerkurClient` trait and `HttpMerkurClient`
 - **OpenAPI 3.0**: Multi-language SDK code generation
+
+## Hybrid Search
+
+`/v1/search` runs two channels in parallel and fuses them with Reciprocal Rank Fusion (`k = 60`, the standard value across retrieval systems):
+
+| Channel | Engine | Strength |
+|---|---|---|
+| BM25 full-text | SQLite FTS5, trigram tokenizer | Exact terms, code identifiers, CJK substrings |
+| Vector cosine | In-memory index (or LanceDB) | Paraphrases, semantic similarity |
+
+Design properties:
+
+- **Default mode.** `mode=hybrid` is implied; `fast` and `deep` remain available as explicit opt-outs.
+- **Normalized scores.** Fused scores are scaled to `(0, 1]` by the theoretical maximum (rank-1 in both channels = `1.0`; single-channel hits cap at ~`0.5`). `score_threshold` keeps one consistent meaning across modes.
+- **CJK-ready.** The trigram tokenizer indexes every 3-character sliding window, so Chinese/Japanese/Korean queries match without a word segmentation dependency.
+- **Short-query fallback.** Queries under 3 characters cannot produce a trigram; the BM25 channel yields no candidates and vector similarity covers those queries alone.
+- **Always-on consistency.** FTS5 triggers mirror every insert/update/delete — including writes from the LanceDB backend and admin tools — so both channels always see the same data.
 
 ## API
 
@@ -56,7 +81,8 @@ curl localhost:1934/v1/health
 | `GET` | `/v1/health` | Health check |
 | `POST` | `/v1/write` | Write a memory |
 | `POST` | `/v1/write-batch` | Batch write |
-| `GET` | `/v1/search` | Search (level/category/date filtering) |
+| `GET` | `/v1/search` | Search (level/category/date filtering; `X-Merkur-Namespace` header scopes to one bucket) |
+| `POST` | `/v1/context` | Token-budget context assembly (digest + items; namespace-aware) |
 | `GET` | `/v1/memory/{id}` | Get memory details |
 | `PUT` | `/v1/memory/{id}` | Update (auto re-embed) |
 | `DELETE` | `/v1/memory/{id}` | Delete (cascade edges + tags) |
@@ -126,7 +152,7 @@ Add to `.cursor/mcp.json` in your project:
 | Tool | Description |
 |------|-------------|
 | `write_memory` | Write a new memory |
-| `search_memory` | Semantic similarity search |
+| `search_memory` | Hybrid BM25 + vector relevance search |
 | `get_memory` | Get memory by ID |
 | `delete_memory` | Delete memory by ID |
 | `relate` | Create edge between memories |

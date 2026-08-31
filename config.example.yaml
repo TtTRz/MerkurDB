@@ -57,7 +57,13 @@ consolidation:
   interval_seconds: 60
   batch_size: 10
 
-# Ebbinghaus forgetting curve: decay, downgrade, archive
+# Write-time dedup (P2-8): top-1 cosine similarity above the threshold makes
+# a write NOOP onto the existing memory in the same namespace.
+write:
+  dedup_enabled: true
+  dedup_threshold: 0.92
+
+# Ebbinghaus forgetting curve: decay, downgrade/upgrade, archive
 forgetting:
   interval_seconds: 300
   batch_size: 100
@@ -68,6 +74,11 @@ forgetting:
   threshold_to_l1: 0.3
   threshold_to_l0: 0.2
   threshold_archive: 0.1
+  # Access-driven promotion (hysteresis): a demoted memory climbs one rung
+  # back up only when its derived weight clears this bar AND it has been
+  # retrieved at least upgrade_min_access_count times.
+  threshold_upgrade: 0.6
+  upgrade_min_access_count: 3
 
 logging:
   level: "info"

@@ -2,6 +2,29 @@
 
 All notable changes to MerkurDB. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Hybrid search (BM25 x vector)** — `/v1/search` gains `mode=hybrid`: FTS5 full-text (trigram tokenizer, CJK-capable) fused with vector cosine via Reciprocal Rank Fusion (`k=60`). Shared orchestration (`merkur_core::hybrid_recall`) powers both the REST handler and the MCP `search_memory` tool; a channel failure degrades to the other instead of failing the recall.
+- **FTS5 schema (migration v2)** — `memories_fts` virtual table plus insert/update/delete triggers with automatic backfill of existing rows on upgrade. Triggers keep every write path (both storage backends, CLI tools) in sync.
+- **`Storage::text_search` trait method** — best-first BM25 candidate lookup; implemented for `SqliteStorage` and `LanceDbStorage` (which rides the same shared SQLite database).
+- **Access-driven promotion (`LevelAction::Upgrade`)** — the forgetting curve now closes the lifecycle loop: a demoted memory whose derived weight clears `threshold_upgrade` (0.6) *and* which has been retrieved at least `upgrade_min_access_count` (3) times climbs back one rung (Title -> Summary -> Full). Archived rows never auto-promote. New config keys under `forgetting:`; `/v1/forget` reports an `upgraded` count.
+- **Logical namespaces (P0-3)** — every memory carries a `namespace` bucket (default `"default"`); `X-Merkur-Namespace` request header scopes writes, hybrid/fast/deep search, and BFS traversal to one bucket. Storage trait gains `vector_search_ns` / `bfs_expand_ns` and a namespaced `text_search`; legacy cross-bucket methods remain for audit paths. Migration v3 adds the column + index with zero-downtime backfill. **Isolation is logical, not a security boundary** — any authenticated caller may claim any bucket.
+- **Composite scoring (P1-5)** — hybrid results are re-ranked by `final = 0.5·fused + 0.2·weight + 0.3·importance`. `importance` is **system-learned only**: the Consolidator writes it during consolidation (migration v4, neutral 0.5 prior for unassessed rows); the public write API has no such field, so salience can never be client-reported. Weights are conservative untuned defaults, documented as such.
+- **`POST /v1/context` (P1-6)** — token-budget context assembly: hybrid recall → MMR dedup (Jaccard ≥ 0.8) → greedy bin-packing → prompt-ready markdown digest. Response carries `digest`, `items`, `token_estimate`, `dropped`. Token counting is the documented `chars/4` approximation (zero-dependency); namespace header scopes the recall exactly like `/v1/search`.
+- **Write-time dedup (P2-8)** — `insert_memory_dedup` short-circuits near-duplicate writes: top-1 cosine ≥ `write.dedup_threshold` (0.92, mem0's published value) in the same namespace returns the existing id without inserting. ADD/NOOP half of write governance; UPDATE/DELETE adjudication stays with the Consolidator. `write.dedup_enabled` master switch.
+- **Benchmarks** — `text_search_bm25_1k`, `hybrid_recall_end_to_end_1k`.
+
+### Changed
+
+- **Default search mode is now `hybrid`** (was `fast`). Scores returned under hybrid are normalized RRF values in `(0, 1]`; `score_threshold` semantics stay "higher is more relevant" across all modes. Pass `mode=fast` explicitly to keep pure-vector behavior.
+- MCP `search_memory` tool upgraded from pure vector similarity to hybrid retrieval.
+
+### Fixed
+
+- Fresh databases skipped pending migrations: first-run version stamping wrote the current version before migrations ran, so auxiliary objects introduced in later versions were never created until the stored version was bumped externally.
+
 ## [0.4.0] — 2026-05-08
 
 Feature expansion: observability, tooling, and AI agent integration.
