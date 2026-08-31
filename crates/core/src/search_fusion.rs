@@ -1,6 +1,6 @@
 //! Hybrid search fusion: FTS5 BM25 x vector cosine via Reciprocal Rank Fusion.
 
-use crate::{MerkurError, MerkurResult, ScoredMemory, Storage};
+use crate::{MerkurResult, ScoredMemory, Storage};
 
 /// Blend of the three relevance channels in the composite score.
 ///
@@ -184,20 +184,32 @@ pub fn greedy_pack(items: &[ScoredMemory], token_budget: usize) -> (Vec<ScoredMe
 }
 
 /// Run both retrieval channels and return their RRF-fused ranking as fully
-/// populated records (`score` carries the normalized fused value).
+/// populated records (`score` carries the composite value).
 ///
 /// Thin orchestration shared by every search entry point (REST handler and
 /// MCP tool) so they cannot drift apart. Oversamples each channel at
 /// `limit * 2` before fusing — RRF needs more input ranks than the requested
 /// output to keep tail quality. A single channel failing degrades to the
 /// other one instead of failing the whole recall. Candidates that surfaced
-/// only through BM25 are fetched by id; vanished ids are skipped.
+/// only through BM25 are fetched by id; vanished ids are skipped, and a
+/// transient hydration failure is logged and skipped rather than sinking the
+/// recall.
+///
+/// `relevance_floor` gates on the **fused retrieval relevance** — the same
+/// semantic `score_threshold` has against raw cosine in fast mode. It must
+/// not gate on the composite score: the composite's structural floor
+/// (`weight` + `importance` shares = 0.35 for a fresh memory at default
+/// weights) sits above the default threshold and would silently disable it.
+/// Gating before hydration also skips pointless `get_memory` round-trips for
+/// candidates that would be filtered out anyway. Callers that want no gate
+/// (context assembly, debugging CLIs) pass `0.0`.
 pub async fn hybrid_recall(
     storage: &dyn Storage,
     query_vec: &[f32],
     raw_query: &str,
     namespace: &str,
     limit: usize,
+    relevance_floor: f64,
 ) -> MerkurResult<Vec<ScoredMemory>> {
     let oversample = limit.saturating_mul(2).max(limit);
 
@@ -232,13 +244,20 @@ pub async fn hybrid_recall(
 
     let mut out = Vec::with_capacity(fused.len());
     for (id, fused_score) in fused {
+        if fused_score < relevance_floor {
+            continue;
+        }
         let mut memory = match by_id.remove(&id) {
             Some(m) => m,
             None => match storage.get_memory(&id).await {
                 Ok(Some(m)) => scored_from_memory(m, fused_score),
                 Ok(None) => continue,
-                Err(MerkurError::MemoryNotFound(_)) => continue,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    // The channel that surfaced this id succeeded; a transient
+                    // hydration failure degrades to the remaining hits.
+                    tracing::warn!(id = %id, error = %e, "hydrating BM25-only hit failed; skipping");
+                    continue;
+                }
             },
         };
         // P1-5: the externally visible score is the composite of retrieval
@@ -273,6 +292,7 @@ fn scored_from_memory(m: crate::Memory, score: f64) -> ScoredMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MerkurError;
 
     fn mk_scored(id: &str, content: &str, score: f64) -> ScoredMemory {
         ScoredMemory {
@@ -469,5 +489,239 @@ mod tests {
         let (packed, dropped) = greedy_pack(&items, 1000);
         assert_eq!(packed.len(), 2);
         assert_eq!(dropped, 0);
+    }
+
+    // ---------- hybrid_recall orchestration ----------
+
+    /// Minimal Storage double exercising the recall surface: one vector hit
+    /// (`v1`), configurable BM25 hits, switchable `get_memory` failure, and a
+    /// call counter proving gated candidates never reach hydration. Every
+    /// unrelated trait method is `unimplemented!` on purpose.
+    struct StubStorage {
+        bm25_hits: Vec<(String, f64)>,
+        hydration_fails: bool,
+        get_memory_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubStorage {
+        fn new(bm25_hits: Vec<(String, f64)>, hydration_fails: bool) -> Self {
+            Self {
+                bm25_hits,
+                hydration_fails,
+                get_memory_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    fn hydrated_memory(id: &str) -> crate::Memory {
+        crate::Memory {
+            id: id.into(),
+            content: format!("hydrated {id}"),
+            abstract_: None,
+            category: "general".into(),
+            weight: 1.0,
+            level: crate::MemoryLevel::Full,
+            pending_consolidation: false,
+            embedding: None,
+            metadata: Default::default(),
+            context: Default::default(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            accessed_at: chrono::Utc::now(),
+            access_count: 0,
+            namespace: crate::DEFAULT_NAMESPACE.to_string(),
+            importance: crate::NEUTRAL_IMPORTANCE,
+            valid_at: chrono::Utc::now(),
+            invalid_at: None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for StubStorage {
+        async fn insert_memory(&self, _: &crate::NewMemory) -> MerkurResult<String> {
+            unimplemented!()
+        }
+        async fn insert_memory_dedup(
+            &self,
+            _: &crate::NewMemory,
+            _: f64,
+        ) -> MerkurResult<String> {
+            unimplemented!()
+        }
+        async fn update_memory(&self, _: &str, _: &str, _: Option<&[f32]>) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn get_memory(&self, id: &str) -> MerkurResult<Option<crate::Memory>> {
+            self.get_memory_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.hydration_fails {
+                return Err(MerkurError::Storage("transient boom".into()));
+            }
+            Ok(Some(hydrated_memory(id)))
+        }
+        async fn delete_memory(&self, _: &str) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn invalidate_memory(&self, _: &str, _: Option<&str>) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn purge_invalidated_older_than(&self, _: i32) -> MerkurResult<usize> {
+            unimplemented!()
+        }
+        async fn vector_search(
+            &self,
+            _: &[f32],
+            _: usize,
+        ) -> MerkurResult<Vec<ScoredMemory>> {
+            unimplemented!()
+        }
+        async fn vector_search_ns(
+            &self,
+            _: &[f32],
+            _: &str,
+            _: usize,
+        ) -> MerkurResult<Vec<ScoredMemory>> {
+            Ok(vec![mk_scored("v1", "vector hit", 0.9)])
+        }
+        async fn record_access(&self, _: &[String]) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn get_embeddings(
+            &self,
+            _: &[String],
+        ) -> MerkurResult<std::collections::HashMap<String, Vec<f32>>> {
+            unimplemented!()
+        }
+        async fn text_search(
+            &self,
+            _: &str,
+            _: &str,
+            _: usize,
+        ) -> MerkurResult<Vec<(String, f64)>> {
+            Ok(self.bm25_hits.clone())
+        }
+        async fn insert_edge(&self, _: &crate::NewEdge) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn get_edges(&self, _: &str) -> MerkurResult<Vec<crate::Edge>> {
+            unimplemented!()
+        }
+        async fn get_edges_batch(
+            &self,
+            _: &[String],
+        ) -> MerkurResult<std::collections::HashMap<String, Vec<crate::Edge>>> {
+            unimplemented!()
+        }
+        async fn bfs_expand(
+            &self,
+            _: &[String],
+            _: usize,
+            _: usize,
+        ) -> MerkurResult<Vec<ScoredMemory>> {
+            unimplemented!()
+        }
+        async fn bfs_expand_ns(
+            &self,
+            _: &[String],
+            _: &str,
+            _: usize,
+            _: usize,
+        ) -> MerkurResult<Vec<ScoredMemory>> {
+            unimplemented!()
+        }
+        async fn insert_context_tag(&self, _: &str, _: &str, _: &str) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn search_by_context(
+            &self,
+            _: &std::collections::HashMap<String, String>,
+        ) -> MerkurResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn list_pending(&self, _: usize) -> MerkurResult<Vec<crate::Memory>> {
+            unimplemented!()
+        }
+        async fn list_for_forgetting(&self, _: usize) -> MerkurResult<Vec<crate::Memory>> {
+            unimplemented!()
+        }
+        async fn mark_consolidated(&self, _: &[String]) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn update_level(&self, _: &str, _: i32) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn update_abstract(&self, _: &str, _: &str) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn update_importance(&self, _: &str, _: f64) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn delete_archived_older_than(&self, _: i32) -> MerkurResult<usize> {
+            unimplemented!()
+        }
+        async fn log_consolidation(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+            _: &crate::ConsolidationReport,
+        ) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn get_consolidation_log(
+            &self,
+            _: usize,
+        ) -> MerkurResult<Vec<crate::ConsolidationLogEntry>> {
+            unimplemented!()
+        }
+        async fn stats(&self) -> MerkurResult<crate::StorageStats> {
+            unimplemented!()
+        }
+        async fn memory_exists(&self, _: &str) -> MerkurResult<bool> {
+            unimplemented!()
+        }
+        async fn memory_exists_batch(
+            &self,
+            _: &[String],
+        ) -> MerkurResult<std::collections::HashSet<String>> {
+            unimplemented!()
+        }
+    }
+
+    /// A BM25-only candidate whose hydration fails must be skipped with a
+    /// warning, not fail the whole recall — the vector channel's hits remain
+    /// perfectly usable.
+    #[tokio::test]
+    async fn hybrid_recall_skips_hits_whose_hydration_fails() {
+        let storage = StubStorage::new(vec![("b1".to_string(), 1.0)], true);
+        let out = hybrid_recall(&storage, &[1.0], "some query", "default", 10, 0.0)
+            .await
+            .expect("a hydration failure must degrade, not fail the recall");
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["v1"]);
+    }
+
+    /// The threshold gates fused retrieval relevance — as it gates cosine in
+    /// `fast` mode — not the composite score (whose structural floor would
+    /// make the gate a no-op). `v1` is rank-1 in both channels (fused 1.0);
+    /// `b1` is BM25 rank-2 only (fused ≈ 0.49) and must be gated by 0.6
+    /// *before* hydration is even attempted.
+    #[tokio::test]
+    async fn hybrid_recall_gates_on_fused_relevance_before_hydration() {
+        let storage = StubStorage::new(
+            vec![("v1".to_string(), 2.0), ("b1".to_string(), 1.0)],
+            false,
+        );
+        let out = hybrid_recall(&storage, &[1.0], "some query", "default", 10, 0.6)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["v1"], "BM25-rank-2-only hit must be gated by 0.6");
+        assert_eq!(
+            storage
+                .get_memory_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "gated candidates must never reach hydration"
+        );
     }
 }

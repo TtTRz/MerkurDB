@@ -48,7 +48,8 @@ curl localhost:1934/v1/health
 - **Hybrid Retrieval (default)**: FTS5 trigram full-text (BM25) x vector cosine, fused with Reciprocal Rank Fusion; results re-ranked by a composite of relevance, stored weight, and **system-learned importance** (Consolidator-assessed, never client-reported). Works on CJK/unsegmented text out of the box; see [Hybrid Search](#hybrid-search)
 - **Fast & Deep modes**: `mode=fast` for pure vector top-k, `mode=deep` for BFS graph diffusion via SQLite CTE
 - **Ebbinghaus Forgetting Curve**: Exponential weight decay, access boost, cascade downgrade (Full→Summary→Title→Archive) with hysteresis-based promotion back up on repeated retrieval
-- **Write-time Dedup**: near-duplicate writes (top-1 cosine ≥ 0.92 in the same bucket) NOOP onto the existing memory — mem0's ADD/NOOP governance without an LLM in the write path
+- **Write Governance (mem0-style)**: near-duplicate writes NOOP onto the existing memory (top-1 cosine ≥ 0.92, same bucket); the async Consolidator adjudicates each new memory against its neighbors — UPDATE absorbs the new content into the existing row (salience, edges, and access history preserved; audit pointer kept), DELETE soft-invalidates the loser. Verdicts execute only with an LLM consolidator AND pair similarity ≥ `consolidation.adjudication_floor` (dual-signal); the synchronous write path stays LLM-free
+- **Soft-Invalidation & Retention**: adjudicated-out memories vanish from every retrieval channel immediately but stay auditable via `GET /v1/memory/{id}` until `forgetting.purge_invalidated_days` (30d) hard-deletes them; client `DELETE` stays an immediate hard delete
 - **Context Assembly**: `POST /v1/context` packs a token-budgeted, deduplicated, prompt-ready digest from hybrid recall — the MCP-friendly entry point
 - **Offline Consolidation**: LLM-driven summarization, entity extraction, and automatic edge creation
 - **Logical Namespaces**: `X-Merkur-Namespace` header scopes writes & all search modes to one bucket; hybrid retrieval stays isolated per bucket. Logical isolation, not a security boundary
@@ -69,7 +70,7 @@ curl localhost:1934/v1/health
 Design properties:
 
 - **Default mode.** `mode=hybrid` is implied; `fast` and `deep` remain available as explicit opt-outs.
-- **Normalized scores.** Fused scores are scaled to `(0, 1]` by the theoretical maximum (rank-1 in both channels = `1.0`; single-channel hits cap at ~`0.5`). `score_threshold` keeps one consistent meaning across modes.
+- **Normalized scores.** Fused scores are scaled to `(0, 1]` by the theoretical maximum (rank-1 in both channels = `1.0`; single-channel hits cap at ~`0.5`). `score_threshold` gates this fused relevance in hybrid mode and raw cosine in fast mode — one meaning across modes.
 - **CJK-ready.** The trigram tokenizer indexes every 3-character sliding window, so Chinese/Japanese/Korean queries match without a word segmentation dependency.
 - **Short-query fallback.** Queries under 3 characters cannot produce a trigram; the BM25 channel yields no candidates and vector similarity covers those queries alone.
 - **Always-on consistency.** FTS5 triggers mirror every insert/update/delete — including writes from the LanceDB backend and admin tools — so both channels always see the same data.
@@ -223,19 +224,28 @@ crates/
 | Cleanup | Dead code removed (Timeout/Unauthorized variants, rebuild_vector_index) |
 | Docs | Mermaid diagrams (crate deps, retrieval flow, lifecycle, consolidation) |
 
-### Planned (v0.4.0+)
+#### v0.5.0 (unreleased) — Retrieval hardening & write governance
+
+| Category | Feature |
+|----------|---------|
+| Governance | Consolidator adjudication (mem0-style UPDATE/DELETE) with dual-signal gate; UPDATE absorbs in place, DELETE soft-invalidates |
+| Schema | Migration v5: `valid_at` (lazy, backfilled) + `invalid_at`; every retrieval channel filters invalidated rows |
+| Retention | `purge_invalidated_days` audit window; `/v1/forget` reports `purged` |
+| Correctness | Per-version transactional, replay-safe migrations; LanceDB backend migrates |
+| Retrieval | Iterative-deepening namespace vector search; hybrid pagination headroom; hydration degradation |
+| Scoring | Threshold gates fused relevance in hybrid mode |
+| Signal | Access recorded at serving points only (`record_access`); probes are pure |
+| Isolation | BFS filters cross-bucket hops; graph endpoints return induced subgraphs |
+| SDK | Client `with_namespace`; `ForgetResponse.upgraded/purged`; full-record `GET /v1/memory/{id}` |
+
+### Planned (v0.6.0+)
 
 | Priority | Feature | Description |
 |----------|---------|-------------|
-| P1 | MCP adapter | Model Context Protocol integration for Agent direct access |
-| P1 | gRPC API | `tonic`-based high-performance streaming API alongside REST |
 | P2 | At-rest encryption | SQLCipher or app-layer embedding column encryption |
-| P2 | DB migration tool | Schema versioning, `merkur migrate` CLI |
 | P2 | PostgreSQL backend | PG storage backend via Storage trait |
-| P2 | Rust CLI | `merkurctl` — admin operations (trigger consolidate, query status, backup) |
-| P3 | Web Dashboard | Tauri/Yew SPA — memory graph visualization, config editor |
+| P2 | Public evaluation | LoCoMo benchmark harness for retrieval/scoring weight tuning |
 | P3 | Multi-modal | Image embedding support (CLIP, etc.) |
-| P3 | Distributed consolidation | Multi-worker parallel consolidation for large memory bases |
 
 ## Documentation
 

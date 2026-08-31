@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::app_state::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::handlers::namespace::Namespace;
 use crate::scheduler;
 
 pub async fn trigger_consolidate(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
@@ -17,6 +18,8 @@ pub async fn trigger_consolidate(State(state): State<AppState>) -> ApiResult<imp
         &*state.storage,
         &*state.consolidator,
         state.config.consolidation.batch_size,
+        state.config.consolidation.adjudication_floor,
+        state.config.consolidation.adjudication_candidates,
     )
     .await;
     Ok((
@@ -25,17 +28,20 @@ pub async fn trigger_consolidate(State(state): State<AppState>) -> ApiResult<imp
             "status": "ok",
             "processed": report.memories_processed,
             "edges_created": report.edges_created,
+            "absorptions": report.absorptions,
+            "invalidations": report.invalidations,
             "errors": report.errors
         })),
     ))
 }
 
 pub async fn trigger_forget(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
-    let (archived, downgraded, upgraded, cleaned) = scheduler::Scheduler::run_forgetting_once(
+    let (archived, downgraded, upgraded, cleaned, purged) = scheduler::Scheduler::run_forgetting_once(
         &*state.storage,
         &*state.forgetter,
         state.config.forgetting.batch_size,
         state.config.forgetting.archive_days,
+        state.config.forgetting.purge_invalidated_days,
     )
     .await;
     Ok((
@@ -45,7 +51,8 @@ pub async fn trigger_forget(State(state): State<AppState>) -> ApiResult<impl Int
             "archived": archived,
             "downgraded": downgraded,
             "upgraded": upgraded,
-            "cleaned": cleaned
+            "cleaned": cleaned,
+            "purged": purged
         })),
     ))
 }
@@ -178,6 +185,7 @@ pub struct GraphQuery {
 
 pub async fn get_graph(
     State(state): State<AppState>,
+    ns: Namespace,
     Path(id): Path<String>,
     Query(params): Query<GraphQuery>,
 ) -> ApiResult<impl IntoResponse> {
@@ -191,7 +199,10 @@ pub async fn get_graph(
         .clamp(1, limits::MAX_BFS_DEGREE);
 
     let seeds = std::slice::from_ref(&id);
-    let neighborhood = state.storage.bfs_expand(seeds, depth, degree_limit).await?;
+    let neighborhood = state
+        .storage
+        .bfs_expand_ns(seeds, &ns.0, depth, degree_limit)
+        .await?;
 
     let mut node_ids: HashSet<String> = neighborhood.iter().map(|m| m.id.clone()).collect();
     node_ids.insert(id.clone());
@@ -205,6 +216,12 @@ pub async fn get_graph(
     let mut seen_edge_ids: HashSet<i64> = HashSet::new();
     for edges in edges_by_node.values() {
         for e in edges {
+            // Induced subgraph only: an edge whose far endpoint is outside the
+            // visible node set (another bucket, or simply not returned) would
+            // leak that endpoint's existence.
+            if !node_ids.contains(&e.source_id) || !node_ids.contains(&e.target_id) {
+                continue;
+            }
             if seen_edge_ids.insert(e.id) {
                 all_edges.push(e.clone());
             }

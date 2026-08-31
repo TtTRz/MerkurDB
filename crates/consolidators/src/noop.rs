@@ -26,6 +26,8 @@ mod tests {
             category: "general".into(),
             namespace: merkur_core::DEFAULT_NAMESPACE.to_string(),
             importance: merkur_core::NEUTRAL_IMPORTANCE,
+            valid_at: chrono::Utc::now(),
+            invalid_at: None,
             weight: 1.0,
             level: MemoryLevel::Full,
             pending_consolidation: true,

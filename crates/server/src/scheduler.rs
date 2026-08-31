@@ -13,6 +13,9 @@ pub struct Scheduler {
     forgetting_interval: Duration,
     forgetting_batch_size: usize,
     archive_days: i32,
+    purge_invalidated_days: i32,
+    adjudication_floor: f64,
+    adjudication_candidates: usize,
 }
 
 impl Scheduler {
@@ -26,6 +29,9 @@ impl Scheduler {
         forgetting_interval: Duration,
         forgetting_batch_size: usize,
         archive_days: i32,
+        purge_invalidated_days: i32,
+        adjudication_floor: f64,
+        adjudication_candidates: usize,
     ) -> Self {
         Self {
             storage,
@@ -36,6 +42,9 @@ impl Scheduler {
             forgetting_interval,
             forgetting_batch_size,
             archive_days,
+            purge_invalidated_days,
+            adjudication_floor,
+            adjudication_candidates,
         }
     }
 
@@ -68,6 +77,8 @@ impl Scheduler {
         storage: &(dyn Storage + Send + Sync),
         consolidator: &(dyn Consolidator + Send + Sync),
         batch_size: usize,
+        adjudication_floor: f64,
+        adjudication_candidates: usize,
     ) -> ConsolidationReport {
         let pending = match storage.list_pending(batch_size).await {
             Ok(p) => p,
@@ -138,6 +149,156 @@ impl Scheduler {
             report.errors += 1;
         }
 
+        // Write governance (P1-7): adjudicate each pending memory against its
+        // nearest neighbors in the same bucket. UPDATE/DELETE are destructive,
+        // so an LLM verdict alone is never enough — it executes only when the
+        // pair's cosine similarity clears `adjudication_floor`.
+        if adjudication_candidates > 0 {
+            let pending_ids: Vec<String> = pending.iter().map(|m| m.id.clone()).collect();
+            let embeddings = match storage.get_embeddings(&pending_ids).await {
+                Ok(e) => e,
+                Err(e) => {
+                    error!("Failed to fetch embeddings for adjudication: {e}");
+                    Default::default()
+                }
+            };
+            for memory in &pending {
+                let Some(embedding) = embeddings.get(&memory.id) else {
+                    continue;
+                };
+                let hits = match storage
+                    .vector_search_ns(embedding, &memory.namespace, adjudication_candidates + 1)
+                    .await
+                {
+                    Ok(h) => h,
+                    Err(e) => {
+                        error!("Adjudication candidate search failed for {}: {e}", memory.id);
+                        continue;
+                    }
+                };
+                let candidates: Vec<_> = hits
+                    .into_iter()
+                    .filter(|h| h.id != memory.id)
+                    .take(adjudication_candidates)
+                    .collect();
+                if candidates.is_empty() {
+                    continue;
+                }
+                let verdict = match consolidator.adjudicate(memory, &candidates).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("Adjudication failed for {}: {e}", memory.id);
+                        report.errors += 1;
+                        continue;
+                    }
+                };
+                let score_of = |id: &str| {
+                    candidates.iter().find(|c| c.id == id).map(|c| c.score)
+                };
+                match verdict.action {
+                    merkur_core::AdjudicationAction::Add | merkur_core::AdjudicationAction::Noop => {}
+                    merkur_core::AdjudicationAction::Update => {
+                        let Some(target) = verdict.target_id.as_deref() else {
+                            continue;
+                        };
+                        if target == memory.id {
+                            // An UPDATE pointing at the pending memory itself
+                            // is meaningless; the parser should have dropped it.
+                            continue;
+                        }
+                        match score_of(target) {
+                            Some(sim) if sim >= adjudication_floor => {
+                                // Absorb: the target takes the new content
+                                // (keeping its learned salience and edges);
+                                // the pending row is invalidated with a
+                                // pointer for audit.
+                                match storage
+                                    .update_memory(target, &memory.content, Some(embedding))
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        match storage
+                                            .invalidate_memory(&memory.id, Some(target))
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                report.absorptions += 1;
+                                                debug!(
+                                                    absorbed = %memory.id,
+                                                    into = %target,
+                                                    sim,
+                                                    reason = %verdict.reason,
+                                                    "absorbed pending memory into existing one"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to invalidate {}: {e}", memory.id);
+                                                report.errors += 1;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to absorb into {target}: {e}");
+                                        report.errors += 1;
+                                    }
+                                }
+                            }
+                            other => {
+                                debug!(
+                                    id = %memory.id,
+                                    target,
+                                    similarity = ?other,
+                                    floor = adjudication_floor,
+                                    "UPDATE verdict below similarity floor; skipped"
+                                );
+                            }
+                        }
+                    }
+                    merkur_core::AdjudicationAction::Delete => {
+                        let Some(target) = verdict.target_id.as_deref() else {
+                            continue;
+                        };
+                        // Evidence for the pair: the target's own similarity,
+                        // or — when the pending memory itself loses — the top
+                        // candidate's (the contradiction partner).
+                        let evidence = if target == memory.id {
+                            candidates.first().map(|c| c.score)
+                        } else {
+                            score_of(target)
+                        };
+                        match evidence {
+                            Some(sim) if sim >= adjudication_floor => {
+                                match storage.invalidate_memory(target, None).await {
+                                    Ok(()) => {
+                                        report.invalidations += 1;
+                                        debug!(
+                                            target,
+                                            sim,
+                                            reason = %verdict.reason,
+                                            "invalidated memory per DELETE verdict"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to invalidate {target}: {e}");
+                                        report.errors += 1;
+                                    }
+                                }
+                            }
+                            other => {
+                                debug!(
+                                    id = %memory.id,
+                                    target,
+                                    similarity = ?other,
+                                    floor = adjudication_floor,
+                                    "DELETE verdict below similarity floor; skipped"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let finished_at = chrono::Utc::now();
         if let Err(e) = storage
             .log_consolidation(started_at, finished_at, &report)
@@ -159,6 +320,8 @@ impl Scheduler {
             &*self.storage,
             &*self.consolidator,
             self.consolidation_batch_size,
+            self.adjudication_floor,
+            self.adjudication_candidates,
         )
         .await;
     }
@@ -168,23 +331,20 @@ impl Scheduler {
         forgetter: &(dyn Forgetter + Send + Sync),
         batch_size: usize,
         archive_days: i32,
-    ) -> (usize, usize, usize, usize) {
-        let memories = match storage.list_for_forgetting(batch_size).await {
-            Ok(m) => m,
-            Err(e) => {
-                error!("Failed to list memories for forgetting: {e}");
-                return (0, 0, 0, 0);
-            }
-        };
-
-        if memories.is_empty() {
-            return (0, 0, 0, 0);
-        }
-
+        purge_invalidated_days: i32,
+    ) -> (usize, usize, usize, usize, usize) {
         let now = chrono::Utc::now();
         let mut archived = 0;
         let mut downgraded = 0;
         let mut upgraded = 0;
+
+        let memories = match storage.list_for_forgetting(batch_size).await {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Failed to list memories for forgetting: {e}");
+                Vec::new()
+            }
+        };
 
         for memory in &memories {
             let action = forgetter.decide(memory, now);
@@ -231,7 +391,19 @@ impl Scheduler {
             info!("Cleaned up {cleaned} archived memories");
         }
 
-        (archived, downgraded, upgraded, cleaned)
+        // Write-governance retention (P1-7): hard-delete rows whose
+        // soft-invalidation is older than the audit window. Runs even when
+        // the forgetting candidate list is empty — invalidated rows are
+        // excluded from that list by definition.
+        let purged = storage
+            .purge_invalidated_older_than(purge_invalidated_days)
+            .await
+            .unwrap_or(0);
+        if purged > 0 {
+            info!("Purged {purged} invalidated memories");
+        }
+
+        (archived, downgraded, upgraded, cleaned, purged)
     }
 
     async fn run_forgetting(&self) {
@@ -240,6 +412,7 @@ impl Scheduler {
             &*self.forgetter,
             self.forgetting_batch_size,
             self.archive_days,
+            self.purge_invalidated_days,
         )
         .await;
     }

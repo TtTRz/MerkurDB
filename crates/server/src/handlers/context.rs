@@ -43,7 +43,8 @@ pub async fn assemble_context(
         ));
     }
 
-    // Over-recall so dedup and packing have room to select, then fuse.
+    // Over-recall so dedup and packing have room to select, then fuse. No
+    // relevance floor: MMR + the token budget do the selection here.
     let recall = req.limit.unwrap_or(50).clamp(1, 200);
     let query_vec = state.embedder.encode(&req.q).await?;
     let mut hits = merkur_core::hybrid_recall(
@@ -52,11 +53,19 @@ pub async fn assemble_context(
         &req.q,
         &ns.0,
         recall,
+        0.0,
     )
     .await?;
 
     let deduped = merkur_core::mmr_dedup(&mut hits, MMR_THRESHOLD);
     let (packed, dropped) = merkur_core::greedy_pack(&deduped, req.token_budget);
+
+    // Record demand for exactly the items served. Best-effort: a bookkeeping
+    // failure must not fail the assembly.
+    let served: Vec<String> = packed.iter().map(|m| m.id.clone()).collect();
+    if let Err(e) = state.storage.record_access(&served).await {
+        tracing::warn!(error = %e, "failed to record access for context items");
+    }
 
     let digest = packed
         .iter()

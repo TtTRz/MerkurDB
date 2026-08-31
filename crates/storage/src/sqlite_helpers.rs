@@ -1,13 +1,12 @@
 use chrono::{DateTime, Utc};
 use merkur_core::{
-    ConsolidationLogEntry, ConsolidationReport, Edge, EdgeType, MemoryLevel, MerkurError,
+    ConsolidationLogEntry, ConsolidationReport, Edge, EdgeType, Memory, MemoryLevel, MerkurError,
     MerkurResult, NewEdge, ScoredMemory, StorageStats,
 };
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use std::collections::HashMap;
-use tracing::warn;
 
 type BfsRow = (
     String,
@@ -48,6 +47,99 @@ pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.into())
         .unwrap_or_else(|_| Utc::now())
+}
+
+/// Fetch a full memory row by id, including invalidated ones — this is the
+/// audit read path; retrieval channels filter `invalid_at` at query time.
+/// Shared by both backends so the `Memory` projection cannot drift.
+pub fn get_memory_row(
+    pool: &Pool<SqliteConnectionManager>,
+    id: &str,
+) -> MerkurResult<Option<Memory>> {
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, content, abstract, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, access_count, namespace, importance, valid_at, invalid_at
+             FROM memories WHERE id = ?1",
+        )
+        .map_err(|e| MerkurError::Storage(format!("Failed to prepare statement: {e}")))?;
+
+    let result = stmt.query_row(params![id], |row| {
+        let metadata_str: String = row.get(7)?;
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, i32>(5)?,
+            row.get::<_, bool>(6)?,
+            metadata_str,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, i64>(11)? as u64,
+            row.get::<_, String>(12)?,
+            row.get::<_, f64>(13)?,
+            row.get::<_, Option<String>>(14)?,
+            row.get::<_, Option<String>>(15)?,
+        ))
+    });
+
+    match result {
+        Ok((
+            id,
+            content,
+            abstract_,
+            category,
+            weight,
+            level_i32,
+            pending,
+            metadata_str,
+            created_at,
+            updated_at,
+            accessed_at,
+            access_count,
+            namespace,
+            importance,
+            valid_at,
+            invalid_at,
+        )) => {
+            let level = MemoryLevel::from_i32(level_i32);
+            let metadata: HashMap<String, serde_json::Value> =
+                serde_json::from_str(&metadata_str).unwrap_or_default();
+            let context = get_context_tags(pool, &id)?;
+            Ok(Some(Memory {
+                id,
+                content,
+                abstract_,
+                category,
+                weight,
+                level,
+                pending_consolidation: pending,
+                embedding: None,
+                metadata,
+                context,
+                created_at: parse_rfc3339(&created_at),
+                updated_at: parse_rfc3339(&updated_at),
+                accessed_at: parse_rfc3339(&accessed_at),
+                access_count,
+                namespace,
+                importance,
+                // Rows predating v5 are backfilled by the migration; a missing
+                // value falls back to created_at defensively.
+                valid_at: valid_at
+                    .as_deref()
+                    .map(parse_rfc3339)
+                    .unwrap_or_else(|| parse_rfc3339(&created_at)),
+                invalid_at: invalid_at.as_deref().map(parse_rfc3339),
+            }))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(MerkurError::Storage(format!("Failed to query memory: {e}"))),
+    }
 }
 
 /// Insert an edge into the SQLite edges table.
@@ -100,13 +192,18 @@ pub fn bfs_expand(
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
 
     // Path delimiters guarantee that LIKE '%,<id>,%' matches whole IDs only.
-    // Namespace filtering lives in the terminal JOIN: edges crossing buckets
-    // are still traversed (they exist), but their far endpoint never lands in
-    // the result set, so a bucket's neighborhood stays its own.
-    let ns_clause = if namespace.is_some() {
-        " AND m.namespace = ?4"
+    // Namespace filtering happens **inside** the recursion (the next hop must
+    // itself live in the bucket) as well as in the terminal SELECT: following
+    // a cross-bucket edge would leak foreign-hop reachability into the result
+    // and spend depth/LIMIT budget on nodes the caller may not see.
+    let (ns_join, ns_step_filter, ns_clause) = if namespace.is_some() {
+        (
+            " JOIN memories mn ON mn.id = (CASE WHEN e.source_id = bfs.id THEN e.target_id ELSE e.source_id END)",
+            " AND mn.namespace = ?4 AND mn.invalid_at IS NULL",
+            " AND m.namespace = ?4",
+        )
     } else {
-        ""
+        ("", "", "")
     };
     let sql = format!("WITH RECURSIVE
             bfs(id, d, w, path) AS (
@@ -123,14 +220,14 @@ pub fn bfs_expand(
                     (e.edge_type = 'auto' AND (e.source_id = bfs.id OR e.target_id = bfs.id))
                     OR
                     (e.edge_type = 'manual' AND e.source_id = bfs.id)
-                )
+                ){ns_join}
                 WHERE bfs.d < ?2
-                  AND bfs.path NOT LIKE '%,' || (CASE WHEN e.source_id = bfs.id THEN e.target_id ELSE e.source_id END) || ',%'
+                  AND bfs.path NOT LIKE '%,' || (CASE WHEN e.source_id = bfs.id THEN e.target_id ELSE e.source_id END) || ',%'{ns_step_filter}
             )
         SELECT bfs.id, bfs.d, bfs.w, m.content, m.abstract, m.level, m.category, m.created_at, m.namespace, m.importance
         FROM bfs
         JOIN memories m ON m.id = bfs.id
-        WHERE bfs.d > 0 AND m.level >= 0{ns_clause}
+        WHERE bfs.d > 0 AND m.level >= 0 AND m.invalid_at IS NULL{ns_clause}
         ORDER BY bfs.d, bfs.w DESC
         LIMIT ?3");
 
@@ -283,7 +380,7 @@ pub fn list_pending_ids(
         .get()
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
     let mut stmt = conn
-        .prepare("SELECT id FROM memories WHERE pending_consolidation = 1 LIMIT ?1")
+        .prepare("SELECT id FROM memories WHERE pending_consolidation = 1 AND invalid_at IS NULL LIMIT ?1")
         .map_err(|e| MerkurError::Storage(format!("Failed to prepare pending query: {e}")))?;
     Ok(stmt
         .query_map(params![limit as i64], |row| row.get::<_, String>(0))
@@ -301,7 +398,7 @@ pub fn list_forgetting_ids(
         .get()
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
     let mut stmt = conn
-        .prepare("SELECT id FROM memories WHERE level >= 0 ORDER BY accessed_at ASC LIMIT ?1")
+        .prepare("SELECT id FROM memories WHERE level >= 0 AND invalid_at IS NULL ORDER BY accessed_at ASC LIMIT ?1")
         .map_err(|e| MerkurError::Storage(format!("Failed to prepare forgetting query: {e}")))?;
     Ok(stmt
         .query_map(params![limit as i64], |row| row.get::<_, String>(0))
@@ -596,33 +693,80 @@ pub fn get_edges_batch(
     Ok(by_mem)
 }
 
-/// Update access tracking for a batch of memories. Errors are logged, not
-/// propagated — access bookkeeping must never fail a read request.
-pub fn update_access(pool: &Pool<SqliteConnectionManager>, ids: &[String]) {
+/// Update access tracking for a batch of memories (access_count + 1,
+/// accessed_at = now). Called by serving points via `Storage::record_access`
+/// — retrieval paths are pure and never touch this.
+pub fn update_access(pool: &Pool<SqliteConnectionManager>, ids: &[String]) -> MerkurResult<()> {
     if ids.is_empty() {
-        return;
+        return Ok(());
     }
-    let conn = match pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Failed to get connection for update_access: {e}");
-            return;
-        }
-    };
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("update_access: get conn: {e}")))?;
     let now = Utc::now().to_rfc3339();
-    let ids_json = match serde_json::to_string(ids) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("update_access failed to encode ids: {e}");
-            return;
-        }
-    };
-    let sql = "UPDATE memories
-               SET accessed_at = ?1, access_count = access_count + 1
-               WHERE id IN (SELECT value FROM json_each(?2))";
-    if let Err(e) = conn.execute(sql, params![now, ids_json]) {
-        warn!("update_access failed: {e}");
+    let ids_json = serde_json::to_string(ids)
+        .map_err(|e| MerkurError::Storage(format!("update_access: encode ids: {e}")))?;
+    conn.execute(
+        "UPDATE memories
+         SET accessed_at = ?1, access_count = access_count + 1
+         WHERE id IN (SELECT value FROM json_each(?2))",
+        params![now, ids_json],
+    )
+    .map_err(|e| MerkurError::Storage(format!("update_access: {e}")))?;
+    Ok(())
+}
+
+/// Write-time dedup verdict: `Some(id)` to NOOP onto the existing memory,
+/// `None` to proceed with a plain insert. A below-threshold top hit, an empty
+/// probe, and a failed probe (mapped to `None` by the caller) all mean
+/// "insert" — governance must never block or lose a write.
+pub(crate) fn dedup_verdict(top_hit: Option<(String, f64)>, threshold: f64) -> Option<String> {
+    match top_hit {
+        Some((id, score)) if score >= threshold => Some(id),
+        _ => None,
     }
+}
+
+/// Decode a little-endian f32 blob back into a vector.
+pub(crate) fn blob_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+/// Batch-fetch raw embeddings by id. Ids without an embedding are absent from
+/// the map. Internal surface: consolidation adjudication needs the pending
+/// memories' vectors (the `Memory` read model deliberately omits the blob).
+pub fn get_embeddings_batch(
+    pool: &Pool<SqliteConnectionManager>,
+    ids: &[String],
+) -> MerkurResult<HashMap<String, Vec<f32>>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+    let ids_json = serde_json::to_string(ids)
+        .map_err(|e| MerkurError::Storage(format!("Failed to encode ids: {e}")))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, embedding FROM memories
+             WHERE id IN (SELECT value FROM json_each(?1)) AND embedding IS NOT NULL",
+        )
+        .map_err(|e| MerkurError::Storage(format!("Failed to prepare embeddings query: {e}")))?;
+    let rows = stmt
+        .query_map(params![ids_json], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| MerkurError::Storage(format!("Embeddings query failed: {e}")))?;
+    let mut out = HashMap::new();
+    for r in rows {
+        let (id, blob) = r.map_err(|e| MerkurError::Storage(format!("Row error: {e}")))?;
+        out.insert(id, blob_to_f32(&blob));
+    }
+    Ok(out)
 }
 
 /// Check if a memory exists.
@@ -711,7 +855,7 @@ pub fn text_search_bm25(
             "SELECT f.id, bm25(memories_fts) AS score
              FROM memories_fts f
              JOIN memories m ON m.id = f.id
-             WHERE memories_fts MATCH ?1 AND m.level >= 0 AND m.namespace = ?3
+             WHERE memories_fts MATCH ?1 AND m.level >= 0 AND m.namespace = ?3 AND m.invalid_at IS NULL
              ORDER BY score
              LIMIT ?2",
         )
@@ -743,4 +887,29 @@ pub fn update_importance(
     )
     .map_err(|e| MerkurError::Storage(format!("Failed to update importance: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedup_verdict;
+
+    #[test]
+    fn dedup_verdict_noops_above_threshold() {
+        assert_eq!(
+            dedup_verdict(Some(("mem_1".to_string(), 0.95)), 0.92),
+            Some("mem_1".to_string())
+        );
+    }
+
+    #[test]
+    fn dedup_verdict_inserts_below_threshold() {
+        assert_eq!(dedup_verdict(Some(("mem_1".to_string(), 0.90)), 0.92), None);
+    }
+
+    #[test]
+    fn dedup_verdict_inserts_on_empty_or_failed_probe() {
+        // A best-effort governance probe that found nothing — or errored,
+        // which the caller maps to None — must never block a write.
+        assert_eq!(dedup_verdict(None, 0.92), None);
+    }
 }

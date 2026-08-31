@@ -83,9 +83,22 @@ pub async fn search(
         // Hybrid is the two-channel recall (BM25 x vector, RRF-fused with
         // normalized scores). Level/category/date filtering and the context
         // boost below apply to fused results exactly as they did to cosine.
+        // The fused pool gets headroom beyond `limit` (at least 2x, or enough
+        // to cover the requested page) so post-filters and offset pagination
+        // do not silently starve.
         SearchMode::Hybrid => {
-            merkur_core::hybrid_recall(state.storage.as_ref(), &query_vec, &params.q, &ns.0, limit)
-                .await?
+            let pool = limit
+                .saturating_mul(2)
+                .max(offset.saturating_add(limit));
+            merkur_core::hybrid_recall(
+                state.storage.as_ref(),
+                &query_vec,
+                &params.q,
+                &ns.0,
+                pool,
+                threshold,
+            )
+            .await?
         }
         SearchMode::Fast => state
             .storage
@@ -134,17 +147,33 @@ pub async fn search(
         }
     }
 
-    let mut filtered: Vec<_> = candidates
-        .into_iter()
-        .filter(|r| r.score >= threshold)
-        .collect();
+    // Hybrid recall already gated on the fused relevance inside
+    // `hybrid_recall`; re-applying the threshold to the composite score here
+    // would double-gate, and the composite's structural floor (0.35 for a
+    // fresh memory at default weights) would distort the semantics.
+    let mut filtered: Vec<_> = if matches!(mode, SearchMode::Hybrid) {
+        candidates
+    } else {
+        candidates
+            .into_iter()
+            .filter(|r| r.score >= threshold)
+            .collect()
+    };
     filtered.sort_by(|a, b| b.score.total_cmp(&a.score));
 
     let total = filtered.len();
     let paginated: Vec<_> = filtered.into_iter().skip(offset).take(limit).collect();
 
+    // Record the demand signal for exactly the results being served.
+    // Best-effort: a bookkeeping failure must not fail the search.
+    let served: Vec<String> = paginated.iter().map(|r| r.id.clone()).collect();
+    if let Err(e) = state.storage.record_access(&served).await {
+        tracing::warn!(error = %e, "failed to record access for served results");
+    }
+
     let graph = if params.include_graph == Some(true) && !paginated.is_empty() {
         let result_ids: Vec<String> = paginated.iter().map(|r| r.id.clone()).collect();
+        let node_set: std::collections::HashSet<&String> = result_ids.iter().collect();
         let by_id = state
             .storage
             .get_edges_batch(&result_ids)
@@ -153,13 +182,18 @@ pub async fn search(
         let mut graph_edges = Vec::new();
         for edges in by_id.values() {
             for e in edges {
-                graph_edges.push(json!({
-                    "source_id": e.source_id,
-                    "target_id": e.target_id,
-                    "weight": e.weight,
-                    "relation": e.relation,
-                    "edge_type": e.edge_type,
-                }));
+                // Induced subgraph only: an edge whose far endpoint is outside
+                // the served page (another bucket, or just not returned) would
+                // leak that endpoint's existence.
+                if node_set.contains(&e.source_id) && node_set.contains(&e.target_id) {
+                    graph_edges.push(json!({
+                        "source_id": e.source_id,
+                        "target_id": e.target_id,
+                        "weight": e.weight,
+                        "relation": e.relation,
+                        "edge_type": e.edge_type,
+                    }));
+                }
             }
         }
         Some(json!({

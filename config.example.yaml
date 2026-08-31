@@ -56,18 +56,31 @@ auth:
 consolidation:
   interval_seconds: 60
   batch_size: 10
+  # Write governance (P1-7): the Consolidator adjudicates each pending memory
+  # against its nearest neighbors (mem0-style UPDATE/DELETE). Verdicts execute
+  # only when the pair's cosine similarity clears adjudication_floor — the
+  # second signal of the dual-signal rule. Only effective with an LLM
+  # consolidator (plugins.consolidator.type: "llm"); noop adjudicates nothing.
+  adjudication_floor: 0.6
+  adjudication_candidates: 5
 
 # Write-time dedup (P2-8): top-1 cosine similarity above the threshold makes
 # a write NOOP onto the existing memory in the same namespace.
 write:
   dedup_enabled: true
   dedup_threshold: 0.92
+  # Reserved: UPDATE/DELETE adjudication runs in the async Consolidator only.
+  # Only "async" is accepted today.
+  adjudication: "async"
 
 # Ebbinghaus forgetting curve: decay, downgrade/upgrade, archive
 forgetting:
   interval_seconds: 300
   batch_size: 100
   archive_days: 30
+  # Soft-invalidated memories (Consolidator adjudication) are hidden from
+  # retrieval immediately and hard-deleted after this audit window.
+  purge_invalidated_days: 30
   decay_factor: 0.9        # legacy; not used by current formula
   half_life_seconds: 86400 # weight halves every `half_life_seconds`
   access_boost: 0.1
@@ -76,7 +89,8 @@ forgetting:
   threshold_archive: 0.1
   # Access-driven promotion (hysteresis): a demoted memory climbs one rung
   # back up only when its derived weight clears this bar AND it has been
-  # retrieved at least upgrade_min_access_count times.
+  # retrieved at least upgrade_min_access_count times. Must exceed
+  # threshold_to_l1 — validation rejects oscillating configurations.
   threshold_upgrade: 0.6
   upgrade_min_access_count: 3
 

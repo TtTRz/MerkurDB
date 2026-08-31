@@ -73,6 +73,8 @@ pub struct ForgetResponse {
     pub status: String,
     pub archived: usize,
     pub downgraded: usize,
+    #[serde(default)]
+    pub upgraded: usize,
     pub cleaned: usize,
 }
 
@@ -145,6 +147,7 @@ pub struct HttpMerkurClient {
     client: reqwest::Client,
     base_url: String,
     bearer: Option<String>,
+    namespace: Option<String>,
 }
 
 impl HttpMerkurClient {
@@ -171,12 +174,27 @@ impl HttpMerkurClient {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             bearer,
+            namespace: None,
         })
     }
 
-    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.bearer {
+    /// Builder: scope every request to one namespace bucket via the
+    /// `X-Merkur-Namespace` header. Without it, requests land in the server's
+    /// `default` bucket.
+    pub fn with_namespace(self, namespace: impl Into<String>) -> Self {
+        Self {
+            namespace: Some(namespace.into()),
+            ..self
+        }
+    }
+
+    fn apply_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let req = match &self.bearer {
             Some(t) => req.bearer_auth(t),
+            None => req,
+        };
+        match &self.namespace {
+            Some(ns) => req.header("X-Merkur-Namespace", ns),
             None => req,
         }
     }
@@ -241,7 +259,7 @@ impl MerkurClient for HttpMerkurClient {
                 context,
                 metadata,
             });
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_response(resp).await
     }
 
@@ -250,7 +268,7 @@ impl MerkurClient for HttpMerkurClient {
             .client
             .post(format!("{}/v1/write-batch", self.base_url))
             .json(&serde_json::json!({ "items": items }));
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_response(resp).await
     }
 
@@ -298,13 +316,13 @@ impl MerkurClient for HttpMerkurClient {
             .client
             .get(format!("{}/v1/search", self.base_url))
             .query(&q);
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_response(resp).await
     }
 
     async fn get_memory(&self, id: &str) -> ClientResult<Memory> {
         let req = self.client.get(format!("{}/v1/memory/{id}", self.base_url));
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_response(resp).await
     }
 
@@ -313,7 +331,7 @@ impl MerkurClient for HttpMerkurClient {
             .client
             .put(format!("{}/v1/memory/{id}", self.base_url))
             .json(&serde_json::json!({ "content": content }));
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_unit(resp).await
     }
 
@@ -321,13 +339,13 @@ impl MerkurClient for HttpMerkurClient {
         let req = self
             .client
             .delete(format!("{}/v1/memory/{id}", self.base_url));
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_unit(resp).await
     }
 
     async fn status(&self) -> ClientResult<StatusResponse> {
         let req = self.client.get(format!("{}/v1/status", self.base_url));
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_response(resp).await
     }
 
@@ -335,13 +353,13 @@ impl MerkurClient for HttpMerkurClient {
         let req = self
             .client
             .post(format!("{}/v1/consolidate", self.base_url));
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_response(resp).await
     }
 
     async fn forget(&self) -> ClientResult<ForgetResponse> {
         let req = self.client.post(format!("{}/v1/forget", self.base_url));
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_response(resp).await
     }
 
@@ -361,7 +379,7 @@ impl MerkurClient for HttpMerkurClient {
                 "relation": relation,
                 "weight": weight,
             }));
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_unit(resp).await
     }
 
@@ -370,14 +388,92 @@ impl MerkurClient for HttpMerkurClient {
         if let Some(d) = depth {
             req = req.query(&[("depth", d.to_string())]);
         }
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         Self::handle_response(resp).await
     }
 
     async fn health(&self) -> ClientResult<String> {
         let req = self.client.get(format!("{}/v1/health", self.base_url));
-        let resp = self.apply_auth(req).send().await?;
+        let resp = self.apply_headers(req).send().await?;
         let body: serde_json::Value = resp.json().await?;
         Ok(body["status"].as_str().unwrap_or("unknown").to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Canned GET /v1/memory/{id} payload mirroring the server contract
+    /// (namespace and importance included since schema v3/v4).
+    fn canned_memory_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "mem_1",
+            "content": "hello",
+            "abstract": null,
+            "category": "general",
+            "weight": 1.0,
+            "level": "full",
+            "pending_consolidation": false,
+            "metadata": {},
+            "context": {},
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "accessed_at": "2026-01-01T00:00:00+00:00",
+            "access_count": 0,
+            "namespace": "alpha",
+            "importance": 0.5,
+            "valid_at": "2026-01-01T00:00:00+00:00",
+            "invalid_at": null
+        })
+    }
+
+    /// Spin up a stub server that records the X-Merkur-Namespace header of
+    /// the memory GET and replies with the canned payload.
+    async fn spawn_stub(captured: Arc<Mutex<Option<String>>>) -> String {
+        let app = axum::Router::new().route(
+            "/v1/memory/{id}",
+            axum::routing::get(move |req: axum::extract::Request| {
+                let captured = captured.clone();
+                async move {
+                    let header = req
+                        .headers()
+                        .get("x-merkur-namespace")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    *captured.lock().unwrap() = header;
+                    axum::Json(canned_memory_json())
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn client_sends_namespace_header_when_configured() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_stub(captured.clone()).await;
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("alpha");
+        let mem = client.get_memory("mem_1").await.unwrap();
+        assert_eq!(mem.namespace, "alpha");
+        assert_eq!(mem.importance, 0.5);
+        assert_eq!(*captured.lock().unwrap(), Some("alpha".to_string()));
+    }
+
+    #[tokio::test]
+    async fn client_omits_namespace_header_by_default() {
+        let captured = Arc::new(Mutex::new(None));
+        let base = spawn_stub(captured.clone()).await;
+        let client = HttpMerkurClient::new(&base).unwrap();
+        let _ = client.get_memory("mem_1").await.unwrap();
+        assert_eq!(*captured.lock().unwrap(), None);
     }
 }

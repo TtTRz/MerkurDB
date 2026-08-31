@@ -17,4 +17,5 @@ async-trait.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
+axum = "0.8"
+tokio = { workspace = true, features = ["test-util", "net"] }

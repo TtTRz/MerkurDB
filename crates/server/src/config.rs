@@ -199,6 +199,15 @@ pub struct ConsolidationConfig {
     pub interval_seconds: u64,
     #[serde(default = "default_consolidation_batch")]
     pub batch_size: usize,
+    /// Write governance (P1-7): LLM UPDATE/DELETE verdicts execute only when
+    /// the pair's cosine similarity clears this floor — the second signal of
+    /// the dual-signal rule. 0.6 is deliberately loose (below the 0.92 dedup
+    /// bar); the LLM verdict carries the semantic weight.
+    #[serde(default = "default_adjudication_floor")]
+    pub adjudication_floor: f64,
+    /// Nearest-neighbor candidates the adjudicator judges per pending memory.
+    #[serde(default = "default_adjudication_candidates")]
+    pub adjudication_candidates: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -209,6 +218,10 @@ pub struct ForgettingConfig {
     pub batch_size: usize,
     #[serde(default = "default_archive_days")]
     pub archive_days: i32,
+    /// Days an invalidated (soft-deleted) memory is kept for audit before the
+    /// forgetting tick hard-deletes it (P1-7, Q7).
+    #[serde(default = "default_purge_invalidated_days")]
+    pub purge_invalidated_days: i32,
     #[serde(default = "default_decay_factor")]
     pub decay_factor: f64,
     #[serde(default = "default_half_life_seconds")]
@@ -237,6 +250,12 @@ pub struct WriteConfig {
     /// Master switch; disabling restores plain insert behavior.
     #[serde(default = "default_dedup_enabled")]
     pub dedup_enabled: bool,
+    /// Reserved write-governance mode switch. The P1-7 decision: UPDATE/DELETE
+    /// adjudication runs in the async Consolidator only, keeping the
+    /// synchronous write path LLM-free. Only "async" is accepted today; the
+    /// field exists so a future "sync" mode does not break config compat.
+    #[serde(default = "default_adjudication_mode")]
+    pub adjudication: String,
 }
 
 impl Default for WriteConfig {
@@ -244,6 +263,7 @@ impl Default for WriteConfig {
         Self {
             dedup_threshold: 0.92,
             dedup_enabled: true,
+            adjudication: "async".into(),
         }
     }
 }
@@ -253,6 +273,9 @@ fn default_dedup_threshold() -> f64 {
 }
 fn default_dedup_enabled() -> bool {
     true
+}
+fn default_adjudication_mode() -> String {
+    "async".into()
 }
 
 // Serde requires free functions for field-level defaults. Keep them named for
@@ -264,6 +287,12 @@ fn default_consolidation_interval() -> u64 {
 fn default_consolidation_batch() -> usize {
     10
 }
+fn default_adjudication_floor() -> f64 {
+    0.6
+}
+fn default_adjudication_candidates() -> usize {
+    5
+}
 fn default_forgetting_interval() -> u64 {
     300
 }
@@ -271,6 +300,9 @@ fn default_forgetting_batch() -> usize {
     100
 }
 fn default_archive_days() -> i32 {
+    30
+}
+fn default_purge_invalidated_days() -> i32 {
     30
 }
 fn default_decay_factor() -> f64 {
@@ -303,6 +335,8 @@ impl Default for ConsolidationConfig {
         Self {
             interval_seconds: 60,
             batch_size: 10,
+            adjudication_floor: 0.6,
+            adjudication_candidates: 5,
         }
     }
 }
@@ -313,6 +347,7 @@ impl Default for ForgettingConfig {
             interval_seconds: 300,
             batch_size: 100,
             archive_days: 30,
+            purge_invalidated_days: 30,
             decay_factor: 0.9,
             half_life_seconds: 86400.0,
             access_boost: 0.1,
@@ -387,6 +422,11 @@ impl Config {
                 "forgetting.archive_days must be >= 0".into(),
             ));
         }
+        if self.forgetting.purge_invalidated_days < 0 {
+            return Err(MerkurError::Config(
+                "forgetting.purge_invalidated_days must be >= 0".into(),
+            ));
+        }
         if let Some(dim) = self.plugins.embedder.noop.as_ref().and_then(|n| n.dim)
             && dim == 0
         {
@@ -400,6 +440,29 @@ impl Config {
             return Err(MerkurError::Config(
                 "retrieval.score_threshold must be in [-1, 1]".into(),
             ));
+        }
+        if self.write.dedup_threshold <= 0.0 || self.write.dedup_threshold > 1.0 {
+            // 0.0 would NOOP nearly every embedded write onto an unrelated
+            // memory; >1.0 silently disables dedup.
+            return Err(MerkurError::Config(
+                "write.dedup_threshold must be in (0, 1]".into(),
+            ));
+        }
+        if self.write.adjudication != "async" {
+            return Err(MerkurError::Config(
+                "write.adjudication is reserved and only \"async\" is supported today".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.consolidation.adjudication_floor) {
+            return Err(MerkurError::Config(
+                "consolidation.adjudication_floor must be in [0, 1]".into(),
+            ));
+        }
+        if self.forgetting.threshold_upgrade <= self.forgetting.threshold_to_l1 {
+            return Err(MerkurError::Config(format!(
+                "forgetting.threshold_upgrade ({}) must exceed threshold_to_l1 ({}) — otherwise memories oscillate across the boundary on every tick",
+                self.forgetting.threshold_upgrade, self.forgetting.threshold_to_l1
+            )));
         }
         // Production safety: refuse to start with `*` CORS and no tokens unless
         // dev_mode is explicitly enabled.
@@ -467,5 +530,59 @@ auth:
 
     pub fn default_degree_limit(&self) -> usize {
         self.retrieval.default_degree_limit.unwrap_or(10)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_validates() {
+        assert!(Config::test_config().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_dedup_threshold() {
+        // 0.0 would NOOP nearly every embedded write onto an unrelated
+        // memory — silent write loss with a 201 in hand.
+        let mut cfg = Config::test_config();
+        cfg.write.dedup_threshold = 0.0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_dedup_threshold_above_one() {
+        let mut cfg = Config::test_config();
+        cfg.write.dedup_threshold = 1.5;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn purge_invalidated_days_defaults_to_30() {
+        assert_eq!(Config::test_config().forgetting.purge_invalidated_days, 30);
+    }
+
+    #[test]
+    fn adjudication_defaults_and_reservation() {
+        let cfg = Config::test_config();
+        assert_eq!(cfg.consolidation.adjudication_floor, 0.6);
+        assert_eq!(cfg.consolidation.adjudication_candidates, 5);
+        assert_eq!(cfg.write.adjudication, "async");
+
+        // The reserved mode switch rejects anything but "async" today.
+        let mut cfg = Config::test_config();
+        cfg.write.adjudication = "sync".into();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_upgrade_threshold_below_downgrade() {
+        // An upgrade bar under the L1 downgrade bar oscillates a memory
+        // between levels on every forgetting tick — the exact flip-flop the
+        // hysteresis design exists to prevent.
+        let mut cfg = Config::test_config();
+        cfg.forgetting.threshold_upgrade = 0.25; // < default threshold_to_l1 0.3
+        assert!(cfg.validate().is_err());
     }
 }

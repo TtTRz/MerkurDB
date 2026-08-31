@@ -77,6 +77,9 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(cfg.forgetting.interval_seconds),
         cfg.forgetting.batch_size,
         cfg.forgetting.archive_days,
+        cfg.forgetting.purge_invalidated_days,
+        cfg.consolidation.adjudication_floor,
+        cfg.consolidation.adjudication_candidates,
     ));
     let sched_handle = tokio::spawn({
         let sched = sched.clone();

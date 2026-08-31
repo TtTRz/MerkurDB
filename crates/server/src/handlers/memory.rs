@@ -32,7 +32,11 @@ pub async fn get_memory(
             "created_at": memory.created_at,
             "updated_at": memory.updated_at,
             "accessed_at": memory.accessed_at,
-            "access_count": memory.access_count
+            "access_count": memory.access_count,
+            "namespace": memory.namespace,
+            "importance": memory.importance,
+            "valid_at": memory.valid_at,
+            "invalid_at": memory.invalid_at
         })),
     ))
 }

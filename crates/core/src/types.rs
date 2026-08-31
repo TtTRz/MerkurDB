@@ -32,6 +32,16 @@ pub struct Memory {
     /// consolidator forms an opinion; clients cannot self-report it through
     /// the write path.
     pub importance: f64,
+    /// When the fact became valid. Always equals `created_at` today (memories
+    /// are written in real time); the column exists so a future point-in-time
+    /// query needs no migration (schema v5, lazy).
+    #[serde(default = "chrono::Utc::now")]
+    pub valid_at: DateTime<Utc>,
+    /// Soft-invalidation timestamp (Consolidator adjudication, P1-7). Set =
+    /// hidden from every retrieval channel but kept for audit until the
+    /// retention purge. Clients cannot set it.
+    #[serde(default)]
+    pub invalid_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +182,40 @@ pub struct ConsolidationReport {
     /// Consolidator-assessed importance per memory id; absent entries keep
     /// their prior. Only successfully persisted entries are applied.
     pub new_importance: HashMap<String, f64>,
+    /// Write-governance absorptions applied this tick (P1-7): a pending row
+    /// whose content was folded into an existing memory by an UPDATE verdict.
+    pub absorptions: usize,
+    /// Write-governance invalidations applied this tick (DELETE verdict).
+    pub invalidations: usize,
+}
+
+/// Write-governance verdict for one freshly written memory judged against its
+/// nearest neighbors (P1-7). Produced by `Consolidator::adjudicate`, executed
+/// by the scheduler under an explicit similarity floor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AdjudicationAction {
+    /// Keep the new memory as-is — the default, and the safe fallback for
+    /// unparseable or hallucinated verdicts.
+    #[default]
+    Add,
+    /// The new memory restates an existing one: the target absorbs the new
+    /// content (in-place update) and the new row is invalidated with an
+    /// `absorbed_into` pointer.
+    Update,
+    /// A contradiction: the target — an existing memory, or the new memory
+    /// itself — is the loser and gets invalidated.
+    Delete,
+    /// Explicitly no relationship of interest.
+    Noop,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Adjudication {
+    pub action: AdjudicationAction,
+    /// UPDATE/DELETE target: an existing candidate's id, or the pending
+    /// memory's own id when the new write itself loses a contradiction.
+    pub target_id: Option<String>,
+    pub reason: String,
 }
 
 impl ConsolidationReport {

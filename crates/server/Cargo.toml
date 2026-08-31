@@ -26,6 +26,7 @@ figment = { version = "0.10", features = ["yaml", "env"] }
 tower-http = { version = "0.6", features = ["cors"] }
 serde.workspace = true
 serde_json.workspace = true
+async-trait.workspace = true
 # Binary crate: needs rt-multi-thread, net, signal on top of the workspace
 # lean defaults.
 tokio = { version = "1", features = ["full"] }

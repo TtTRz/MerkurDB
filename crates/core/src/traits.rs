@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    ConsolidationLogEntry, ConsolidationReport, LevelAction, Memory, MerkurResult, NewEdge,
-    NewMemory, ScoredMemory, StorageStats,
+    Adjudication, ConsolidationLogEntry, ConsolidationReport, LevelAction, Memory, MerkurResult,
+    NewEdge, NewMemory, ScoredMemory, StorageStats,
 };
 
 #[async_trait]
@@ -19,6 +19,17 @@ pub trait Embedder: Send + Sync {
 #[async_trait]
 pub trait Consolidator: Send + Sync {
     async fn consolidate(&self, memories: &[Memory]) -> MerkurResult<ConsolidationReport>;
+
+    /// Judge one freshly written memory against its nearest neighbors
+    /// (write governance, P1-7). The default verdict is `Add` — no
+    /// adjudication happens without an LLM behind the trait.
+    async fn adjudicate(
+        &self,
+        _pending: &Memory,
+        _candidates: &[ScoredMemory],
+    ) -> MerkurResult<Adjudication> {
+        Ok(Adjudication::default())
+    }
 }
 
 pub trait Forgetter: Send + Sync {
@@ -53,18 +64,53 @@ pub trait Storage: Send + Sync {
     async fn get_memory(&self, id: &str) -> MerkurResult<Option<Memory>>;
     async fn delete_memory(&self, id: &str) -> MerkurResult<()>;
 
+    /// Soft-invalidate a memory (P1-7 write governance): the row stays for
+    /// audit with `invalid_at` set, but disappears from every retrieval
+    /// channel until the retention purge hard-deletes it. `absorbed_into`
+    /// records the surviving memory when the invalidation is the absorb half
+    /// of an UPDATE adjudication. Idempotent: re-invalidating keeps the
+    /// original timestamp.
+    async fn invalidate_memory(&self, id: &str, absorbed_into: Option<&str>) -> MerkurResult<()>;
+
+    /// Hard-delete memories invalidated more than `days` ago — the retention
+    /// window for the soft-invalidation channel.
+    async fn purge_invalidated_older_than(&self, days: i32) -> MerkurResult<usize>;
+
     /// Pure cosine channel over **every** bucket. Kept for the rare
     /// cross-namespace audit path; new callers should prefer
     /// [`Storage::vector_search_ns`].
     async fn vector_search(&self, vec: &[f32], limit: usize) -> MerkurResult<Vec<ScoredMemory>>;
 
     /// Cosine channel restricted to one bucket.
+    ///
+    /// Pure query: records no access. Serving points call
+    /// [`Storage::record_access`] for the results they actually return.
     async fn vector_search_ns(
         &self,
         vec: &[f32],
         namespace: &str,
         limit: usize,
     ) -> MerkurResult<Vec<ScoredMemory>>;
+
+    /// Record that these memories were served to a caller — the demand
+    /// signal the forgetting curve and access-driven promotion consume.
+    ///
+    /// Retrieval methods ([`Storage::vector_search_ns`],
+    /// [`Storage::text_search`], [`Storage::bfs_expand_ns`]) are pure queries
+    /// and never record; governance probes (write-time dedup) ride the same
+    /// pure path. Serving points — the REST search handler, context assembly,
+    /// the MCP tools — call this for the items they actually return, so the
+    /// signal stays symmetric across channels and free of probe noise.
+    async fn record_access(&self, ids: &[String]) -> MerkurResult<()>;
+
+    /// Batch-fetch raw embeddings by id. Ids without an embedding are absent
+    /// from the map. Internal surface: consolidation adjudication needs the
+    /// pending memories' vectors (the `Memory` read model deliberately omits
+    /// the blob).
+    async fn get_embeddings(
+        &self,
+        ids: &[String],
+    ) -> MerkurResult<std::collections::HashMap<String, Vec<f32>>>;
 
     /// Full-text (BM25) channel for hybrid retrieval, best match first.
     ///

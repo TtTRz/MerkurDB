@@ -490,6 +490,150 @@ async fn test_migration_backfills_preexisting_rows() -> MerkurResult<()> {
 }
 
 
+#[tokio::test]
+async fn test_migration_replay_after_version_rollback_is_safe() -> MerkurResult<()> {
+    // Simulates a crash mid-migration: the v2-v4 schema objects already exist
+    // but the recorded version was never advanced. Replay must heal the
+    // database — not fail on duplicate columns, not duplicate FTS rows.
+    let path = temp_db_path();
+    let storage = SqliteStorage::new(&path, 4)?;
+    let id = storage
+        .insert_memory(&new_test_memory("redis cluster resharding notes", None))
+        .await?;
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE merkur_meta SET value = '1' WHERE key = 'schema_version'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let replayed = SqliteStorage::new(&path, 4)
+        .expect("migration replay after partial upgrade must succeed");
+    let hits = replayed
+        .text_search("resharding", merkur_core::DEFAULT_NAMESPACE, 5)
+        .await?;
+    assert_eq!(hits.len(), 1, "FTS backfill must not duplicate on replay");
+    assert_eq!(hits[0].0, id);
+    let m = replayed.get_memory(&id).await?.unwrap();
+    assert_eq!(m.namespace, "default");
+    drop(storage);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_vector_search_ns_deepens_past_foreign_bucket_hits() -> MerkurResult<()> {
+    // Five foreign-bucket vectors all outrank the in-bucket needle, so a fixed
+    // top-(limit*2) probe of the global index would discard the needle and
+    // return nothing. The search must deepen until the bucket is served.
+    let storage = new_test_storage(4)?;
+    for i in 0..5 {
+        storage
+            .insert_memory(&NewMemory {
+                content: format!("foreign filler {i}"),
+                category: Some("general".into()),
+                context: Default::default(),
+                metadata: Default::default(),
+                embedding: Some(vec![1.0, 0.001 * (i as f32 + 1.0), 0.0, 0.0]),
+                namespace: "default".into(),
+            })
+            .await?;
+    }
+    let needle = storage
+        .insert_memory(&NewMemory {
+            content: "alpha needle".into(),
+            category: Some("general".into()),
+            context: Default::default(),
+            metadata: Default::default(),
+            embedding: Some(vec![0.5, 0.5, 0.5, 0.5]),
+            namespace: "alpha".into(),
+        })
+        .await?;
+
+    let hits = storage
+        .vector_search_ns(&[1.0, 0.0, 0.0, 0.0], "alpha", 1)
+        .await?;
+    assert_eq!(
+        hits.len(),
+        1,
+        "in-bucket needle must be found despite foreign hits outranking it"
+    );
+    assert_eq!(hits[0].id, needle);
+    Ok(())
+}
+
+/// Let any pre-fix fire-and-forget bump task land before asserting.
+async fn settle_background_tasks() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn test_record_access_increments_count() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let id = storage
+        .insert_memory(&new_test_memory("demand signal target", None))
+        .await?;
+    storage.record_access(std::slice::from_ref(&id)).await?;
+    storage.record_access(std::slice::from_ref(&id)).await?;
+    let m = storage.get_memory(&id).await?.unwrap();
+    assert_eq!(m.access_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_vector_search_does_not_record_access() -> MerkurResult<()> {
+    // Retrieval is a pure query; only serving points record demand.
+    let storage = new_test_storage(4)?;
+    let id = storage
+        .insert_memory(&new_test_memory(
+            "pure retrieval target",
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+        ))
+        .await?;
+    let hits = storage
+        .vector_search_ns(&[1.0, 0.0, 0.0, 0.0], merkur_core::DEFAULT_NAMESPACE, 5)
+        .await?;
+    assert!(hits.iter().any(|h| h.id == id));
+    settle_background_tasks().await;
+    let m = storage.get_memory(&id).await?.unwrap();
+    assert_eq!(
+        m.access_count, 0,
+        "retrieval must not record access; serving points do"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dedup_probe_is_not_recorded_as_access() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let existing = storage
+        .insert_memory(&new_test_memory(
+            "existing fact",
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+        ))
+        .await?;
+    // Cosine ≈ 0.85 against the existing embedding: below the 0.92 NOOP bar,
+    // so this is a real insert whose governance probe must not count as
+    // demand for the memory it merely compared against.
+    let probe = new_test_memory("related new fact", Some(vec![0.85, 0.53, 0.0, 0.0]));
+    let new_id = storage.insert_memory_dedup(&probe, 0.92).await?;
+    assert_ne!(new_id, existing, "below-threshold probe must insert, not NOOP");
+    settle_background_tasks().await;
+    let m = storage.get_memory(&existing).await?.unwrap();
+    assert_eq!(
+        m.access_count, 0,
+        "a dedup probe is governance, not demonstrated demand"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Namespace isolation (P0-3)
 // ---------------------------------------------------------------------------
@@ -621,6 +765,227 @@ async fn test_namespace_isolated_bfs() -> MerkurResult<()> {
         expanded.iter().all(|m| m.id != b_ids[0]),
         "cross-bucket edge endpoint must not appear in alpha results"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_namespace_isolated_bfs_does_not_traverse_foreign_nodes() -> MerkurResult<()> {
+    // alpha:A -- beta:B -- alpha:C. The recursive CTE must not follow the
+    // cross-bucket edge into beta at all, so C — reachable only through a
+    // foreign node — must not appear (and the foreign hop must not spend
+    // depth/LIMIT budget).
+    let storage = new_test_storage(4)?;
+    let mk = |content: &str, ns: &str| NewMemory {
+        content: content.to_string(),
+        category: None,
+        context: Default::default(),
+        metadata: Default::default(),
+        embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
+        namespace: ns.to_string(),
+    };
+    let a = storage.insert_memory(&mk("alpha node a", "alpha")).await?;
+    let b = storage.insert_memory(&mk("beta node b", "beta")).await?;
+    let c = storage.insert_memory(&mk("alpha node c", "alpha")).await?;
+    for (src, dst) in [(&a, &b), (&b, &c)] {
+        storage
+            .insert_edge(&NewEdge {
+                source_id: src.clone(),
+                target_id: dst.clone(),
+                weight: Some(1.0),
+                relation: None,
+                edge_type: EdgeType::Auto,
+            })
+            .await?;
+    }
+
+    let expanded = storage
+        .bfs_expand_ns(std::slice::from_ref(&a), "alpha", 3, 20)
+        .await?;
+    assert!(
+        expanded.iter().all(|m| m.namespace == "alpha"),
+        "BFS leaked into beta: {expanded:?}"
+    );
+    assert!(
+        !expanded.iter().any(|m| m.id == c),
+        "C must be unreachable: the path to it runs through a foreign bucket"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_migration_v5_backfills_valid_at() -> MerkurResult<()> {
+    // Hand-rolled v4 database: everything through the importance column, no
+    // temporal columns. v5 must add them and backfill valid_at from
+    // created_at.
+    let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let path = format!("file:v4_{n}?mode=memory&cache=shared");
+    let keeper = rusqlite::Connection::open(&path).unwrap();
+    keeper
+        .execute_batch(
+            "CREATE TABLE memories (
+                id TEXT PRIMARY KEY, content TEXT NOT NULL, abstract TEXT DEFAULT '',
+                category TEXT DEFAULT 'general', weight REAL NOT NULL DEFAULT 1.0,
+                level INTEGER NOT NULL DEFAULT 2, pending_consolidation INTEGER NOT NULL DEFAULT 1,
+                embedding BLOB, metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, accessed_at TEXT NOT NULL,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                namespace TEXT NOT NULL DEFAULT 'default',
+                importance REAL NOT NULL DEFAULT 0.5
+            );
+            CREATE TABLE merkur_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO merkur_meta VALUES ('schema_version', '4');
+            INSERT INTO memories (id, content, created_at, updated_at, accessed_at)
+              VALUES ('mem_v4_1', 'temporal backfill probe', '2026-01-01T00:00:00+00:00',
+                      '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');",
+        )
+        .unwrap();
+
+    let storage = SqliteStorage::new(&path, 4)?;
+    let m = storage.get_memory("mem_v4_1").await?.unwrap();
+    assert_eq!(
+        m.valid_at.to_rfc3339(),
+        "2026-01-01T00:00:00+00:00",
+        "valid_at must be backfilled from created_at"
+    );
+    assert!(m.invalid_at.is_none(), "existing rows stay valid");
+
+    let v: String = keeper
+        .query_row(
+            "SELECT value FROM merkur_meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v, "5");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_sets_valid_at_and_leaves_invalid_at_null() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let id = storage
+        .insert_memory(&new_test_memory("temporal insert probe", None))
+        .await?;
+    let m = storage.get_memory(&id).await?.unwrap();
+    assert_eq!(m.valid_at, m.created_at, "valid_at defaults to created_at");
+    assert!(m.invalid_at.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_invalidated_memory_hidden_from_retrieval_but_auditable() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let doomed = storage
+        .insert_memory(&new_test_memory(
+            "the deploy region is us-east",
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+        ))
+        .await?;
+    let keep = storage
+        .insert_memory(&new_test_memory(
+            "the deploy region is us-west",
+            Some(vec![0.0, 1.0, 0.0, 0.0]),
+        ))
+        .await?;
+    storage
+        .insert_edge(&NewEdge {
+            source_id: keep.clone(),
+            target_id: doomed.clone(),
+            weight: Some(1.0),
+            relation: None,
+            edge_type: EdgeType::Auto,
+        })
+        .await?;
+
+    storage.invalidate_memory(&doomed, None).await?;
+
+    let vec_hits = storage
+        .vector_search_ns(&[1.0, 0.0, 0.0, 0.0], merkur_core::DEFAULT_NAMESPACE, 5)
+        .await?;
+    assert!(
+        vec_hits.iter().all(|m| m.id != doomed),
+        "vector channel must hide invalidated rows"
+    );
+    let bm25 = storage
+        .text_search("deploy region", merkur_core::DEFAULT_NAMESPACE, 5)
+        .await?;
+    assert!(
+        bm25.iter().all(|(id, _)| *id != doomed),
+        "BM25 channel must hide invalidated rows"
+    );
+    let graph = storage
+        .bfs_expand_ns(std::slice::from_ref(&keep), merkur_core::DEFAULT_NAMESPACE, 2, 10)
+        .await?;
+    assert!(
+        graph.iter().all(|m| m.id != doomed),
+        "BFS must hide invalidated rows"
+    );
+    assert!(
+        storage
+            .list_for_forgetting(10)
+            .await?
+            .iter()
+            .all(|m| m.id != doomed),
+        "forgetting must not spend cycles on invalidated rows"
+    );
+
+    // Audit path: the row is still fully readable, with its salience intact
+    // (Q5: importance is preserved, not zeroed).
+    let m = storage.get_memory(&doomed).await?.unwrap();
+    assert!(m.invalid_at.is_some());
+    assert_eq!(m.importance, 0.5);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_invalidate_records_absorb_pointer() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let x = storage
+        .insert_memory(&new_test_memory("surviving canonical fact", None))
+        .await?;
+    let p = storage
+        .insert_memory(&new_test_memory("newer phrasing of the fact", None))
+        .await?;
+    storage.invalidate_memory(&p, Some(&x)).await?;
+    let m = storage.get_memory(&p).await?.unwrap();
+    assert!(m.invalid_at.is_some());
+    assert_eq!(
+        m.metadata.get("absorbed_into").and_then(|v| v.as_str()),
+        Some(x.as_str()),
+        "absorbed_into must point at the surviving memory"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_purge_invalidated_older_than() -> MerkurResult<()> {
+    let path = temp_db_path();
+    let storage = SqliteStorage::new(&path, 4)?;
+    let old = storage
+        .insert_memory(&new_test_memory("old invalidated fact", None))
+        .await?;
+    let recent = storage
+        .insert_memory(&new_test_memory("recently invalidated fact", None))
+        .await?;
+    storage.invalidate_memory(&old, None).await?;
+    storage.invalidate_memory(&recent, None).await?;
+
+    // Backdate the old row's invalid_at beyond the retention window.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE memories SET invalid_at = ?1 WHERE id = ?2",
+        rusqlite::params![
+            (chrono::Utc::now() - chrono::Duration::days(40)).to_rfc3339(),
+            old
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let purged = storage.purge_invalidated_older_than(30).await?;
+    assert_eq!(purged, 1, "only the row past retention is purged");
+    assert!(storage.get_memory(&old).await?.is_none());
+    assert!(storage.get_memory(&recent).await?.is_some());
     Ok(())
 }
 

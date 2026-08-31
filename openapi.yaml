@@ -1,10 +1,10 @@
 openapi: "3.0.3"
 info:
   title: MerkurDB
-  version: "0.1.0"
+  version: "0.4.0"
   description: |
     Standalone cognitive memory service for AI agents.
-    MerkurDB is an independent HTTP memory service supporting memory writes, semantic search, graph diffusion,
+    MerkurDB is an independent HTTP memory service supporting memory writes, hybrid semantic/keyword search, graph diffusion,
     memory consolidation, and forgetting curve management.
   contact:
     name: MerkurDB
@@ -61,6 +61,8 @@ paths:
       tags: [Write]
       summary: Write a memory
       operationId: write
+      parameters:
+        - $ref: "#/components/parameters/NamespaceHeader"
       requestBody:
         required: true
         content:
@@ -99,6 +101,8 @@ paths:
       tags: [Write]
       summary: Batch write memories
       operationId: writeBatch
+      parameters:
+        - $ref: "#/components/parameters/NamespaceHeader"
       requestBody:
         required: true
         content:
@@ -158,6 +162,7 @@ paths:
       summary: Search memories
       operationId: search
       parameters:
+        - $ref: "#/components/parameters/NamespaceHeader"
         - name: q
           in: query
           required: true
@@ -168,9 +173,9 @@ paths:
           in: query
           schema:
             type: string
-            enum: [fast, deep]
-            default: fast
-          description: fast=vector retrieval, deep=BFS graph diffusion
+            enum: [hybrid, fast, deep]
+            default: hybrid
+          description: hybrid=BM25 x vector RRF fusion (default), fast=vector retrieval, deep=BFS graph diffusion
         - name: limit
           in: query
           schema:
@@ -185,11 +190,18 @@ paths:
             minimum: -1
             maximum: 1
             default: 0.3
+          description: Relevance floor. Gates raw cosine in fast mode and the normalized RRF fused relevance in hybrid mode (not the composite score, whose weight/importance shares would otherwise set a floor). Ignored by deep mode ranking.
         - name: context
           in: query
           schema:
             type: string
           description: JSON context filter, e.g. '{"agent":"test"}'
+        - name: include_graph
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Include the induced subgraph over the served page (edges whose endpoints are both in the result set)
         - name: offset
           in: query
           schema:
@@ -330,15 +342,30 @@ paths:
       summary: View memory graph neighborhood
       operationId: getGraph
       parameters:
+        - $ref: "#/components/parameters/NamespaceHeader"
         - name: id
           in: path
           required: true
           schema:
             type: string
           description: Center memory ID
+        - name: depth
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5
+            default: 2
+        - name: degree_limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 10
       responses:
         "200":
-          description: Graph neighborhood
+          description: Graph neighborhood (bucket-scoped; edges form the induced subgraph over the returned nodes)
           content:
             application/json:
               schema:
@@ -346,6 +373,10 @@ paths:
                 properties:
                   center:
                     type: string
+                  depth:
+                    type: integer
+                  degree_limit:
+                    type: integer
                   neighborhood:
                     type: array
                     items:
@@ -361,6 +392,92 @@ paths:
                           type: number
                         level:
                           type: string
+                  edges:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                        source_id:
+                          type: string
+                        target_id:
+                          type: string
+                        weight:
+                          type: number
+                        relation:
+                          type: string
+                        edge_type:
+                          type: string
+                          enum: [auto, manual]
+
+  /context:
+    post:
+      tags: [Search]
+      summary: Assemble a token-budgeted context digest
+      description: Hybrid recall, MMR dedup, then greedy packing under the token budget. Returns a prompt-ready digest plus the surviving items.
+      operationId: assembleContext
+      parameters:
+        - $ref: "#/components/parameters/NamespaceHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [q, token_budget]
+              properties:
+                q:
+                  type: string
+                  description: Free-text query steering the hybrid recall
+                token_budget:
+                  type: integer
+                  minimum: 1
+                  description: Hard ceiling on the digest's approximate token count (chars/4 heuristic)
+                limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 200
+                  default: 50
+                  description: Recall width before dedup/packing
+            example:
+              q: "postgres vacuum tuning"
+              token_budget: 512
+      responses:
+        "200":
+          description: Assembled context
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  digest:
+                    type: string
+                    description: Prompt-ready bullet list of packed memory contents
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        content:
+                          type: string
+                        score:
+                          type: number
+                        weight:
+                          type: number
+                        importance:
+                          type: number
+                        namespace:
+                          type: string
+                  token_estimate:
+                    type: integer
+                  dropped:
+                    type: integer
+                    description: Recalled items that did not fit the budget
+        "400":
+          $ref: "#/components/responses/Error"
 
   /relate:
     post:
@@ -491,12 +608,20 @@ paths:
                     type: integer
                   edges_created:
                     type: integer
+                  absorptions:
+                    type: integer
+                    description: Pending memories folded into an existing one by an UPDATE verdict (P1-7)
+                  invalidations:
+                    type: integer
+                    description: Memories soft-invalidated by a DELETE verdict (P1-7)
                   errors:
                     type: integer
               example:
                 status: "ok"
                 processed: 5
                 edges_created: 3
+                absorptions: 1
+                invalidations: 0
                 errors: 0
 
   /consolidate/log:
@@ -559,13 +684,21 @@ paths:
                     type: integer
                   downgraded:
                     type: integer
+                  upgraded:
+                    type: integer
+                    description: Memories promoted one level by demonstrated demand (hysteresis promotion)
                   cleaned:
                     type: integer
+                  purged:
+                    type: integer
+                    description: Invalidated memories hard-deleted past the audit window (P1-7)
               example:
                 status: "ok"
                 archived: 2
                 downgraded: 1
+                upgraded: 1
                 cleaned: 0
+                purged: 0
 
   /status:
     get:
@@ -585,6 +718,15 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
+  parameters:
+    NamespaceHeader:
+      name: X-Merkur-Namespace
+      in: header
+      required: false
+      schema:
+        type: string
+        default: default
+      description: Logical isolation bucket for this request. Missing/empty falls back to `default`. Logical isolation only — not a security boundary.
   schemas:
     Memory:
       type: object
@@ -622,6 +764,21 @@ components:
           format: date-time
         access_count:
           type: integer
+        namespace:
+          type: string
+          description: Logical isolation bucket (set via X-Merkur-Namespace at write time; not a security boundary)
+        importance:
+          type: number
+          description: System-learned salience in [0, 1], written only by the Consolidator; new memories carry the neutral 0.5 prior
+        valid_at:
+          type: string
+          format: date-time
+          description: When the fact became valid (currently always equals created_at)
+        invalid_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Soft-invalidation timestamp (Consolidator adjudication); set rows are hidden from retrieval but kept for audit until the retention purge
 
     WriteResponse:
       type: object
@@ -647,6 +804,9 @@ components:
           type: string
         score:
           type: number
+          description: Composite score (0.5 relevance + 0.2 weight + 0.3 importance at default weights)
+        weight:
+          type: number
         level:
           type: string
         category:
@@ -656,6 +816,10 @@ components:
         created_at:
           type: string
           format: date-time
+        namespace:
+          type: string
+        importance:
+          type: number
 
     SearchResponse:
       type: object

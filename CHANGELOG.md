@@ -6,6 +6,11 @@ All notable changes to MerkurDB. Format follows [Keep a Changelog](https://keepa
 
 ### Added
 
+- **Write governance: Consolidator adjudication (P1-7)** — after consolidation, each pending memory is adjudicated against its nearest same-bucket neighbors (mem0-style ADD/UPDATE/DELETE/NOOP). UPDATE *absorbs*: the target takes the new content in place (keeping its learned importance, access history, and edges) while the new row is invalidated with an `absorbed_into` audit pointer. DELETE invalidates the loser the LLM names — an existing memory, or the new write itself. Verdicts execute only when the pair's cosine similarity clears `consolidation.adjudication_floor` (0.6, dual-signal); hallucinated or unparseable verdicts fall back to ADD. Requires `plugins.consolidator.type = "llm"`; `NoopConsolidator` adjudicates nothing.
+- **Bitemporal soft-invalidation (schema v5)** — `memories.valid_at` (backfilled from `created_at`; lazy — reserved so a future point-in-time query needs no migration) and `memories.invalid_at`. Invalidated rows vanish from every retrieval channel (vector, BM25, BFS, pending-consolidation and forgetting lists) but stay readable via `GET /v1/memory/{id}` for audit until purged.
+- **Invalidation retention** — `forgetting.purge_invalidated_days` (default 30) hard-deletes rows past the audit window on each forgetting tick; `/v1/forget` reports `purged`. Client `DELETE /v1/memory/{id}` remains an immediate hard delete — soft-invalidation is a system-only channel.
+- **`write.adjudication` reserved config key** — only `"async"` is accepted today; reserves the slot for a future synchronous adjudication mode without breaking config compatibility.
+- **Client namespace support** — `HttpMerkurClient::with_namespace("bucket")` sends `X-Merkur-Namespace` on every request; `ForgetResponse` gains `upgraded`/`purged`.
 - **Hybrid search (BM25 x vector)** — `/v1/search` gains `mode=hybrid`: FTS5 full-text (trigram tokenizer, CJK-capable) fused with vector cosine via Reciprocal Rank Fusion (`k=60`). Shared orchestration (`merkur_core::hybrid_recall`) powers both the REST handler and the MCP `search_memory` tool; a channel failure degrades to the other instead of failing the recall.
 - **FTS5 schema (migration v2)** — `memories_fts` virtual table plus insert/update/delete triggers with automatic backfill of existing rows on upgrade. Triggers keep every write path (both storage backends, CLI tools) in sync.
 - **`Storage::text_search` trait method** — best-first BM25 candidate lookup; implemented for `SqliteStorage` and `LanceDbStorage` (which rides the same shared SQLite database).
@@ -18,11 +23,23 @@ All notable changes to MerkurDB. Format follows [Keep a Changelog](https://keepa
 
 ### Changed
 
-- **Default search mode is now `hybrid`** (was `fast`). Scores returned under hybrid are normalized RRF values in `(0, 1]`; `score_threshold` semantics stay "higher is more relevant" across all modes. Pass `mode=fast` explicitly to keep pure-vector behavior.
+- **`score_threshold` in hybrid mode now gates the fused retrieval relevance** (normalized RRF), not the composite score — previously the composite's structural floor (0.35 for a fresh memory at default weights) silently disabled the threshold in the default mode. Fast mode still gates raw cosine.
+- **Access signal is recorded at serving points only** — retrieval (`vector_search_ns`, `text_search`, `bfs_expand_ns`) is now pure; the REST search handler, `/v1/context`, and the MCP `search_memory` tool call `Storage::record_access` for exactly the results they serve. Dedup probes and hydration internals no longer touch `access_count`/`accessed_at`, so the promotion signal reflects demonstrated demand only.
+- **`GET /v1/memory/{id}` response** gains `namespace`, `importance`, `valid_at`, `invalid_at`.
+- **`GET /v1/graph/{id}`** is namespace-scoped like every other read path and returns the induced subgraph over the visible nodes (no foreign-bucket endpoint leakage); `/v1/search?include_graph=true` applies the same rule.
+- **Default search mode is now `hybrid`** (was `fast`). Scores returned under hybrid are composite values re-ranked from the RRF fusion; pass `mode=fast` explicitly to keep pure-vector behavior.
 - MCP `search_memory` tool upgraded from pure vector similarity to hybrid retrieval.
 
 ### Fixed
 
+- **Migrations are now transactional per version and replay-safe** — a crash between a migration step and its version bump no longer bricks the database (`duplicate column` on restart) or duplicates the FTS backfill; databases bricked by a partial migration heal on boot.
+- **LanceDB backend runs schema migrations** — previously it created only the base tables, so every write failed with `no column named namespace`.
+- **Namespace-scoped vector search no longer starves small buckets** — both backends deepen the global candidate probe until the bucket is served (a fixed 2× oversample could return zero in-bucket hits; write-time dedup could miss exact in-bucket duplicates).
+- **Hybrid pagination** — the fused pool keeps headroom (`max(2×limit, offset+limit)`), so `offset` past page one and post-filters no longer return empty or underfilled pages.
+- **Hybrid recall degrades on hydration failure** — a BM25-only candidate whose fetch fails is skipped instead of failing the whole recall.
+- **BFS traversal no longer follows cross-bucket edges** — the recursive CTE filters hops by namespace, so foreign nodes can neither appear nor bridge back into the bucket (and no longer spend depth/limit budget).
+- **Write-time dedup probe failures fall back to plain insert** instead of failing the write.
+- **Config validation** — rejects `write.dedup_threshold` outside `(0, 1]` (0.0 caused silent write loss), `forgetting.threshold_upgrade <= threshold_to_l1` (per-tick level oscillation), and negative `forgetting.purge_invalidated_days`.
 - Fresh databases skipped pending migrations: first-run version stamping wrote the current version before migrations ran, so auxiliary objects introduced in later versions were never created until the stored version was bumped externally.
 
 ## [0.4.0] — 2026-05-08

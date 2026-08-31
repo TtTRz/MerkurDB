@@ -132,7 +132,7 @@ pub async fn write_batch(
     };
 
     let mut ids = Vec::with_capacity(eligible.len());
-    for ((i, item), embedding) in eligible.iter().zip(embeddings.into_iter()) {
+    for ((i, item), embedding) in eligible.iter().zip(embeddings) {
         let new_mem = NewMemory {
             content: item.content.clone(),
             category: None,

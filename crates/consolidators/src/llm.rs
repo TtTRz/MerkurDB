@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use merkur_core::{
-    ConsolidationReport, Consolidator, EdgeType, Memory, MerkurError, MerkurResult, NewEdge,
+    Adjudication, AdjudicationAction, ConsolidationReport, Consolidator, EdgeType, Memory,
+    MerkurError, MerkurResult, NewEdge, ScoredMemory,
 };
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -160,6 +161,106 @@ fn extract_json_object(s: &str) -> &str {
     stripped
 }
 
+#[derive(Debug, Deserialize)]
+struct AdjudicationJson {
+    action: Option<String>,
+    target_id: Option<String>,
+    reason: Option<String>,
+}
+
+/// Parse an adjudication verdict from LLM output. Anything unparseable, any
+/// hallucinated target id, and any UPDATE/DELETE left without a valid target
+/// all collapse to the safe default (`Add`, no target) — a governance miss
+/// must never mutate memory.
+pub(crate) fn parse_adjudication(
+    raw: &str,
+    pending_id: &str,
+    candidate_ids: &HashSet<&str>,
+) -> Adjudication {
+    let cleaned = extract_json_object(raw);
+    let parsed: AdjudicationJson = match serde_json::from_str(cleaned) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "adjudication output unparseable; defaulting to ADD");
+            return Adjudication::default();
+        }
+    };
+    let action = match parsed
+        .action
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("update") => AdjudicationAction::Update,
+        Some("delete") => AdjudicationAction::Delete,
+        Some("noop") => AdjudicationAction::Noop,
+        _ => AdjudicationAction::Add,
+    };
+    let target_id = match parsed.target_id {
+        Some(t) if t == pending_id || candidate_ids.contains(t.as_str()) => Some(t),
+        Some(t) => {
+            warn!(target = %t, "LLM hallucinated adjudication target; dropping");
+            None
+        }
+        None => None,
+    };
+    let (action, target_id) = match (&action, &target_id) {
+        (AdjudicationAction::Update, None) | (AdjudicationAction::Delete, None) => {
+            (AdjudicationAction::Add, None)
+        }
+        _ => (action, target_id),
+    };
+    Adjudication {
+        action,
+        target_id,
+        reason: parsed.reason.unwrap_or_default(),
+    }
+}
+
+/// Build the adjudication prompt: one pending memory vs its nearest
+/// neighbors (with similarity evidence the scheduler will re-check against
+/// the configured floor).
+fn build_adjudication_prompt(
+    pending: &Memory,
+    candidates: &[ScoredMemory],
+) -> MerkurResult<String> {
+    let pending_json = serde_json::to_string(&serde_json::json!({
+        "id": pending.id,
+        "content": pending.content,
+    }))
+    .map_err(|e| MerkurError::Consolidation(format!("encode pending memory: {e}")))?;
+    let cands: Vec<serde_json::Value> = candidates
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id,
+                "content": c.content,
+                "similarity": (c.score * 1000.0).round() / 1000.0,
+            })
+        })
+        .collect();
+    let cands_json = serde_json::to_string(&cands)
+        .map_err(|e| MerkurError::Consolidation(format!("encode candidates: {e}")))?;
+
+    Ok(format!(
+        r#"You are a memory governance judge. A newly written memory may relate to existing memories.
+
+New memory: {pending_json}
+Existing neighbors (most similar first): {cands_json}
+
+Decide the relationship:
+- ADD: the new memory is a genuinely new fact (the default when unsure).
+- UPDATE: the new memory restates or refines one existing memory — name it in target_id; it will take over the new content.
+- DELETE: a contradiction — name the loser in target_id: the existing memory if the new fact supersedes it, or the new memory's own id if the new write itself is wrong.
+- NOOP: the same fact is already recorded; nothing to do.
+
+Use ONLY ids shown above (or the new memory's own id for DELETE). Do not invent ids.
+
+Respond with JSON only:
+{{"action":"ADD|UPDATE|DELETE|NOOP","target_id":"...or null...","reason":"one sentence"}}"#
+    ))
+}
+
 #[async_trait]
 impl Consolidator for LlmConsolidator {
     async fn consolidate(&self, memories: &[Memory]) -> MerkurResult<ConsolidationReport> {
@@ -235,6 +336,20 @@ impl Consolidator for LlmConsolidator {
         report.edges_created = 0;
 
         Ok(report)
+    }
+
+    async fn adjudicate(
+        &self,
+        pending: &Memory,
+        candidates: &[ScoredMemory],
+    ) -> MerkurResult<Adjudication> {
+        if candidates.is_empty() {
+            return Ok(Adjudication::default());
+        }
+        let prompt = build_adjudication_prompt(pending, candidates)?;
+        let raw = self.call_llm(&prompt).await?;
+        let candidate_ids: HashSet<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
+        Ok(parse_adjudication(&raw, &pending.id, &candidate_ids))
     }
 }
 
@@ -316,6 +431,8 @@ mod tests {
             access_count: 0,
             namespace: merkur_core::DEFAULT_NAMESPACE.to_string(),
             importance: merkur_core::NEUTRAL_IMPORTANCE,
+            valid_at: chrono::Utc::now(),
+            invalid_at: None,
         }
     }
 
@@ -325,5 +442,71 @@ mod tests {
         let prompt = build_prompt(&[m]).unwrap();
         assert!(prompt.contains("importance"));
         assert!(prompt.contains("[0, 1]"));
+    }
+
+    // ---------- adjudication parsing (P1-7 write governance) ----------
+
+    #[test]
+    fn adjudication_parses_update_verdict() {
+        let candidates: HashSet<&str> = ["mem_x"].into_iter().collect();
+        let raw = r#"{"action":"UPDATE","target_id":"mem_x","reason":"same fact rephrased"}"#;
+        let v = parse_adjudication(raw, "mem_p", &candidates);
+        assert_eq!(v.action, merkur_core::AdjudicationAction::Update);
+        assert_eq!(v.target_id.as_deref(), Some("mem_x"));
+        assert_eq!(v.reason, "same fact rephrased");
+    }
+
+    #[test]
+    fn adjudication_hallucinated_target_collapses_to_add() {
+        let candidates: HashSet<&str> = ["mem_x"].into_iter().collect();
+        let raw = r#"{"action":"DELETE","target_id":"mem_hallucinated","reason":"invented"}"#;
+        let v = parse_adjudication(raw, "mem_p", &candidates);
+        assert_eq!(v.action, merkur_core::AdjudicationAction::Add);
+        assert_eq!(v.target_id, None);
+    }
+
+    #[test]
+    fn adjudication_delete_may_target_the_pending_memory_itself() {
+        let candidates: HashSet<&str> = ["mem_x"].into_iter().collect();
+        let raw = r#"{"action":"delete","target_id":"mem_p","reason":"new write is wrong"}"#;
+        let v = parse_adjudication(raw, "mem_p", &candidates);
+        assert_eq!(v.action, merkur_core::AdjudicationAction::Delete);
+        assert_eq!(v.target_id.as_deref(), Some("mem_p"));
+    }
+
+    #[test]
+    fn adjudication_garbage_output_is_safe_default() {
+        let candidates: HashSet<&str> = HashSet::new();
+        let v = parse_adjudication("not json at all", "mem_p", &candidates);
+        assert_eq!(v.action, merkur_core::AdjudicationAction::Add);
+    }
+
+    #[test]
+    fn adjudication_update_without_target_collapses_to_add() {
+        let candidates: HashSet<&str> = ["mem_x"].into_iter().collect();
+        let v = parse_adjudication(r#"{"action":"UPDATE"}"#, "mem_p", &candidates);
+        assert_eq!(v.action, merkur_core::AdjudicationAction::Add);
+    }
+
+    #[test]
+    fn adjudication_prompt_lists_candidates_with_similarity() {
+        let pending = test_memory("mem_p", "the region is now us-west");
+        let cand = merkur_core::ScoredMemory {
+            id: "mem_x".into(),
+            content: "the region is us-east".into(),
+            abstract_: None,
+            score: 0.87,
+            weight: 1.0,
+            level: merkur_core::MemoryLevel::Full,
+            category: "general".into(),
+            context: Default::default(),
+            created_at: chrono::Utc::now(),
+            namespace: merkur_core::DEFAULT_NAMESPACE.to_string(),
+            importance: merkur_core::NEUTRAL_IMPORTANCE,
+        };
+        let prompt = build_adjudication_prompt(&pending, std::slice::from_ref(&cand)).unwrap();
+        assert!(prompt.contains("mem_x"));
+        assert!(prompt.contains("us-east"));
+        assert!(prompt.contains("0.87"));
     }
 }

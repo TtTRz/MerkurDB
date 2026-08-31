@@ -92,9 +92,12 @@ impl MerkurMcp {
             Ok(v) => v,
             Err(e) => return format!("Embedding error: {e}"),
         };
-        match merkur_core::hybrid_recall(self.storage.as_ref(), &vec, &args.query, merkur_core::DEFAULT_NAMESPACE, args.limit).await
+        match merkur_core::hybrid_recall(self.storage.as_ref(), &vec, &args.query, merkur_core::DEFAULT_NAMESPACE, args.limit, 0.0).await
         {
             Ok(results) => {
+                // Best-effort demand signal for the served results.
+                let ids: Vec<String> = results.iter().map(|m| m.id.clone()).collect();
+                let _ = self.storage.record_access(&ids).await;
                 serde_json::to_string_pretty(&results).unwrap_or_else(|e| format!("Error: {e}"))
             }
             Err(e) => format!("Error: {e}"),

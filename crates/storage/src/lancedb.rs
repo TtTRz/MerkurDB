@@ -99,6 +99,55 @@ where
         .map_err(|e| MerkurError::Internal(format!("blocking task panicked: {e}")))?
 }
 
+/// Top-`limit` cosine candidates from the Lance vector table, as id -> score.
+///
+/// cos = 1 - d² / 2 (exact for L2-normalized vectors).
+async fn lance_candidates(
+    table: &lancedb::Table,
+    vec: &[f32],
+    limit: usize,
+) -> MerkurResult<HashMap<String, f64>> {
+    use futures::TryStreamExt;
+    use lancedb::query::{ExecutableQuery, QueryBase};
+
+    let results: Vec<_> = table
+        .query()
+        .nearest_to(vec)
+        .map_err(|e| MerkurError::Storage(format!("Failed to create query: {e}")))?
+        .limit(limit)
+        .execute()
+        .await
+        .map_err(|e| MerkurError::Storage(format!("Vector search failed: {e}")))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| MerkurError::Storage(format!("Failed to collect results: {e}")))?;
+
+    let mut id_score: HashMap<String, f64> = HashMap::new();
+    for batch in results {
+        let id_col = batch
+            .column_by_name("id")
+            .ok_or_else(|| MerkurError::Storage("Missing id column".into()))?;
+        let id_array = id_col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| MerkurError::Storage("Invalid id column type".into()))?;
+        let distance_col = batch
+            .column_by_name("_distance")
+            .ok_or_else(|| MerkurError::Storage("Missing _distance column".into()))?;
+        let dist_array = distance_col
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .ok_or_else(|| MerkurError::Storage("Invalid distance type".into()))?;
+        for i in 0..batch.num_rows() {
+            let id = id_array.value(i).to_string();
+            let d = f64::from(dist_array.value(i));
+            let score = (1.0 - (d * d) / 2.0).clamp(-1.0, 1.0);
+            id_score.insert(id, score);
+        }
+    }
+    Ok(id_score)
+}
+
 impl LanceDbStorage {
     pub async fn new(lance_path: &str, sqlite_path: &str, dim: usize) -> MerkurResult<Self> {
         let db = lancedb::connect(lance_path)
@@ -114,6 +163,10 @@ impl LanceDbStorage {
         conn.execute_batch(DDL)
             .map_err(|e| MerkurError::Storage(format!("Failed to init SQLite schema: {e}")))?;
         drop(conn);
+
+        // Both backends share this SQLite file for rows/FTS; skip this and the
+        // table never gains the migrated columns (namespace, importance, ...).
+        crate::migration::migrate(&sqlite_pool)?;
 
         let storage = Self {
             db,
@@ -262,8 +315,8 @@ impl Storage for LanceDbStorage {
                 .transaction()
                 .map_err(|e| MerkurError::Storage(format!("begin tx failed: {e}")))?;
             tx.execute(
-                "INSERT INTO memories (id, content, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, namespace)
-                 VALUES (?1, ?2, ?3, 1.0, 2, 1, ?4, ?5, ?5, ?5, ?6)",
+                "INSERT INTO memories (id, content, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, namespace, valid_at)
+                 VALUES (?1, ?2, ?3, 1.0, 2, 1, ?4, ?5, ?5, ?5, ?6, ?5)",
                 params![id_for_db, content, category, metadata, now, namespace],
             )
             .map_err(|e| MerkurError::Storage(format!("Failed to insert memory: {e}")))?;
@@ -320,18 +373,22 @@ impl Storage for LanceDbStorage {
         threshold: f64,
     ) -> MerkurResult<String> {
         if let Some(embedding) = mem.embedding.as_deref() {
-            let top = self
-                .vector_search_ns(embedding, &mem.namespace, 1)
-                .await?;
-            if let Some(hit) = top.first()
-                && hit.score >= threshold
-            {
+            // Best-effort governance probe: a probe failure must not fail the
+            // write — fall back to a plain insert.
+            let top = match self.vector_search_ns(embedding, &mem.namespace, 1).await {
+                Ok(hits) => hits.into_iter().next().map(|h| (h.id, h.score)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "dedup probe failed; inserting plainly");
+                    None
+                }
+            };
+            if let Some(existing_id) = sqlite_helpers::dedup_verdict(top, threshold) {
                 tracing::debug!(
-                    existing_id = hit.id.as_str(),
-                    similarity = hit.score,
+                    existing_id = existing_id.as_str(),
+                    threshold,
                     "write-time dedup: NOOP onto existing memory"
                 );
-                return Ok(hit.id.clone());
+                return Ok(existing_id);
             }
         }
         self.insert_memory(mem).await
@@ -391,83 +448,7 @@ impl Storage for LanceDbStorage {
     async fn get_memory(&self, id: &str) -> MerkurResult<Option<Memory>> {
         let id_owned = id.to_string();
         let pool = self.sqlite_pool.clone();
-
-        run_blocking(move || -> MerkurResult<Option<Memory>> {
-            let conn = pool
-                .get()
-                .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, content, abstract, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, access_count, namespace, importance
-                     FROM memories WHERE id = ?1",
-                )
-                .map_err(|e| MerkurError::Storage(format!("Failed to prepare statement: {e}")))?;
-
-            let result = stmt.query_row(params![id_owned], |row| {
-                let metadata_str: String = row.get(7)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, f64>(4)?,
-                    row.get::<_, i32>(5)?,
-                    row.get::<_, bool>(6)?,
-                    metadata_str,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
-                    row.get::<_, i64>(11)? as u64,
-                    row.get::<_, String>(12)?,
-                    row.get::<_, f64>(13)?,
-                ))
-            });
-
-            match result {
-                Ok((
-                    id,
-                    content,
-                    abstract_,
-                    category,
-                    weight,
-                    level_i32,
-                    pending,
-                    metadata_str,
-                    created_at,
-                    updated_at,
-                    accessed_at,
-                    access_count,
-                    namespace,
-                    importance,
-                )) => {
-                    let level = MemoryLevel::from_i32(level_i32);
-                    let metadata: HashMap<String, serde_json::Value> =
-                        serde_json::from_str(&metadata_str).unwrap_or_default();
-                    let context = sqlite_helpers::get_context_tags(&pool, &id)?;
-                    Ok(Some(Memory {
-                        id,
-                        content,
-                        abstract_,
-                        category,
-                        weight,
-                        level,
-                        pending_consolidation: pending,
-                        embedding: None,
-                        metadata,
-                        context,
-                        created_at: sqlite_helpers::parse_rfc3339(&created_at),
-                        updated_at: sqlite_helpers::parse_rfc3339(&updated_at),
-                        accessed_at: sqlite_helpers::parse_rfc3339(&accessed_at),
-                        access_count,
-                        namespace,
-                        importance,
-                    }))
-                }
-                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                Err(e) => Err(MerkurError::Storage(format!("Failed to query memory: {e}"))),
-            }
-        })
-        .await
+        run_blocking(move || sqlite_helpers::get_memory_row(&pool, &id_owned)).await
     }
 
     async fn delete_memory(&self, id: &str) -> MerkurResult<()> {
@@ -521,93 +502,24 @@ impl Storage for LanceDbStorage {
         namespace: &str,
         limit: usize,
     ) -> MerkurResult<Vec<ScoredMemory>> {
-        let namespace = namespace.to_string();
-        use futures::TryStreamExt;
-        use lancedb::query::{ExecutableQuery, QueryBase};
-
         let table = self.get_table().await?;
 
-        let oversample = limit.saturating_mul(2).max(limit);
-        let results: Vec<_> = table
-            .query()
-            .nearest_to(vec)
-            .map_err(|e| MerkurError::Storage(format!("Failed to create query: {e}")))?
-            .limit(oversample)
-            .execute()
-            .await
-            .map_err(|e| MerkurError::Storage(format!("Vector search failed: {e}")))?
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| MerkurError::Storage(format!("Failed to collect results: {e}")))?;
-
-        // cos = 1 - d² / 2 (exact for L2-normalized vectors).
-        let mut id_score: HashMap<String, f64> = HashMap::new();
-        for batch in results {
-            let id_col = batch
-                .column_by_name("id")
-                .ok_or_else(|| MerkurError::Storage("Missing id column".into()))?;
-            let id_array = id_col
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| MerkurError::Storage("Invalid id column type".into()))?;
-            let distance_col = batch
-                .column_by_name("_distance")
-                .ok_or_else(|| MerkurError::Storage("Missing _distance column".into()))?;
-            let dist_array = distance_col
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| MerkurError::Storage("Invalid distance type".into()))?;
-            for i in 0..batch.num_rows() {
-                let id = id_array.value(i).to_string();
-                let d = f64::from(dist_array.value(i));
-                let score = (1.0 - (d * d) / 2.0).clamp(-1.0, 1.0);
-                id_score.insert(id, score);
+        // Same iterative-deepening contract as the SQLite backend: candidates
+        // are scored globally in the vector table and filtered by bucket in
+        // the shared SQLite database, so a fixed oversample can starve a
+        // small bucket.
+        let mut fetch = limit.saturating_mul(2).max(limit).max(1);
+        let (memories, id_score) = loop {
+            let id_score = lance_candidates(&table, vec, fetch).await?;
+            let exhausted = id_score.len() < fetch;
+            let ids: Vec<String> = id_score.keys().cloned().collect();
+            let memories =
+                crate::sqlite::fetch_rows_in_namespace(&self.sqlite_pool, &ids, namespace).await?;
+            if memories.len() >= limit || exhausted {
+                break (memories, id_score);
             }
-        }
-
-        if id_score.is_empty() {
-            return Ok(Vec::new());
-        }
-        let ids: Vec<String> = id_score.keys().cloned().collect();
-        let pool = self.sqlite_pool.clone();
-        let ids_for_query = ids.clone();
-
-        let memories = run_blocking(move || -> MerkurResult<Vec<(String, String, Option<String>, String, f64, i32, String, String, f64)>> {
-            let conn = pool
-                .get()
-                .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
-            let ids_json = serde_json::to_string(&ids_for_query)
-                .map_err(|e| MerkurError::Storage(format!("Failed to encode ids: {e}")))?;
-            let mut stmt = conn
-                .prepare(
-                    "SELECT id, content, abstract, category, weight, level, created_at, namespace, importance
-                     FROM memories
-                     WHERE id IN (SELECT value FROM json_each(?1))
-                       AND level >= 0 AND namespace = ?2",
-                )
-                .map_err(|e| MerkurError::Storage(format!("Failed to prepare batch query: {e}")))?;
-            let rows = stmt
-                .query_map(params![ids_json, namespace], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, f64>(4)?,
-                        row.get::<_, i32>(5)?,
-                        row.get::<_, String>(6)?,
-                        row.get::<_, String>(7)?,
-                        row.get::<_, f64>(8)?,
-                    ))
-                })
-                .map_err(|e| MerkurError::Storage(format!("Batch query failed: {e}")))?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(r.map_err(|e| MerkurError::Storage(format!("Row error: {e}")))?);
-            }
-            Ok(out)
-        })
-        .await?;
+            fetch = fetch.saturating_mul(2);
+        };
 
         let pool2 = self.sqlite_pool.clone();
         let id_set: Vec<String> = memories.iter().map(|m| m.0.clone()).collect();
@@ -676,16 +588,23 @@ impl Storage for LanceDbStorage {
         });
         out.truncate(limit);
 
-        let pool3 = self.sqlite_pool.clone();
-        let touched: Vec<String> = out.iter().map(|s| s.id.clone()).collect();
-        tokio::spawn(async move {
-            let _ =
-                task::spawn_blocking(move || sqlite_helpers::update_access(&pool3, &touched)).await;
-        });
-
         Ok(out)
     }
 
+    async fn record_access(&self, ids: &[String]) -> MerkurResult<()> {
+        let pool = self.sqlite_pool.clone();
+        let ids = ids.to_vec();
+        run_blocking(move || sqlite_helpers::update_access(&pool, &ids)).await
+    }
+
+    async fn get_embeddings(
+        &self,
+        ids: &[String],
+    ) -> MerkurResult<HashMap<String, Vec<f32>>> {
+        let pool = self.sqlite_pool.clone();
+        let ids = ids.to_vec();
+        run_blocking(move || sqlite_helpers::get_embeddings_batch(&pool, &ids)).await
+    }
     async fn vector_search(&self, vec: &[f32], limit: usize) -> MerkurResult<Vec<ScoredMemory>> {
         // Legacy cross-bucket audit path — same rationale as the SQLite
         // backend: delegate to the default bucket until an audit endpoint
@@ -817,6 +736,82 @@ impl Storage for LanceDbStorage {
         let pool = self.sqlite_pool.clone();
         run_blocking(move || sqlite_helpers::update_importance(&pool, &id_owned, importance))
             .await
+    }
+
+    async fn invalidate_memory(&self, id: &str, absorbed_into: Option<&str>) -> MerkurResult<()> {
+        // Rows live in the shared SQLite database; the Lance side keeps the
+        // vector, which every retrieval path filters via the SQL post-filter
+        // until the retention purge removes it.
+        let id = id.to_string();
+        let absorbed = absorbed_into.map(str::to_string);
+        let pool = self.sqlite_pool.clone();
+        run_blocking(move || {
+            let conn = pool
+                .get()
+                .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+            let now = Utc::now().to_rfc3339();
+            // Idempotent: the first invalidation wins, keeping the original
+            // timestamp and absorb pointer for audit.
+            match absorbed {
+                Some(target) => conn.execute(
+                    "UPDATE memories SET invalid_at = ?1, updated_at = ?1,
+                        metadata = json_set(metadata, '$.absorbed_into', ?2)
+                     WHERE id = ?3 AND invalid_at IS NULL",
+                    params![now, target, id],
+                ),
+                None => conn.execute(
+                    "UPDATE memories SET invalid_at = ?1, updated_at = ?1
+                     WHERE id = ?2 AND invalid_at IS NULL",
+                    params![now, id],
+                ),
+            }
+            .map_err(|e| MerkurError::Storage(format!("Failed to invalidate memory: {e}")))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn purge_invalidated_older_than(&self, days: i32) -> MerkurResult<usize> {
+        let pool = self.sqlite_pool.clone();
+        let (ids, count) = run_blocking(move || -> MerkurResult<(Vec<String>, usize)> {
+            let threshold = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+            let conn = pool
+                .get()
+                .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM memories WHERE invalid_at IS NOT NULL AND invalid_at < ?1",
+                )
+                .map_err(|e| MerkurError::Storage(format!("Failed to prepare purge query: {e}")))?;
+            let ids: Vec<String> = stmt
+                .query_map(params![threshold], |row| row.get::<_, String>(0))
+                .map_err(|e| MerkurError::Storage(format!("Failed to query invalidated: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+            let count = conn
+                .execute(
+                    "DELETE FROM memories WHERE invalid_at IS NOT NULL AND invalid_at < ?1",
+                    params![threshold],
+                )
+                .map_err(|e| MerkurError::Storage(format!("Failed to purge invalidated: {e}")))?;
+            Ok((ids, count))
+        })
+        .await?;
+
+        if !ids.is_empty() {
+            let table = self.get_table().await?;
+            let mut quoted = Vec::with_capacity(ids.len());
+            for id in &ids {
+                quoted.push(Self::quote_id_strict(id)?);
+            }
+            let id_list = quoted.join(",");
+            table
+                .delete(&format!("id IN ({id_list})"))
+                .await
+                .map_err(|e| MerkurError::Storage(format!("Failed to delete vectors: {e}")))?;
+        }
+
+        Ok(count)
     }
 
     async fn delete_archived_older_than(&self, days: i32) -> MerkurResult<usize> {
