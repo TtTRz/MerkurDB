@@ -10,3 +10,4 @@
 .env.local
 data/
 .claude/
+crates/eval/data/

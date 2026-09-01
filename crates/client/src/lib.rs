@@ -143,6 +143,7 @@ pub trait MerkurClient: Send + Sync {
 
 // ── HTTP implementation ──
 
+#[derive(Clone)]
 pub struct HttpMerkurClient {
     client: reqwest::Client,
     base_url: String,
