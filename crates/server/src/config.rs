@@ -112,6 +112,9 @@ pub struct LlmConsolidatorConfig {
     /// Bearer token for hosted providers (DeepSeek, OpenRouter). Prefer the
     /// MERKUR_PLUGINS__CONSOLIDATOR__LLM__API_KEY env var over the file.
     pub api_key: Option<String>,
+    /// Per-call timeout seconds (default 120). Reasoning models on large
+    /// batches can need much longer.
+    pub timeout_seconds: Option<u64>,
 }
 
 fn default_llm_backend() -> String {

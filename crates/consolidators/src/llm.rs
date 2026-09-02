@@ -44,6 +44,16 @@ impl LlmConsolidator {
         self
     }
 
+    /// Override the per-call timeout (default 120 s). Reasoning models on
+    /// large consolidation batches can exceed two minutes easily.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        self
+    }
+
     async fn call_llm(&self, prompt: &str) -> MerkurResult<String> {
         match self.backend {
             LlmBackend::Ollama => self.call_ollama(prompt).await,
