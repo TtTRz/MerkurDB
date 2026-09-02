@@ -109,6 +109,9 @@ pub struct LlmConsolidatorConfig {
     pub model: String,
     #[serde(default = "default_llm_backend")]
     pub backend: String,
+    /// Bearer token for hosted providers (DeepSeek, OpenRouter). Prefer the
+    /// MERKUR_PLUGINS__CONSOLIDATOR__LLM__API_KEY env var over the file.
+    pub api_key: Option<String>,
 }
 
 fn default_llm_backend() -> String {

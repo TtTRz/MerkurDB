@@ -271,11 +271,15 @@ fn build_consolidator(cfg: &config::Config) -> Result<Arc<dyn Consolidator>> {
                 lc.model,
                 lc.backend()
             );
-            Ok(Arc::new(LlmConsolidator::new(
+            let mut consolidator = LlmConsolidator::new(
                 lc.base_url.clone(),
                 lc.model.clone(),
                 lc.backend(),
-            )?))
+            )?;
+            if let Some(key) = &lc.api_key {
+                consolidator = consolidator.with_api_key(key.clone());
+            }
+            Ok(Arc::new(consolidator))
         }
         _ => {
             info!("Using NoopConsolidator");

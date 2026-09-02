@@ -19,6 +19,7 @@ pub struct LlmConsolidator {
     model: String,
     client: reqwest::Client,
     backend: LlmBackend,
+    api_key: Option<String>,
 }
 
 impl LlmConsolidator {
@@ -32,7 +33,15 @@ impl LlmConsolidator {
             model,
             client,
             backend,
+            api_key: None,
         })
+    }
+
+    /// Attach a bearer token for hosted OpenAI-compatible providers (DeepSeek,
+    /// OpenRouter, ...). Local endpoints (ollama-style) leave this unset.
+    pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
+        self.api_key = Some(api_key.into());
+        self
     }
 
     async fn call_llm(&self, prompt: &str) -> MerkurResult<String> {
@@ -75,7 +84,7 @@ impl LlmConsolidator {
     }
 
     async fn call_openai(&self, prompt: &str) -> MerkurResult<String> {
-        let resp = self
+        let mut req = self
             .client
             .post(format!("{}/v1/chat/completions", self.base_url))
             .header("Content-Type", "application/json")
@@ -83,7 +92,11 @@ impl LlmConsolidator {
                 "model": &self.model,
                 "messages": [{"role": "user", "content": prompt}],
                 "response_format": {"type": "json_object"},
-            }))
+            }));
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| MerkurError::Consolidation(format!("LLM request failed: {e}")))?;
@@ -393,6 +406,50 @@ Respond with JSON only:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn openai_backend_sends_bearer_when_api_key_configured() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |req: axum::extract::Request| {
+                let seen = seen2.clone();
+                async move {
+                    let auth = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    *seen.lock().unwrap() = auth;
+                    axum::Json(serde_json::json!({
+                        "choices": [{"message": {"content": "{\"results\": []}"}}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base = format!("http://{addr}");
+        let mems = vec![test_memory("m1", "hello")];
+        let with_key =
+            LlmConsolidator::new(base.clone(), "m".into(), LlmBackend::OpenAI)
+                .unwrap()
+                .with_api_key("sk-test");
+        with_key.consolidate(&mems).await.ok();
+        assert_eq!(seen.lock().unwrap().as_deref(), Some("Bearer sk-test"));
+
+        // No key configured -> no Authorization header (local endpoints).
+        *seen.lock().unwrap() = None;
+        let without_key = LlmConsolidator::new(base, "m".into(), LlmBackend::OpenAI).unwrap();
+        without_key.consolidate(&mems).await.ok();
+        assert_eq!(seen.lock().unwrap().as_deref(), None);
+    }
 
     #[test]
     fn test_extract_json_object_plain() {
