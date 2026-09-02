@@ -200,64 +200,13 @@ crates/
 ├── consolidators/     # Noop / LLM
 ├── forgetters/        # Ebbinghaus
 ├── server/            # HTTP server + scheduler
-└── client/            # Rust SDK
+├── client/            # Rust SDK
+├── cli/               # merkurctl admin CLI
+├── mcp/               # MCP server (stdio)
+└── eval/              # LoCoMo + PersonaMem benchmark harness
 ```
 
 ## Roadmap
-
-### Completed
-
-#### v0.1.0 — Foundation
-
-| Category | Feature |
-|----------|---------|
-| Core | Type system (Memory, Edge, MemoryLevel), 4 plugin traits, MerkurError |
-| Storage | SqliteStorage (WAL + r2d2), InMemoryVectorIndex (cosine similarity) |
-| Storage | LanceDbStorage (disk-based vector search, feature gated) |
-| Embedders | NoopEmbedder, OllamaEmbedder, OpenAIEmbedder (feature gated) |
-| Retrieval | S1 Fast (vector top-k), S2 Deep (CTE BFS graph diffusion) |
-| Consolidation | NoopConsolidator, LlmConsolidator (LLM summary + edge creation) |
-| Forgetting | EbbinghausForgetter (exponential decay + access boost + cascade) |
-| Server | 14 REST endpoints, CORS, Scheduler, graceful shutdown |
-| SDK | `merkur-client` crate, OpenAPI 3.0 spec |
-| DevOps | Docker, GitHub Actions CI |
-
-#### v0.2.0 — Hardening
-
-| Category | Feature |
-|----------|---------|
-| Security | Bearer-token auth middleware, constant-time comparison |
-| Safety | `foreign_keys=ON` per-connection, `spawn_blocking` for all SQLite |
-| Correctness | Ebbinghaus formula fixed (true half-life), BFS cycle detection |
-| Performance | Bounded min-heap top-k, batch `json_each` queries |
-| Config | Figment multi-layer merge, runtime validation |
-| API | Structured error responses, request body limit (10 MiB) |
-
-#### v0.3.0 — Performance & Reliability
-
-| Category | Feature |
-|----------|---------|
-| Critical fix | Consolidation no longer marks failed memories as complete |
-| Performance | N+1 eliminated in 5 hot paths (bfs, write_batch, search, graph, relate) |
-| Performance | Pre-cached L2 norms in vector index, LanceDB auto-index at 256 rows |
-| Security | `subtle` crate for constant-time token comparison |
-| API | `write_batch` returns 207 on full failure, context boost before threshold |
-| Cleanup | Dead code removed (Timeout/Unauthorized variants, rebuild_vector_index) |
-| Docs | Mermaid diagrams (crate deps, retrieval flow, lifecycle, consolidation) |
-
-#### v0.5.0 (unreleased) — Retrieval hardening & write governance
-
-| Category | Feature |
-|----------|---------|
-| Governance | Consolidator adjudication (mem0-style UPDATE/DELETE) with dual-signal gate; UPDATE absorbs in place, DELETE soft-invalidates |
-| Schema | Migration v5: `valid_at` (lazy, backfilled) + `invalid_at`; every retrieval channel filters invalidated rows |
-| Retention | `purge_invalidated_days` audit window; `/v1/forget` reports `purged` |
-| Correctness | Per-version transactional, replay-safe migrations; LanceDB backend migrates |
-| Retrieval | Iterative-deepening namespace vector search; hybrid pagination headroom; hydration degradation |
-| Scoring | Threshold gates fused relevance in hybrid mode |
-| Signal | Access recorded at serving points only (`record_access`); probes are pure |
-| Isolation | BFS filters cross-bucket hops; graph endpoints return induced subgraphs |
-| SDK | Client `with_namespace`; `ForgetResponse.upgraded/purged`; full-record `GET /v1/memory/{id}` |
 
 ### Planned (v0.6.0+)
 
@@ -265,13 +214,15 @@ crates/
 |----------|---------|-------------|
 | P2 | At-rest encryption | SQLCipher or app-layer embedding column encryption |
 | P2 | PostgreSQL backend | PG storage backend via Storage trait |
-| P2 | Public evaluation | LoCoMo benchmark harness for retrieval/scoring weight tuning |
 | P3 | Multi-modal | Image embedding support (CLIP, etc.) |
+
+The full per-release change record lives in [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation
 
 - [SPEC.md](docs/SPEC.md) — Design philosophy, cognitive science background, product roadmap
 - [ARCHITECTURE.md](docs/ARCHITECTURE.md) — Technical architecture, data model, API spec
+- [Architecture diagram](docs/diagrams/architecture.html) — interactive system map (open in a browser)
 - [openapi.yaml](openapi.yaml) — OpenAPI 3.0 specification
 - [CHANGELOG.md](CHANGELOG.md) — Change log
 

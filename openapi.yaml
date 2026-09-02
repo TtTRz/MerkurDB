@@ -43,7 +43,7 @@ paths:
       security: []
       responses:
         "200":
-          description: Service healthy
+          description: Service status. `status` is "ok" or "degraded" (200 either way); `checks` reports the database and the probed embedding dimension.
           content:
             application/json:
               schema:
@@ -51,10 +51,34 @@ paths:
                 properties:
                   status:
                     type: string
+                    enum: [ok, degraded]
                     example: ok
                   version:
                     type: string
-                    example: "0.1.0"
+                    example: "0.4.0"
+                  checks:
+                    type: object
+                    properties:
+                      database:
+                        type: string
+                        example: ok
+                      embedder_dim:
+                        type: integer
+                        example: 4096
+
+  /metrics:
+    get:
+      tags: [Admin]
+      summary: Prometheus metrics exposition
+      operationId: metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
 
   /write:
     post:
@@ -93,8 +117,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/WriteResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "500":
           $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/EmbedFailed"
 
   /write-batch:
     post:
@@ -151,8 +183,18 @@ paths:
                       type: object
                   time_ms:
                     type: integer
+        "207":
+          description: Every item failed (details in errors)
+          content:
+            application/json:
+              schema:
+                type: object
         "400":
           $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "500":
           $ref: "#/components/responses/Error"
 
@@ -187,15 +229,13 @@ paths:
           in: query
           schema:
             type: number
-            minimum: -1
-            maximum: 1
             default: 0.3
-          description: Relevance floor. Gates raw cosine in fast mode and the normalized RRF fused relevance in hybrid mode (not the composite score, whose weight/importance shares would otherwise set a floor). Ignored by deep mode ranking.
+          description: Relevance floor applied to the returned score. Gates raw cosine in fast mode, normalized RRF fused relevance in hybrid mode (not the composite score), and the diffusion-decayed score in deep mode. Any number is accepted; out-of-range values simply over- or under-filter.
         - name: context
           in: query
           schema:
             type: string
-          description: JSON context filter, e.g. '{"agent":"test"}'
+          description: JSON context boost, e.g. '{"agent":"test"}'. Each matching key adds +0.1 to the score of matching memories — a reranking boost, not a filter; non-matching memories are not excluded.
         - name: include_graph
           in: query
           schema:
@@ -253,8 +293,16 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SearchResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "500":
           $ref: "#/components/responses/Error"
+        "502":
+          $ref: "#/components/responses/EmbedFailed"
 
   /memory/{id}:
     get:
@@ -276,6 +324,10 @@ paths:
                 $ref: "#/components/schemas/Memory"
         "404":
           $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
     put:
       tags: [Memory]
       summary: Update memory content
@@ -312,6 +364,14 @@ paths:
                     example: updated
                   id:
                     type: string
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "502":
+          $ref: "#/components/responses/EmbedFailed"
     delete:
       tags: [Memory]
       summary: Delete memory
@@ -336,6 +396,10 @@ paths:
                   id:
                     type: string
 
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /graph/{id}:
     get:
       tags: [Graph]
@@ -388,6 +452,7 @@ paths:
                           type: string
                         abstract:
                           type: string
+                          nullable: true
                         score:
                           type: number
                         level:
@@ -411,6 +476,10 @@ paths:
                           type: string
                           enum: [auto, manual]
 
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /context:
     post:
       tags: [Search]
@@ -479,6 +548,10 @@ paths:
         "400":
           $ref: "#/components/responses/Error"
 
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /relate:
     post:
       tags: [Graph]
@@ -530,6 +603,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /relate-batch:
     post:
       tags: [Graph]
@@ -567,7 +644,7 @@ paths:
                   weight: 0.5
       responses:
         "201":
-          description: Batch create results
+          description: Batch create results. `requested` echoes the input count; `created` <= `requested` when some edges failed.
           content:
             application/json:
               schema:
@@ -576,6 +653,8 @@ paths:
                   status:
                     type: string
                   created:
+                    type: integer
+                  requested:
                     type: integer
                   errors:
                     type: array
@@ -588,6 +667,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /consolidate:
     post:
       tags: [Lifecycle]
@@ -624,6 +707,10 @@ paths:
                 invalidations: 0
                 errors: 0
 
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /consolidate/log:
     get:
       tags: [Lifecycle]
@@ -634,8 +721,10 @@ paths:
           in: query
           schema:
             type: integer
+            minimum: 1
+            maximum: 1000
             default: 20
-          description: Max entries to return
+          description: Max entries to return (values outside 1-1000 are clamped)
       responses:
         "200":
           description: Consolidation log entries
@@ -664,6 +753,10 @@ paths:
                         errors:
                           type: integer
 
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /forget:
     post:
       tags: [Lifecycle]
@@ -700,6 +793,10 @@ paths:
                 cleaned: 0
                 purged: 0
 
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
   /status:
     get:
       tags: [Status]
@@ -713,6 +810,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/StatusResponse"
 
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
 components:
   securitySchemes:
     bearerAuth:
@@ -737,6 +838,7 @@ components:
           type: string
         abstract:
           type: string
+          nullable: true
         category:
           type: string
         weight:
@@ -802,9 +904,10 @@ components:
           type: string
         abstract:
           type: string
+          nullable: true
         score:
           type: number
-          description: Composite score (0.5 relevance + 0.2 weight + 0.3 importance at default weights)
+          description: "Per-mode score semantics — hybrid: composite of fused relevance, weight, and importance (0.5/0.2/0.3 at default weights); fast: raw vector cosine; deep: diffusion-decayed path score (0.5^depth x edge weight)."
         weight:
           type: number
         level:
@@ -852,6 +955,32 @@ components:
         graph:
           nullable: true
           type: object
+          description: Induced subgraph over the served page (only with include_graph=true)
+          properties:
+            nodes:
+              type: array
+              items:
+                type: string
+            edges:
+              type: array
+              items:
+                $ref: "#/components/schemas/Edge"
+
+    Edge:
+      type: object
+      properties:
+        source_id:
+          type: string
+        target_id:
+          type: string
+        weight:
+          type: number
+        relation:
+          type: string
+          nullable: true
+        edge_type:
+          type: string
+          description: system (LLM-created) or manual (client-created)
 
     StatusResponse:
       type: object
@@ -884,6 +1013,24 @@ components:
   responses:
     Error:
       description: Error response
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Missing or invalid bearer token (code UNAUTHORIZED). Applies to every route except /health and /metrics.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    RateLimited:
+      description: Global token-bucket rate limit exceeded (code RATE_LIMITED). Only when rate limiting is enabled in config.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    EmbedFailed:
+      description: The configured embedding backend failed (code EMBED_FAILED). Reachable from endpoints that embed text (write, write-batch, search, context, PUT memory).
       content:
         application/json:
           schema:

@@ -15,11 +15,12 @@ cargo test --workspace
 
 1. Fork the repo and create a feature branch
 2. Make your changes
-3. Ensure all checks pass:
+3. Ensure all checks pass (these mirror the CI gates — run them on the latest
+   stable toolchain, since CI uses `rust-toolchain@stable`):
    ```bash
+   cargo fmt --check
    cargo build --workspace
    cargo test --workspace
-   cargo fmt --check
    cargo clippy --workspace --all-features -- -D warnings
    ```
 4. Add tests for new functionality
@@ -28,8 +29,8 @@ cargo test --workspace
 
 ## Code Style
 
-- Follow `rustfmt` defaults
-- Run `cargo clippy -- -D warnings` — PRs with clippy warnings will not be merged
+- Follow `rustfmt` defaults (`cargo fmt` before committing — CI enforces it)
+- Run `cargo clippy --workspace --all-features -- -D warnings` — PRs with clippy warnings will not be merged
 - Use `tracing` for logging, not `println!`
 - Errors use `MerkurError` / `MerkurResult` from `merkur-core`
 - New endpoints: add to router, handlers, OpenAPI spec, README API table, and tests

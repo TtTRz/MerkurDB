@@ -10,6 +10,7 @@ All notable changes to MerkurDB. Format follows [Keep a Changelog](https://keepa
 - **Answer styles for the QA track** — `--answer-style baseline|aggregate|guarded`; `guarded` (aggregate facts + abstain when the question presupposes unestablished facts) is the recommended reporting style.
 - **Configurable retrieval fusion (P1-5)** — `retrieval.fusion.{rrf_k, bm25_weight, vector_weight, score_search, score_weight, score_importance}` with validation; env-overridable as `MERKUR_RETRIEVAL__FUSION__*` for sweeps. Defaults reproduce the previous fixed behavior exactly (k=60, symmetric channels, 0.5/0.2/0.3). Weighted RRF keeps normalized (0,1] score semantics under any positive channel weights.
 - **`scripts/sweep_fusion.sh`** — fusion-parameter sweeps over one persistent corpus: ingest once, restart the server per config, recall-only per config.
+- **LLM consolidator can authenticate and wait longer** — `plugins.consolidator.llm.api_key` (bearer for hosted OpenAI-compatible providers; prefer the `MERKUR_PLUGINS__CONSOLIDATOR__LLM__API_KEY` env var) and `plugins.consolidator.llm.timeout_seconds` (default 120; reasoning models on large batches need more).
 
 ### Evaluation results (reference configuration)
 

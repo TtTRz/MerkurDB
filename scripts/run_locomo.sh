@@ -70,7 +70,7 @@ if [ "${MERKUR_EVAL_CONSOLIDATOR:-}" = "llm" ]; then
       timeout_seconds: 600"
   CONSOLIDATION_KNOBS="consolidation:
   interval_seconds: 5
-  batch_size: 25
+  batch_size: 100
   adjudication_candidates: 0"
 fi
 
