@@ -36,8 +36,36 @@ impl Default for ScoreWeights {
 /// forgetting curve's business, not retrieval's),
 /// `importance` is the Consolidator's 0–1 assessment.
 pub fn composite_score(fused: f64, weight: f64, importance: f64) -> f64 {
-    let w = ScoreWeights::default();
+    composite_score_with(&ScoreWeights::default(), fused, weight, importance)
+}
+
+/// Composite score under explicit weights (P1-5: configurable via
+/// `retrieval.fusion` in server config).
+pub fn composite_score_with(w: &ScoreWeights, fused: f64, weight: f64, importance: f64) -> f64 {
     w.search * fused + w.weight * weight.clamp(0.0, 1.0) + w.importance * importance.clamp(0.0, 1.0)
+}
+
+/// Fusion tuning knobs (P1-5). Defaults reproduce the pre-P1-5 behavior
+/// exactly: symmetric channels, k=60, 0.5/0.2/0.3 composite.
+#[derive(Debug, Clone, Copy)]
+pub struct FusionParams {
+    pub rrf_k: f64,
+    /// Relative share of the BM25 channel in the fused score.
+    pub bm25_weight: f64,
+    /// Relative share of the vector channel in the fused score.
+    pub vector_weight: f64,
+    pub score: ScoreWeights,
+}
+
+impl Default for FusionParams {
+    fn default() -> Self {
+        Self {
+            rrf_k: DEFAULT_RRF_K,
+            bm25_weight: 1.0,
+            vector_weight: 1.0,
+            score: ScoreWeights::default(),
+        }
+    }
 }
 
 /// Default RRF smoothing constant. `k = 60` is the value used across the
@@ -90,19 +118,36 @@ pub fn rrf_fuse(
     k: f64,
     limit: usize,
 ) -> Vec<(String, f64)> {
+    rrf_fuse_weighted(bm25, vector, k, 1.0, 1.0, limit)
+}
+
+/// Weighted RRF: each channel contributes `weight / (k + rank + 1)`.
+/// Normalizing by the weighted theoretical maximum — top rank in both
+/// channels — keeps the (0, 1] score semantics of [`rrf_fuse`]. Zero weight
+/// disables a channel's influence (its ids score 0 but are not removed).
+#[allow(clippy::too_many_arguments)]
+pub fn rrf_fuse_weighted(
+    bm25: &[(String, f64)],
+    vector: &[(String, f64)],
+    k: f64,
+    bm25_weight: f64,
+    vector_weight: f64,
+    limit: usize,
+) -> Vec<(String, f64)> {
     let mut fused: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
-    let channels: [&[(String, f64)]; 2] = [bm25, vector];
-    for ch in channels {
-        for (rank, (id, _)) in ch.iter().enumerate() {
-            *fused.entry(id.as_str()).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
-        }
+    for (rank, (id, _)) in bm25.iter().enumerate() {
+        *fused.entry(id.as_str()).or_insert(0.0) += bm25_weight / (k + rank as f64 + 1.0);
+    }
+    for (rank, (id, _)) in vector.iter().enumerate() {
+        *fused.entry(id.as_str()).or_insert(0.0) += vector_weight / (k + rank as f64 + 1.0);
     }
 
-    if limit == 0 || fused.is_empty() {
+    let weight_sum = bm25_weight + vector_weight;
+    if limit == 0 || fused.is_empty() || weight_sum <= 0.0 {
         return Vec::new();
     }
 
-    let max = 2.0 / (k + 1.0);
+    let max = weight_sum / (k + 1.0);
     let mut out: Vec<(String, f64)> = fused
         .into_iter()
         .map(|(id, s)| (id.to_string(), s / max))
@@ -210,6 +255,7 @@ pub async fn hybrid_recall(
     namespace: &str,
     limit: usize,
     relevance_floor: f64,
+    fusion: &FusionParams,
 ) -> MerkurResult<Vec<ScoredMemory>> {
     let oversample = limit.saturating_mul(2).max(limit);
 
@@ -235,7 +281,14 @@ pub async fn hybrid_recall(
 
     let vec_ranked: Vec<(String, f64)> =
         vec_hits.iter().map(|s| (s.id.clone(), s.score)).collect();
-    let fused = rrf_fuse(&bm25, &vec_ranked, DEFAULT_RRF_K, limit);
+    let fused = rrf_fuse_weighted(
+        &bm25,
+        &vec_ranked,
+        fusion.rrf_k,
+        fusion.bm25_weight,
+        fusion.vector_weight,
+        limit,
+    );
 
     let mut by_id: std::collections::HashMap<String, ScoredMemory> = vec_hits
         .into_iter()
@@ -263,7 +316,8 @@ pub async fn hybrid_recall(
         // P1-5: the externally visible score is the composite of retrieval
         // relevance, stored weight, and Consolidator importance. RRF rank
         // alone decided *which* ids made it here; this decides their order.
-        memory.score = composite_score(fused_score, memory.weight, memory.importance);
+        memory.score =
+            composite_score_with(&fusion.score, fused_score, memory.weight, memory.importance);
         out.push(memory);
     }
     // Composite, not RRF order, defines the final ranking.
@@ -418,6 +472,61 @@ mod tests {
     #[test]
     fn fuse_both_empty_yields_empty() {
         assert!(rrf_fuse(&[], &[], K, 10).is_empty());
+    }
+
+    // ---------- rrf_fuse_weighted / FusionParams (P1-5) ----------
+
+    #[test]
+    fn weighted_fuse_with_unit_weights_matches_rrf_fuse() {
+        let bm25 = vec![("a".to_string(), 3.0), ("b".to_string(), 2.0)];
+        let vec = vec![("a".to_string(), 0.9), ("c".to_string(), 0.8)];
+        let plain = rrf_fuse(&bm25, &vec, K, 10);
+        let weighted = rrf_fuse_weighted(&bm25, &vec, K, 1.0, 1.0, 10);
+        assert_eq!(plain, weighted);
+    }
+
+    #[test]
+    fn weighted_fuse_boosts_favored_channel() {
+        // b_only ranks 1st in BM25, v_only ranks 1st in vector; symmetric
+        // weights tie them, doubling bm25's share must flip the order.
+        let bm25 = vec![("b_only".to_string(), 1.0)];
+        let vec = vec![("v_only".to_string(), 1.0)];
+        let tie = rrf_fuse_weighted(&bm25, &vec, K, 1.0, 1.0, 10);
+        assert!((tie[0].1 - tie[1].1).abs() < 1e-9);
+        let boosted = rrf_fuse_weighted(&bm25, &vec, K, 2.0, 1.0, 10);
+        assert_eq!(boosted[0].0, "b_only");
+        assert!(boosted[0].1 > boosted[1].1);
+        let flipped = rrf_fuse_weighted(&bm25, &vec, K, 1.0, 2.0, 10);
+        assert_eq!(flipped[0].0, "v_only");
+    }
+
+    #[test]
+    fn weighted_fuse_keeps_normalized_score_semantics() {
+        // Top in both channels under any positive weights still scores 1.0.
+        let bm25 = vec![("a".to_string(), 1.0)];
+        let vec = vec![("a".to_string(), 1.0)];
+        let out = rrf_fuse_weighted(&bm25, &vec, K, 3.0, 0.5, 10);
+        assert!((out[0].1 - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn composite_score_with_custom_weights() {
+        // Pure-relevance configuration: score == fused, ignoring salience.
+        let w = ScoreWeights { search: 1.0, weight: 0.0, importance: 0.0 };
+        assert!((composite_score_with(&w, 0.7, 1.0, 0.5) - 0.7).abs() < 1e-9);
+        // Default weights match the legacy function exactly.
+        assert_eq!(
+            composite_score(0.6, 0.9, 0.4),
+            composite_score_with(&ScoreWeights::default(), 0.6, 0.9, 0.4)
+        );
+    }
+
+    #[test]
+    fn fusion_params_default_matches_legacy_behavior() {
+        let p = FusionParams::default();
+        assert_eq!(p.rrf_k, DEFAULT_RRF_K);
+        assert_eq!(p.bm25_weight, 1.0);
+        assert_eq!(p.vector_weight, 1.0);
     }
 
     // ---------- composite_score ----------
@@ -693,7 +802,7 @@ mod tests {
     #[tokio::test]
     async fn hybrid_recall_skips_hits_whose_hydration_fails() {
         let storage = StubStorage::new(vec![("b1".to_string(), 1.0)], true);
-        let out = hybrid_recall(&storage, &[1.0], "some query", "default", 10, 0.0)
+        let out = hybrid_recall(&storage, &[1.0], "some query", "default", 10, 0.0, &FusionParams::default())
             .await
             .expect("a hydration failure must degrade, not fail the recall");
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
@@ -711,7 +820,7 @@ mod tests {
             vec![("v1".to_string(), 2.0), ("b1".to_string(), 1.0)],
             false,
         );
-        let out = hybrid_recall(&storage, &[1.0], "some query", "default", 10, 0.6)
+        let out = hybrid_recall(&storage, &[1.0], "some query", "default", 10, 0.6, &FusionParams::default())
             .await
             .unwrap();
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();

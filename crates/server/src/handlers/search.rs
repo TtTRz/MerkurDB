@@ -97,6 +97,7 @@ pub async fn search(
                 &ns.0,
                 pool,
                 threshold,
+                &state.config.fusion_params(),
             )
             .await?
         }

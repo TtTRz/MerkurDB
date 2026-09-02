@@ -151,6 +151,19 @@ pub struct RetrievalConfig {
     pub score_threshold: Option<f64>,
     pub default_depth: Option<usize>,
     pub default_degree_limit: Option<usize>,
+    pub fusion: Option<FusionConfig>,
+}
+
+/// Hybrid-retrieval fusion tuning (P1-5). Every field is optional and falls
+/// back to the pre-P1-5 behavior (symmetric channels, k=60, 0.5/0.2/0.3).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FusionConfig {
+    pub rrf_k: Option<f64>,
+    pub bm25_weight: Option<f64>,
+    pub vector_weight: Option<f64>,
+    pub score_search: Option<f64>,
+    pub score_weight: Option<f64>,
+    pub score_importance: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -458,6 +471,35 @@ impl Config {
                 "consolidation.adjudication_floor must be in [0, 1]".into(),
             ));
         }
+        if let Some(f) = &self.retrieval.fusion {
+            if let Some(k) = f.rrf_k
+                && k <= 0.0
+            {
+                return Err(MerkurError::Config(
+                    "retrieval.fusion.rrf_k must be > 0".into(),
+                ));
+            }
+            let bw = f.bm25_weight.unwrap_or(1.0);
+            let vw = f.vector_weight.unwrap_or(1.0);
+            if bw < 0.0 || vw < 0.0 || (bw == 0.0 && vw == 0.0) {
+                return Err(MerkurError::Config(
+                    "retrieval.fusion channel weights must be >= 0 and not both zero".into(),
+                ));
+            }
+            for (name, v) in [
+                ("score_search", f.score_search),
+                ("score_weight", f.score_weight),
+                ("score_importance", f.score_importance),
+            ] {
+                if let Some(v) = v
+                    && v < 0.0
+                {
+                    return Err(MerkurError::Config(format!(
+                        "retrieval.fusion.{name} must be >= 0"
+                    )));
+                }
+            }
+        }
         if self.forgetting.threshold_upgrade <= self.forgetting.threshold_to_l1 {
             return Err(MerkurError::Config(format!(
                 "forgetting.threshold_upgrade ({}) must exceed threshold_to_l1 ({}) — otherwise memories oscillate across the boundary on every tick",
@@ -531,6 +573,19 @@ auth:
     pub fn default_degree_limit(&self) -> usize {
         self.retrieval.default_degree_limit.unwrap_or(10)
     }
+
+    pub fn fusion_params(&self) -> merkur_core::FusionParams {
+        let mut p = merkur_core::FusionParams::default();
+        if let Some(f) = &self.retrieval.fusion {
+            p.rrf_k = f.rrf_k.unwrap_or(p.rrf_k);
+            p.bm25_weight = f.bm25_weight.unwrap_or(p.bm25_weight);
+            p.vector_weight = f.vector_weight.unwrap_or(p.vector_weight);
+            p.score.search = f.score_search.unwrap_or(p.score.search);
+            p.score.weight = f.score_weight.unwrap_or(p.score.weight);
+            p.score.importance = f.score_importance.unwrap_or(p.score.importance);
+        }
+        p
+    }
 }
 
 #[cfg(test)]
@@ -540,6 +595,61 @@ mod tests {
     #[test]
     fn test_config_validates() {
         assert!(Config::test_config().validate().is_ok());
+    }
+
+    // ── retrieval.fusion (P1-5) ──
+
+    #[test]
+    fn fusion_params_default_to_legacy_behavior() {
+        let p = Config::test_config().fusion_params();
+        assert_eq!(p.rrf_k, 60.0);
+        assert_eq!(p.bm25_weight, 1.0);
+        assert_eq!(p.vector_weight, 1.0);
+        assert_eq!(p.score.search, 0.5);
+        assert_eq!(p.score.weight, 0.2);
+        assert_eq!(p.score.importance, 0.3);
+    }
+
+    #[test]
+    fn fusion_params_pick_up_config_overrides() {
+        let mut cfg = Config::test_config();
+        cfg.retrieval.fusion = Some(FusionConfig {
+            rrf_k: Some(20.0),
+            bm25_weight: Some(1.5),
+            vector_weight: None,
+            score_search: Some(0.8),
+            score_weight: Some(0.1),
+            score_importance: Some(0.1),
+        });
+        let p = cfg.fusion_params();
+        assert_eq!(p.rrf_k, 20.0);
+        assert_eq!(p.bm25_weight, 1.5);
+        assert_eq!(p.vector_weight, 1.0); // untouched field falls back
+        assert_eq!(p.score.search, 0.8);
+    }
+
+    #[test]
+    fn fusion_validation_rejects_degenerate_configs() {
+        let mut cfg = Config::test_config();
+        cfg.retrieval.fusion = Some(FusionConfig {
+            rrf_k: Some(0.0), ..Default::default()
+        });
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::test_config();
+        cfg.retrieval.fusion = Some(FusionConfig {
+            bm25_weight: Some(0.0),
+            vector_weight: Some(0.0),
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::test_config();
+        cfg.retrieval.fusion = Some(FusionConfig {
+            score_search: Some(-0.1),
+            ..Default::default()
+        });
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

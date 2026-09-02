@@ -54,6 +54,7 @@ pub async fn assemble_context(
         &ns.0,
         recall,
         0.0,
+        &state.config.fusion_params(),
     )
     .await?;
 
