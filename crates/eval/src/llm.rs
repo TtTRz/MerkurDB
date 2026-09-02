@@ -55,14 +55,53 @@ pub fn parse_verdict(raw: &str) -> Option<Verdict> {
 
 // ── Prompts ──
 
+/// Answer-prompt style. `Baseline` is the smoke/baseline-validated wording;
+/// `Aggregate` targets the category-1 failure mode found in the full run:
+/// enumeration questions need facts combined across memories, and partial
+/// information must be surfaced instead of abstained away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum AnswerStyle {
+    #[default]
+    Baseline,
+    Aggregate,
+    /// Aggregate + premise guard: at top-30 depth every adversarial question
+    /// has *related* memories, so "no memory is relevant" never fires; the
+    /// guard keys abstention on the question's presupposition instead.
+    Guarded,
+}
+
 /// Answer a LoCoMo question from retrieved memory contents (already carrying
 /// their `[date] speaker:` prefixes). Abstention is explicitly allowed —
 /// category-5 questions are unanswerable by construction.
 pub fn build_answer_prompt(question: &str, memories: &[String]) -> (String, String) {
-    let system = "You are a question-answering assistant. Answer using ONLY the provided \
+    build_answer_prompt_styled(question, memories, AnswerStyle::Baseline)
+}
+
+pub fn build_answer_prompt_styled(
+    question: &str,
+    memories: &[String],
+    style: AnswerStyle,
+) -> (String, String) {
+    let system = match style {
+        AnswerStyle::Baseline => "You are a question-answering assistant. Answer using ONLY the provided \
         conversation memories. If the memories do not contain the answer, say you don't know \
         instead of guessing."
-        .to_string();
+            .to_string(),
+        AnswerStyle::Aggregate => "You are a question-answering assistant. Answer using ONLY the provided \
+        conversation memories. Combine all relevant facts across the memories into one complete \
+        answer — when the question asks about activities, preferences, places, or people, list \
+        every item mentioned. If the memories contain partial information, answer with what is \
+        stated. Say you don't know ONLY when no memory mentions anything relevant."
+            .to_string(),
+        AnswerStyle::Guarded => "You are a question-answering assistant. Answer using ONLY the provided \
+        conversation memories. Combine all relevant facts across the memories into one complete \
+        answer — when the question asks about activities, preferences, places, or people, list \
+        every item mentioned. If the memories contain partial information, answer with what is \
+        stated. However: if the question presupposes a fact or event that the memories do not \
+        establish, say you don't know — related topics appearing in the memories do NOT count \
+        as establishing it."
+            .to_string(),
+    };
     let mut user = String::from("Memories:\n");
     for m in memories {
         user.push_str("- ");
@@ -244,7 +283,47 @@ mod tests {
         assert_eq!(parse_verdict(""), None);
     }
 
-    // ── answer prompt ──
+    // ── answer prompt styles ──
+
+    #[test]
+    fn baseline_style_is_byte_identical_to_legacy_prompt() {
+        let memories = vec!["[8 May, 2023] Caroline: hello".to_string()];
+        assert_eq!(
+            build_answer_prompt_styled("Q?", &memories, AnswerStyle::Baseline),
+            build_answer_prompt("Q?", &memories)
+        );
+    }
+
+    #[test]
+    fn aggregate_style_demands_combining_and_discourages_false_abstention() {
+        let memories = vec!["[8 May, 2023] Caroline: I do pottery.".to_string()];
+        let (system, user) =
+            build_answer_prompt_styled("What activities?", &memories, AnswerStyle::Aggregate);
+        // Aggregation instruction: combine facts across memories, lists ok.
+        assert!(system.contains("combine") || system.contains("all relevant facts"));
+        // Partial info must be surfaced, not abstained away.
+        assert!(system.contains("partial"));
+        // Abstention still allowed when nothing is relevant (cat-5 safety).
+        assert!(system.contains("don't know") || system.contains("do not know"));
+        // Question and memories still grounded in the user message.
+        assert!(user.contains("What activities?"));
+        assert!(user.contains("I do pottery."));
+    }
+
+    #[test]
+    fn guarded_style_combines_aggregation_with_premise_check() {
+        let memories = vec!["[8 May, 2023] Caroline: I do pottery.".to_string()];
+        let (system, _user) =
+            build_answer_prompt_styled("What camera?", &memories, AnswerStyle::Guarded);
+        // Keeps the aggregation instruction...
+        assert!(system.contains("combine") || system.contains("all relevant facts"));
+        // ...but adds the premise guard the Aggregate style lacked: at top-30
+        // depth every adversarial question has *related* memories, so
+        // "nothing relevant" never triggers. The guard keys on the question's
+        // presupposition instead.
+        assert!(system.contains("presupposes") || system.contains("assumes"));
+        assert!(system.contains("don't know") || system.contains("do not know"));
+    }
 
     #[test]
     fn answer_prompt_grounds_in_memories_and_allows_abstention() {

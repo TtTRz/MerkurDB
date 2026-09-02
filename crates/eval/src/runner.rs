@@ -8,7 +8,9 @@
 //! map hits back to LoCoMo evidence without N+1 lookups.
 
 use crate::dataset::Conversation;
-use crate::llm::{ChatModel, Verdict, build_answer_prompt, build_judge_prompt, parse_verdict};
+use crate::llm::{
+    AnswerStyle, ChatModel, Verdict, build_answer_prompt_styled, build_judge_prompt, parse_verdict,
+};
 use crate::recall::RecallQuestion;
 use futures::StreamExt as _;
 use merkur_client::{ClientError, HttpMerkurClient, MerkurClient, SearchParams};
@@ -272,6 +274,7 @@ pub async fn qa_conversation(
     conv: &Conversation,
     limit: usize,
     mode: &str,
+    style: AnswerStyle,
 ) -> RunResult<QaRun> {
     let params = ungated_params(limit, mode);
     let mut run = QaRun::default();
@@ -297,7 +300,7 @@ pub async fn qa_conversation(
                 run.errors
             );
         }
-        match qa_one(client, chat, &params, qa).await {
+        match qa_one(client, chat, &params, qa, style).await {
             Ok(Some(record)) => run.records.push(record),
             Ok(None) => run.skipped_no_golden += 1,
             Err(_) => run.errors += 1,
@@ -313,13 +316,14 @@ async fn qa_one(
     chat: &dyn ChatModel,
     params: &SearchParams,
     qa: &crate::dataset::Qa,
+    style: AnswerStyle,
 ) -> RunResult<Option<QaRecord>> {
     let Some(golden) = qa.golden_answer() else {
         return Ok(None);
     };
     let resp = search_with_retry(client, &qa.question, params).await?;
     let memories: Vec<String> = resp.results.iter().map(|m| m.content.clone()).collect();
-    let (sys, user) = build_answer_prompt(&qa.question, &memories);
+    let (sys, user) = build_answer_prompt_styled(&qa.question, &memories, style);
     let prediction = chat.chat(&sys, &user).await?;
     let (jsys, juser) =
         build_judge_prompt(&qa.question, &golden, &prediction, qa.is_adversarial());
@@ -344,6 +348,7 @@ pub async fn qa_conversation_concurrent(
     limit: usize,
     mode: &str,
     concurrency: usize,
+    style: AnswerStyle,
 ) -> RunResult<QaRun> {
     let params = ungated_params(limit, mode);
     let total = conv.qa.len();
@@ -353,7 +358,7 @@ pub async fn qa_conversation_concurrent(
             let progress = progress.clone();
             let params = &params; // capture a Copy reference, not the owned value
             async move {
-                let r = qa_one(client, chat, params, qa).await;
+                let r = qa_one(client, chat, params, qa, style).await;
                 let mut p = progress.lock().unwrap();
                 p.0 += 1; // done
                 match &r {
@@ -384,6 +389,162 @@ pub async fn qa_conversation_concurrent(
             Ok(None) => run.skipped_no_golden += 1,
             Err(_) => run.errors += 1,
         }
+    }
+    Ok(run)
+}
+
+// ── personamem ──
+
+#[derive(Debug, serde::Serialize)]
+pub struct PmRecord {
+    pub question_id: String,
+    pub question_type: String,
+    pub correct: bool,
+    pub chosen: Option<char>,
+    pub correct_letter: char,
+    pub question: String,
+    pub prediction_raw: String,
+}
+
+#[derive(Debug, Default)]
+pub struct PmRun {
+    pub records: Vec<PmRecord>,
+    /// Questions lost to search/chat failures after retries.
+    pub errors: usize,
+    pub turns_written: usize,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PmReport {
+    pub questions: usize,
+    pub correct: usize,
+    pub parse_failures: usize,
+    pub per_type: Vec<PmTypeStat>,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PmTypeStat {
+    pub question_type: String,
+    pub questions: usize,
+    pub correct: usize,
+}
+
+impl PmReport {
+    pub fn accuracy(&self) -> f64 {
+        if self.questions == 0 {
+            0.0
+        } else {
+            self.correct as f64 / self.questions as f64
+        }
+    }
+}
+
+pub fn score_pm(records: &[PmRecord]) -> PmReport {
+    let mut report = PmReport::default();
+    let mut types: BTreeMap<String, PmTypeStat> = BTreeMap::new();
+    for r in records {
+        report.questions += 1;
+        report.correct += r.correct as usize;
+        report.parse_failures += r.chosen.is_none() as usize;
+        let stat = types
+            .entry(r.question_type.clone())
+            .or_insert_with(|| PmTypeStat {
+                question_type: r.question_type.clone(),
+                ..Default::default()
+            });
+        stat.questions += 1;
+        stat.correct += r.correct as usize;
+    }
+    report.per_type = types.into_values().collect();
+    report
+}
+
+/// Replay one shared context in-situ: walk checkpoints (unique `end_index`es)
+/// in ascending order, ingesting only the newly visible user/assistant
+/// messages, then answer that checkpoint's questions against the accumulated
+/// memories — no future leakage, minimal writes.
+pub async fn pm_run_context(
+    client: &HttpMerkurClient,
+    chat: &dyn ChatModel,
+    ctx: &crate::personamem::PmContext,
+    questions: &[&crate::personamem::PmQuestion],
+    limit: usize,
+    mode: &str,
+    jobs: usize,
+) -> RunResult<PmRun> {
+    use crate::personamem::{build_mc_prompt, parse_choice};
+
+    let mut run = PmRun::default();
+    let params = ungated_params(limit, mode);
+
+    // Ascending unique checkpoints.
+    let mut ends: Vec<usize> = questions.iter().map(|q| q.end_index).collect();
+    ends.sort_unstable();
+    ends.dedup();
+
+    let mut prev: Option<usize> = None;
+    for end in ends {
+        // Ingest messages (prev, end], skipping system boilerplate; content
+        // carries the true message index for traceability.
+        let start = prev.map(|p| p + 1).unwrap_or(0);
+        let mut items: Vec<WriteItem> = Vec::new();
+        for (i, m) in ctx.messages.iter().enumerate().take(end + 1).skip(start) {
+            if m.role == "system" {
+                continue;
+            }
+            items.push(WriteItem {
+                content: format!("[#{i}] {}: {}", m.role, m.content),
+                context: Some(HashMap::from([
+                    ("msg_index".to_string(), i.to_string()),
+                    ("role".to_string(), m.role.clone()),
+                ])),
+                metadata: None,
+            });
+        }
+        for chunk in items.chunks(100) {
+            let resp = client.write_batch(chunk).await?;
+            run.turns_written += resp.count;
+        }
+        prev = Some(end);
+
+        // Answer this checkpoint's questions concurrently.
+        let checkpoint_qs: Vec<&crate::personamem::PmQuestion> =
+            questions.iter().copied().filter(|q| q.end_index == end).collect();
+        let n_checkpoint = checkpoint_qs.len();
+        let results: Vec<RunResult<PmRecord>> = futures::stream::iter(checkpoint_qs)
+            .map(|q| {
+                let params = &params;
+                async move {
+                    let resp = search_with_retry(client, &q.question, params).await?;
+                    let memories: Vec<String> =
+                        resp.results.iter().map(|m| m.content.clone()).collect();
+                    let (sys, user) = build_mc_prompt(&q.question, &q.options, &memories);
+                    let raw = chat.chat(&sys, &user).await?;
+                    let chosen = parse_choice(&raw, q.options.len());
+                    Ok(PmRecord {
+                        question_id: q.question_id.clone(),
+                        question_type: q.question_type.clone(),
+                        correct: chosen == Some(q.correct_letter),
+                        chosen,
+                        correct_letter: q.correct_letter,
+                        question: q.question.clone(),
+                        prediction_raw: raw,
+                    })
+                }
+            })
+            .buffer_unordered(jobs.max(1))
+            .collect()
+            .await;
+        for r in results {
+            match r {
+                Ok(rec) => run.records.push(rec),
+                Err(_) => run.errors += 1,
+            }
+        }
+        eprintln!(
+            "[pm] {} checkpoint end={} (answered {}, errors: {})",
+            ctx.id, end, n_checkpoint, run.errors
+        );
     }
     Ok(run)
 }
@@ -671,7 +832,7 @@ mod tests {
         let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
         // First chat call = answer generation, second = judge verdict.
         let chat = MockChat::new(vec!["Caroline".into(), "correct".into(), "I refuse".into(), "correct".into()]);
-        let run = qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid").await.unwrap();
+        let run = qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid", AnswerStyle::Baseline).await.unwrap();
 
         assert_eq!(run.skipped_no_golden, 0);
         assert_eq!(run.errors, 0);
@@ -693,7 +854,7 @@ mod tests {
         let base = spawn_stub(state.clone()).await;
         let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
         let chat = MockChat::new(vec![]);
-        let run = qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid").await.unwrap();
+        let run = qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid", AnswerStyle::Baseline).await.unwrap();
 
         assert_eq!(run.records.len(), 0);
         assert_eq!(run.errors, 2);
@@ -708,7 +869,7 @@ mod tests {
         // Only enough mock responses for the first question (answer + judge);
         // the second question's answer call runs dry -> error, not panic.
         let chat = MockChat::new(vec!["Caroline".into(), "correct".into()]);
-        let run = qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid").await.unwrap();
+        let run = qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid", AnswerStyle::Baseline).await.unwrap();
 
         assert_eq!(run.records.len(), 1);
         assert_eq!(run.errors, 1);
@@ -745,7 +906,7 @@ mod tests {
         let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
         let chat = MockChat::with_handler(handler_chat);
         let run =
-            qa_conversation_concurrent(&client, &chat, &conv_with_ungolden_qa(), 10, "hybrid", 3)
+            qa_conversation_concurrent(&client, &chat, &conv_with_ungolden_qa(), 10, "hybrid", 3, AnswerStyle::Baseline)
                 .await
                 .unwrap();
 
@@ -769,5 +930,113 @@ mod tests {
         assert_eq!(run.questions.len(), 2);
         assert_eq!(run.errors, 0);
         assert!(run.questions.iter().all(|q| q.retrieved.len() == 2));
+    }
+
+    #[tokio::test]
+    async fn qa_aggregate_style_reaches_answer_prompt() {
+        let state = Arc::new(Mutex::new(StubState::default()));
+        let base = spawn_stub(state.clone()).await;
+        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
+        let chat = MockChat::new(vec!["ans".into(), "correct".into(), "ans".into(), "correct".into()]);
+        qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid", AnswerStyle::Aggregate)
+            .await
+            .unwrap();
+        let seen = chat.seen();
+        // First call is the answer generation; its system prompt must carry
+        // the aggregation instructions.
+        assert!(seen[0].0.contains("Combine all relevant facts"));
+        // Judge prompt is unaffected by answer style.
+        assert!(seen[1].0.contains("strict grading"));
+    }
+
+    // ── personamem in-situ replay ──
+
+    fn pm_fixture() -> (crate::personamem::PmContext, Vec<crate::personamem::PmQuestion>) {
+        use crate::personamem::{PmContext, PmMessage, PmQuestion};
+        let ctx = PmContext {
+            id: "ctxA".into(),
+            messages: vec![
+                PmMessage { role: "system".into(), content: "scenario boilerplate".into() },
+                PmMessage { role: "user".into(), content: "I love jazz".into() },
+                PmMessage { role: "assistant".into(), content: "noted".into() },
+                PmMessage { role: "user".into(), content: "now I prefer ambient".into() },
+            ],
+        };
+        let q = |id: &str, end: usize, correct: char| PmQuestion {
+            question_id: id.into(),
+            persona_id: "0".into(),
+            question_type: "recall_user_shared_facts".into(),
+            topic: "music".into(),
+            question: format!("question {id}"),
+            correct_letter: correct,
+            options: vec!["(a) x".into(), "(b) y".into(), "(c) z".into(), "(d) w".into()],
+            context_id: "ctxA".into(),
+            end_index: end,
+        };
+        (ctx, vec![q("q1", 2, 'b'), q("q2", 3, 'c')])
+    }
+
+    fn pm_handler(_system: &str, _user: &str) -> String {
+        // Always "(b)": q1 (end=2, correct=b) scores right, q2 (end=3,
+        // correct=c) scores wrong.
+        "(b)".into()
+    }
+
+    #[tokio::test]
+    async fn pm_replays_checkpoints_incrementally_and_scores_choices() {
+        let state = Arc::new(Mutex::new(StubState::default()));
+        let base = spawn_stub(state.clone()).await;
+        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("pm-ctxA");
+        let (ctx, qs) = pm_fixture();
+        let refs: Vec<&crate::personamem::PmQuestion> = qs.iter().collect();
+        let chat = MockChat::with_handler(pm_handler);
+        let run = pm_run_context(&client, &chat, &ctx, &refs, 10, "hybrid", 2).await.unwrap();
+
+        assert_eq!(run.records.len(), 2);
+        assert_eq!(run.errors, 0);
+        // Checkpoint 1 (end=2): 2 non-system messages; checkpoint 2 adds 1.
+        let locked = state.lock().unwrap();
+        let batches = &locked.write_batches;
+        assert_eq!(batches.len(), 2);
+        let b0 = batches[0].1["items"].as_array().unwrap();
+        assert_eq!(b0.len(), 2);
+        assert_eq!(b0[0]["content"], "[#1] user: I love jazz");
+        assert_eq!(b0[1]["content"], "[#2] assistant: noted");
+        let b1 = batches[1].1["items"].as_array().unwrap();
+        assert_eq!(b1.len(), 1);
+        assert_eq!(b1[0]["content"], "[#3] user: now I prefer ambient");
+        // One search per question.
+        assert_eq!(locked.search_queries.len(), 2);
+        drop(locked);
+
+        assert!(run.records[0].correct);
+        assert!(!run.records[1].correct);
+        assert_eq!(run.records[1].chosen, Some('b'));
+
+        let report = score_pm(&run.records);
+        assert_eq!(report.questions, 2);
+        assert_eq!(report.correct, 1);
+        assert_eq!(report.parse_failures, 0);
+        assert!((report.accuracy() - 0.5).abs() < 1e-9);
+        let t = report.per_type.iter().find(|t| t.question_type == "recall_user_shared_facts").unwrap();
+        assert_eq!(t.questions, 2);
+        assert_eq!(t.correct, 1);
+    }
+
+    #[test]
+    fn score_pm_counts_unparseable_choice_as_wrong_but_separate() {
+        let rec = |chosen| PmRecord {
+            question_id: "q".into(),
+            question_type: "t".into(),
+            correct: chosen == Some('b'),
+            chosen,
+            correct_letter: 'b',
+            question: "q".into(),
+            prediction_raw: "raw".into(),
+        };
+        let report = score_pm(&[rec(Some('b')), rec(Some('a')), rec(None)]);
+        assert_eq!(report.questions, 3);
+        assert_eq!(report.correct, 1);
+        assert_eq!(report.parse_failures, 1);
     }
 }

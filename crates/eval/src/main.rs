@@ -12,13 +12,14 @@
 //!   MERKUR_EVAL_CHAT_BASE_URL=... MERKUR_EVAL_CHAT_MODEL=... merkur-eval qa
 
 use clap::{Parser, Subcommand};
+use futures::StreamExt as _;
 use merkur_client::HttpMerkurClient;
 use merkur_eval::dataset::Dataset;
-use merkur_eval::llm::OpenAiChat;
+use merkur_eval::llm::{AnswerStyle, OpenAiChat};
 use merkur_eval::recall::{RecallQuestion, score_recall};
 use merkur_eval::runner::{
-    QaRecord, ingest_conversation, qa_conversation, qa_conversation_concurrent,
-    recall_conversation, recall_conversation_concurrent, score_qa,
+    QaRecord, ingest_conversation, pm_run_context, qa_conversation, qa_conversation_concurrent,
+    recall_conversation, recall_conversation_concurrent, score_pm, score_qa,
 };
 use std::path::PathBuf;
 
@@ -70,6 +71,33 @@ enum Command {
         #[arg(long)]
         dump: Option<PathBuf>,
     },
+    /// PersonaMem (multiple-choice, no judge): replay shared contexts in-situ
+    /// and answer checkpoint questions against accumulated memories.
+    PmRun {
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value = "hybrid")]
+        mode: String,
+        /// Questions in flight within each checkpoint.
+        #[arg(long, default_value_t = 8)]
+        jobs: usize,
+        /// Restrict to one shared_context_id (prefix match).
+        #[arg(long)]
+        context: Option<String>,
+        /// Contexts replayed concurrently (namespaces are isolated).
+        #[arg(long, default_value_t = 4)]
+        context_jobs: usize,
+        #[arg(long, env = "MERKUR_EVAL_CHAT_BASE_URL")]
+        chat_base_url: String,
+        #[arg(long, env = "MERKUR_EVAL_CHAT_API_KEY")]
+        chat_api_key: Option<String>,
+        #[arg(long, env = "MERKUR_EVAL_CHAT_MODEL")]
+        chat_model: String,
+        #[arg(long)]
+        json: Option<PathBuf>,
+        #[arg(long)]
+        dump: Option<PathBuf>,
+    },
     /// End-to-end QA: retrieve, answer, judge. Needs a chat endpoint.
     Qa {
         #[arg(long, default_value_t = 10)]
@@ -79,6 +107,10 @@ enum Command {
         /// Questions in flight; 1 = serial (baseline-comparable).
         #[arg(long, default_value_t = 1)]
         jobs: usize,
+        /// Answer-prompt style (baseline = as benchmarked; aggregate =
+        /// combine facts across memories, fewer false abstentions).
+        #[arg(long, value_enum, default_value = "baseline")]
+        answer_style: AnswerStyle,
         #[arg(long, env = "MERKUR_EVAL_CHAT_BASE_URL")]
         chat_base_url: String,
         #[arg(long, env = "MERKUR_EVAL_CHAT_API_KEY")]
@@ -223,6 +255,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             limit,
             mode,
             jobs,
+            answer_style,
             chat_base_url,
             chat_api_key,
             chat_model,
@@ -238,9 +271,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for conv in selected(&ds, &cli.conv) {
                 let namespaced = client.clone().with_namespace(&conv.sample_id);
                 let run = if *jobs > 1 {
-                    qa_conversation_concurrent(&namespaced, &chat, conv, *limit, mode, *jobs).await?
+                    qa_conversation_concurrent(&namespaced, &chat, conv, *limit, mode, *jobs, *answer_style).await?
                 } else {
-                    qa_conversation(&namespaced, &chat, conv, *limit, mode).await?
+                    qa_conversation(&namespaced, &chat, conv, *limit, mode, *answer_style).await?
                 };
                 println!(
                     "{}: {} judged, {} skipped, {} errors",
@@ -275,6 +308,116 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("judge parse failures: {}", report.parse_failures);
             println!("skipped (no golden): {skipped}");
             println!("errors (retried out): {errors}");
+            if let Some(path) = json {
+                std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+            }
+            if let Some(path) = dump {
+                write_jsonl(path, &records)?;
+            }
+        }
+
+        Command::PmRun {
+            limit,
+            mode,
+            jobs,
+            context,
+            context_jobs,
+            chat_base_url,
+            chat_api_key,
+            chat_model,
+            json,
+            dump,
+        } => {
+            // PersonaMem files sit next to locomo10.json in the data dir.
+            let dir = cli.data.parent().unwrap_or(std::path::Path::new("."));
+            let questions_csv = std::fs::read_to_string(dir.join("questions_32k.csv"))?;
+            let contexts_jsonl = std::fs::read_to_string(dir.join("shared_contexts_32k.jsonl"))?;
+            let questions = merkur_eval::personamem::parse_questions_csv(&questions_csv)?;
+            let contexts = merkur_eval::personamem::parse_contexts_jsonl(&contexts_jsonl)?;
+
+            // Group questions by shared context, preserving checkpoint replay.
+            let mut by_context: std::collections::BTreeMap<String, Vec<&merkur_eval::personamem::PmQuestion>> =
+                Default::default();
+            for q in &questions {
+                by_context.entry(q.context_id.clone()).or_default().push(q);
+            }
+
+            let client = base_client(&cli)?;
+            let chat = std::sync::Arc::new(OpenAiChat::new(chat_base_url, chat_api_key.clone(), chat_model));
+            // Contexts are namespace-isolated, so replay them concurrently;
+            // per-checkpoint answer fan-out stays at `jobs`.
+            let ctx_units: Vec<_> = by_context
+                .iter()
+                .filter(|(ctx_id, _)| {
+                    context.as_ref().is_none_or(|f| ctx_id.starts_with(f.as_str()))
+                })
+                .collect();
+            let runs: Vec<_> = futures::stream::iter(ctx_units)
+                .map(|(ctx_id, qs)| {
+                    let client = client.clone();
+                    let chat = chat.clone();
+                    let contexts = &contexts; // capture a Copy reference
+                    async move {
+                        let Some(ctx) = contexts.get(ctx_id) else {
+                            eprintln!("[pm] context {ctx_id} missing from contexts file, skipped");
+                            return None;
+                        };
+                        let ns = format!("pm-{}", &ctx_id[..16.min(ctx_id.len())]);
+                        let namespaced = client.with_namespace(&ns);
+                        match pm_run_context(&namespaced, chat.as_ref(), ctx, qs, *limit, mode, *jobs)
+                            .await
+                        {
+                            Ok(run) => {
+                                println!(
+                                    "{}: {} answered, {} errors ({} turns)",
+                                    &ctx_id[..8.min(ctx_id.len())],
+                                    run.records.len(),
+                                    run.errors,
+                                    run.turns_written
+                                );
+                                Some(run)
+                            }
+                            Err(e) => {
+                                eprintln!("[pm] context {} failed: {e}", &ctx_id[..8.min(ctx_id.len())]);
+                                None
+                            }
+                        }
+                    }
+                })
+                .buffer_unordered((*context_jobs).max(1))
+                .collect()
+                .await;
+            let context_failures = runs.iter().filter(|r| r.is_none()).count();
+            let mut records = Vec::new();
+            let mut errors = 0;
+            let mut turns = 0;
+            for run in runs.into_iter().flatten() {
+                errors += run.errors;
+                turns += run.turns_written;
+                records.extend(run.records);
+            }
+            if context_failures > 0 {
+                println!("context failures: {context_failures}");
+            }
+            let report = score_pm(&records);
+            println!("\npersonamem accuracy (model={chat_model})");
+            println!("{:<40} {:>9} {:>7} {:>9}", "question_type", "questions", "correct", "accuracy");
+            for t in &report.per_type {
+                println!(
+                    "{:<40} {:>9} {:>7} {:>9.3}",
+                    t.question_type,
+                    t.questions,
+                    t.correct,
+                    t.correct as f64 / t.questions.max(1) as f64
+                );
+            }
+            println!(
+                "{:<40} {:>9} {:>7} {:>9.3}",
+                "overall", report.questions, report.correct, report.accuracy()
+            );
+            println!("unparseable choices: {}", report.parse_failures);
+            println!("errors (retried out): {errors}");
+            println!("turns written: {turns}");
             if let Some(path) = json {
                 std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
             }

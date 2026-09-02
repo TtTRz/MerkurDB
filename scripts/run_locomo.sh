@@ -21,6 +21,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIMIT="${MERKUR_EVAL_LIMIT:-10}"
 JOBS="${MERKUR_EVAL_JOBS:-8}"
+ANSWER_STYLE="${MERKUR_EVAL_ANSWER_STYLE:-baseline}"
 PORT="${MERKUR_EVAL_PORT:-19390}"
 SERVER_BIN="$ROOT/target/release/merkur-server"
 EVAL_BIN="$ROOT/target/release/merkur-eval"
@@ -100,8 +101,8 @@ echo "== recall@$LIMIT (jobs=$JOBS)"
 "$EVAL_BIN" recall --limit "$LIMIT" --jobs "$JOBS" ${CONV_ARG[@]+"${CONV_ARG[@]}"} --json "$WORK/recall.json" --dump "$WORK/recall.jsonl"
 
 if [ -n "${MERKUR_EVAL_CHAT_BASE_URL:-}" ]; then
-  echo "== qa@$LIMIT (judge: ${MERKUR_EVAL_CHAT_MODEL:-?}, jobs=$JOBS)"
-  "$EVAL_BIN" qa --limit "$LIMIT" --jobs "$JOBS" ${CONV_ARG[@]+"${CONV_ARG[@]}"} --json "$WORK/qa.json" --dump "$WORK/qa.jsonl"
+  echo "== qa@$LIMIT (judge: ${MERKUR_EVAL_CHAT_MODEL:-?}, jobs=$JOBS, style=$ANSWER_STYLE)"
+  "$EVAL_BIN" qa --limit "$LIMIT" --jobs "$JOBS" --answer-style "$ANSWER_STYLE" ${CONV_ARG[@]+"${CONV_ARG[@]}"} --json "$WORK/qa.json" --dump "$WORK/qa.jsonl"
 else
   echo "== qa skipped (MERKUR_EVAL_CHAT_* not set)"
 fi

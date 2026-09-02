@@ -3625,6 +3625,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "csv",
  "futures",
  "merkur-client",
  "merkur-core",
