@@ -367,11 +367,7 @@ impl Storage for LanceDbStorage {
         Ok(id)
     }
 
-    async fn insert_memory_dedup(
-        &self,
-        mem: &NewMemory,
-        threshold: f64,
-    ) -> MerkurResult<String> {
+    async fn insert_memory_dedup(&self, mem: &NewMemory, threshold: f64) -> MerkurResult<String> {
         if let Some(embedding) = mem.embedding.as_deref() {
             // Best-effort governance probe: a probe failure must not fail the
             // write — fall back to a plain insert.
@@ -490,10 +486,8 @@ impl Storage for LanceDbStorage {
         let expr = escape_fts_query(query);
         let namespace = namespace.to_string();
         let pool = self.sqlite_pool.clone();
-        run_blocking(move || {
-            sqlite_helpers::text_search_bm25(&pool, &expr, &namespace, limit)
-        })
-        .await
+        run_blocking(move || sqlite_helpers::text_search_bm25(&pool, &expr, &namespace, limit))
+            .await
     }
 
     async fn vector_search_ns(
@@ -561,7 +555,17 @@ impl Storage for LanceDbStorage {
         let mut out: Vec<ScoredMemory> = memories
             .into_iter()
             .map(
-                |(id, content, abstract_, category, weight, level_i32, created_at, namespace, importance)| {
+                |(
+                    id,
+                    content,
+                    abstract_,
+                    category,
+                    weight,
+                    level_i32,
+                    created_at,
+                    namespace,
+                    importance,
+                )| {
                     let level = MemoryLevel::from_i32(level_i32);
                     let score = id_score.get(&id).copied().unwrap_or(0.0);
                     let context = ctx_map.get(&id).cloned().unwrap_or_default();
@@ -597,10 +601,7 @@ impl Storage for LanceDbStorage {
         run_blocking(move || sqlite_helpers::update_access(&pool, &ids)).await
     }
 
-    async fn get_embeddings(
-        &self,
-        ids: &[String],
-    ) -> MerkurResult<HashMap<String, Vec<f32>>> {
+    async fn get_embeddings(&self, ids: &[String]) -> MerkurResult<HashMap<String, Vec<f32>>> {
         let pool = self.sqlite_pool.clone();
         let ids = ids.to_vec();
         run_blocking(move || sqlite_helpers::get_embeddings_batch(&pool, &ids)).await
@@ -643,10 +644,8 @@ impl Storage for LanceDbStorage {
         // Legacy cross-bucket traversal.
         let seeds = seed_ids.to_vec();
         let pool = self.sqlite_pool.clone();
-        run_blocking(move || {
-            sqlite_helpers::bfs_expand(&pool, &seeds, None, depth, degree_limit)
-        })
-        .await
+        run_blocking(move || sqlite_helpers::bfs_expand(&pool, &seeds, None, depth, degree_limit))
+            .await
     }
 
     async fn bfs_expand_ns(
@@ -734,8 +733,7 @@ impl Storage for LanceDbStorage {
     async fn update_importance(&self, id: &str, importance: f64) -> MerkurResult<()> {
         let id_owned = id.to_string();
         let pool = self.sqlite_pool.clone();
-        run_blocking(move || sqlite_helpers::update_importance(&pool, &id_owned, importance))
-            .await
+        run_blocking(move || sqlite_helpers::update_importance(&pool, &id_owned, importance)).await
     }
 
     async fn invalidate_memory(&self, id: &str, absorbed_into: Option<&str>) -> MerkurResult<()> {
@@ -779,9 +777,7 @@ impl Storage for LanceDbStorage {
                 .get()
                 .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
             let mut stmt = conn
-                .prepare(
-                    "SELECT id FROM memories WHERE invalid_at IS NOT NULL AND invalid_at < ?1",
-                )
+                .prepare("SELECT id FROM memories WHERE invalid_at IS NOT NULL AND invalid_at < ?1")
                 .map_err(|e| MerkurError::Storage(format!("Failed to prepare purge query: {e}")))?;
             let ids: Vec<String> = stmt
                 .query_map(params![threshold], |row| row.get::<_, String>(0))

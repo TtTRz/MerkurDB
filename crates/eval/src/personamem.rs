@@ -99,17 +99,27 @@ pub fn parse_options(raw: &str) -> Result<Vec<String>, PmError> {
     let inner = t
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| PmError::Field(format!("all_options not a list: {}", &raw[..raw.len().min(60)])))?;
+        .ok_or_else(|| {
+            PmError::Field(format!(
+                "all_options not a list: {}",
+                &raw[..raw.len().min(60)]
+            ))
+        })?;
     let mut out = Vec::new();
     let mut chars = inner.chars().peekable();
     loop {
         // Skip whitespace and commas between items.
-        while matches!(chars.peek(), Some(',') | Some(' ') | Some('\n') | Some('\t')) {
+        while matches!(
+            chars.peek(),
+            Some(',') | Some(' ') | Some('\n') | Some('\t')
+        ) {
             chars.next();
         }
         let Some(&quote) = chars.peek() else { break };
         if quote != '\'' && quote != '"' {
-            return Err(PmError::Field(format!("unexpected char in options list: {quote}")));
+            return Err(PmError::Field(format!(
+                "unexpected char in options list: {quote}"
+            )));
         }
         chars.next();
         let mut item = String::new();
@@ -132,7 +142,10 @@ pub fn parse_options(raw: &str) -> Result<Vec<String>, PmError> {
 
 /// `(c)` → `c` (case-insensitive). Anything else is a data error.
 pub fn letter_of(correct_answer: &str) -> Option<char> {
-    let t = correct_answer.trim().trim_start_matches('(').trim_end_matches(')');
+    let t = correct_answer
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
     let mut chars = t.chars();
     match (chars.next(), chars.next()) {
         (Some(c), None) if c.is_ascii_alphabetic() => Some(c.to_ascii_lowercase()),

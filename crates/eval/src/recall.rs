@@ -126,10 +126,10 @@ mod tests {
     #[test]
     fn aggregates_per_category_and_overall() {
         let questions = vec![
-            q(1, &["D1:1"], &["D1:1"]),       // hit, cov 1.0
-            q(1, &["D1:2"], &["D9:9"]),       // miss, cov 0.0
+            q(1, &["D1:1"], &["D1:1"]),         // hit, cov 1.0
+            q(1, &["D1:2"], &["D9:9"]),         // miss, cov 0.0
             q(2, &["D2:1", "D2:2"], &["D2:1"]), // hit, cov 0.5
-            q(3, &[], &["D3:1"]),             // no evidence -> skipped
+            q(3, &[], &["D3:1"]),               // no evidence -> skipped
         ];
         let report = score_recall(&questions);
         assert_eq!(report.skipped_no_evidence, 1);
@@ -138,11 +138,19 @@ mod tests {
         assert!((report.hit_rate() - 2.0 / 3.0).abs() < 1e-9);
         assert!((report.mean_coverage() - (1.0 + 0.0 + 0.5) / 3.0).abs() < 1e-9);
 
-        let cat1 = report.per_category.iter().find(|c| c.category == 1).unwrap();
+        let cat1 = report
+            .per_category
+            .iter()
+            .find(|c| c.category == 1)
+            .unwrap();
         assert_eq!(cat1.questions, 2);
         assert_eq!(cat1.hits, 1);
         assert!((cat1.mean_coverage() - 0.5).abs() < 1e-9);
-        let cat2 = report.per_category.iter().find(|c| c.category == 2).unwrap();
+        let cat2 = report
+            .per_category
+            .iter()
+            .find(|c| c.category == 2)
+            .unwrap();
         assert!((cat2.mean_coverage() - 0.5).abs() < 1e-9);
         // Skipped question contributes no category row.
         assert!(report.per_category.iter().all(|c| c.category != 3));

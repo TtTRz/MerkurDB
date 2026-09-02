@@ -172,7 +172,10 @@ impl Scheduler {
                 {
                     Ok(h) => h,
                     Err(e) => {
-                        error!("Adjudication candidate search failed for {}: {e}", memory.id);
+                        error!(
+                            "Adjudication candidate search failed for {}: {e}",
+                            memory.id
+                        );
                         continue;
                     }
                 };
@@ -192,11 +195,10 @@ impl Scheduler {
                         continue;
                     }
                 };
-                let score_of = |id: &str| {
-                    candidates.iter().find(|c| c.id == id).map(|c| c.score)
-                };
+                let score_of = |id: &str| candidates.iter().find(|c| c.id == id).map(|c| c.score);
                 match verdict.action {
-                    merkur_core::AdjudicationAction::Add | merkur_core::AdjudicationAction::Noop => {}
+                    merkur_core::AdjudicationAction::Add
+                    | merkur_core::AdjudicationAction::Noop => {}
                     merkur_core::AdjudicationAction::Update => {
                         let Some(target) = verdict.target_id.as_deref() else {
                             continue;

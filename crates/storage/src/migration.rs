@@ -174,10 +174,8 @@ fn run_v3(conn: &rusqlite::Connection) -> MerkurResult<()> {
         )
         .map_err(|e| MerkurError::Storage(format!("migration v3: namespace: {e}")))?;
     }
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_mem_namespace ON memories(namespace);",
-    )
-    .map_err(|e| MerkurError::Storage(format!("migration v3: namespace index: {e}")))?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_mem_namespace ON memories(namespace);")
+        .map_err(|e| MerkurError::Storage(format!("migration v3: namespace index: {e}")))?;
     Ok(())
 }
 
@@ -185,15 +183,11 @@ fn run_v3(conn: &rusqlite::Connection) -> MerkurResult<()> {
 /// default so existing rows start unassessed rather than silently promoted.
 fn run_v4(conn: &rusqlite::Connection) -> MerkurResult<()> {
     if !has_column(conn, "memories", "importance")? {
-        conn.execute_batch(
-            "ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;",
-        )
-        .map_err(|e| MerkurError::Storage(format!("migration v4: importance: {e}")))?;
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN importance REAL NOT NULL DEFAULT 0.5;")
+            .map_err(|e| MerkurError::Storage(format!("migration v4: importance: {e}")))?;
     }
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_mem_importance ON memories(importance);",
-    )
-    .map_err(|e| MerkurError::Storage(format!("migration v4: importance index: {e}")))?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_mem_importance ON memories(importance);")
+        .map_err(|e| MerkurError::Storage(format!("migration v4: importance index: {e}")))?;
     Ok(())
 }
 

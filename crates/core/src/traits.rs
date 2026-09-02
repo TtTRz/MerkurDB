@@ -53,8 +53,7 @@ pub trait Storage: Send + Sync {
     ///
     /// Implementations may skip the check when the new memory carries no
     /// embedding (there is nothing to compare).
-    async fn insert_memory_dedup(&self, mem: &NewMemory, threshold: f64)
-    -> MerkurResult<String>;
+    async fn insert_memory_dedup(&self, mem: &NewMemory, threshold: f64) -> MerkurResult<String>;
     async fn update_memory(
         &self,
         id: &str,

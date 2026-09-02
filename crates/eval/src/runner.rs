@@ -57,7 +57,10 @@ pub async fn ingest_conversation(
                 metadata: Some(HashMap::from([
                     ("dia_id".to_string(), serde_json::json!(turn.dia_id)),
                     ("session_date".to_string(), serde_json::json!(date)),
-                    ("session_index".to_string(), serde_json::json!(session.index)),
+                    (
+                        "session_index".to_string(),
+                        serde_json::json!(session.index),
+                    ),
                 ])),
             });
         }
@@ -325,8 +328,7 @@ async fn qa_one(
     let memories: Vec<String> = resp.results.iter().map(|m| m.content.clone()).collect();
     let (sys, user) = build_answer_prompt_styled(&qa.question, &memories, style);
     let prediction = chat.chat(&sys, &user).await?;
-    let (jsys, juser) =
-        build_judge_prompt(&qa.question, &golden, &prediction, qa.is_adversarial());
+    let (jsys, juser) = build_judge_prompt(&qa.question, &golden, &prediction, qa.is_adversarial());
     let raw = chat.chat(&jsys, &juser).await?;
     Ok(Some(QaRecord {
         category: qa.category,
@@ -508,8 +510,11 @@ pub async fn pm_run_context(
         prev = Some(end);
 
         // Answer this checkpoint's questions concurrently.
-        let checkpoint_qs: Vec<&crate::personamem::PmQuestion> =
-            questions.iter().copied().filter(|q| q.end_index == end).collect();
+        let checkpoint_qs: Vec<&crate::personamem::PmQuestion> = questions
+            .iter()
+            .copied()
+            .filter(|q| q.end_index == end)
+            .collect();
         let n_checkpoint = checkpoint_qs.len();
         let results: Vec<RunResult<PmRecord>> = futures::stream::iter(checkpoint_qs)
             .map(|q| {
@@ -565,16 +570,26 @@ mod tests {
                     index: 1,
                     date_time: "1:56 pm on 8 May, 2023".into(),
                     turns: vec![
-                        Turn { dia_id: "D1:1".into(), speaker: "Caroline".into(), text: "hello".into() },
-                        Turn { dia_id: "D1:2".into(), speaker: "Melanie".into(), text: "hi there".into() },
+                        Turn {
+                            dia_id: "D1:1".into(),
+                            speaker: "Caroline".into(),
+                            text: "hello".into(),
+                        },
+                        Turn {
+                            dia_id: "D1:2".into(),
+                            speaker: "Melanie".into(),
+                            text: "hi there".into(),
+                        },
                     ],
                 },
                 Session {
                     index: 2,
                     date_time: "3:00 pm on 9 May, 2023".into(),
-                    turns: vec![
-                        Turn { dia_id: "D2:1".into(), speaker: "Caroline".into(), text: "bye".into() },
-                    ],
+                    turns: vec![Turn {
+                        dia_id: "D2:1".into(),
+                        speaker: "Caroline".into(),
+                        text: "bye".into(),
+                    }],
                 },
             ],
             qa: vec![
@@ -698,8 +713,12 @@ mod tests {
     async fn ingest_writes_dated_prefixed_turns_with_dia_id_context() {
         let state = Arc::new(Mutex::new(StubState::default()));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
-        let summary = ingest_conversation(&client, &conv_fixture(), 100).await.unwrap();
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
+        let summary = ingest_conversation(&client, &conv_fixture(), 100)
+            .await
+            .unwrap();
 
         assert_eq!(summary.turns_written, 3);
         assert_eq!(summary.batches, 1);
@@ -718,8 +737,12 @@ mod tests {
     async fn ingest_splits_at_batch_size() {
         let state = Arc::new(Mutex::new(StubState::default()));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
-        let summary = ingest_conversation(&client, &conv_fixture(), 2).await.unwrap();
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
+        let summary = ingest_conversation(&client, &conv_fixture(), 2)
+            .await
+            .unwrap();
         assert_eq!(summary.batches, 2);
         assert_eq!(summary.turns_written, 3);
     }
@@ -730,14 +753,21 @@ mod tests {
     async fn recall_maps_hits_back_to_dia_ids() {
         let state = Arc::new(Mutex::new(StubState::default()));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
-        let run = recall_conversation(&client, &conv_fixture(), 10, "hybrid").await.unwrap();
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
+        let run = recall_conversation(&client, &conv_fixture(), 10, "hybrid")
+            .await
+            .unwrap();
 
         // Both QA produce a RecallQuestion; the no-evidence one is filtered by
         // score_recall, not by the runner.
         assert_eq!(run.questions.len(), 2);
         assert_eq!(run.errors, 0);
-        assert_eq!(run.questions[0].retrieved, vec!["D1:1".to_string(), "D1:2".to_string()]);
+        assert_eq!(
+            run.questions[0].retrieved,
+            vec!["D1:1".to_string(), "D1:2".to_string()]
+        );
         assert_eq!(run.questions[0].category, 1);
         // Search must run ungated (threshold 0) with the requested mode.
         let locked = state.lock().unwrap();
@@ -756,8 +786,12 @@ mod tests {
             ..Default::default()
         }));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
-        let run = recall_conversation(&client, &conv_fixture(), 10, "hybrid").await.unwrap();
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
+        let run = recall_conversation(&client, &conv_fixture(), 10, "hybrid")
+            .await
+            .unwrap();
 
         assert_eq!(run.errors, 0);
         assert_eq!(run.questions.len(), 2);
@@ -772,8 +806,12 @@ mod tests {
             ..Default::default()
         }));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
-        let run = recall_conversation(&client, &conv_fixture(), 10, "hybrid").await.unwrap();
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
+        let run = recall_conversation(&client, &conv_fixture(), 10, "hybrid")
+            .await
+            .unwrap();
 
         assert_eq!(run.questions.len(), 0);
         assert_eq!(run.errors, 2);
@@ -803,7 +841,11 @@ mod tests {
         assert_eq!(report.correct, 1);
         assert_eq!(report.parse_failures, 1);
         assert!((report.accuracy() - 1.0 / 3.0).abs() < 1e-9);
-        let cat1 = report.per_category.iter().find(|c| c.category == 1).unwrap();
+        let cat1 = report
+            .per_category
+            .iter()
+            .find(|c| c.category == 1)
+            .unwrap();
         assert_eq!(cat1.questions, 2);
         assert_eq!(cat1.correct, 1);
     }
@@ -829,10 +871,26 @@ mod tests {
     async fn qa_runner_answers_then_judges_and_skips_missing_golden() {
         let state = Arc::new(Mutex::new(StubState::default()));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
         // First chat call = answer generation, second = judge verdict.
-        let chat = MockChat::new(vec!["Caroline".into(), "correct".into(), "I refuse".into(), "correct".into()]);
-        let run = qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid", AnswerStyle::Baseline).await.unwrap();
+        let chat = MockChat::new(vec![
+            "Caroline".into(),
+            "correct".into(),
+            "I refuse".into(),
+            "correct".into(),
+        ]);
+        let run = qa_conversation(
+            &client,
+            &chat,
+            &conv_fixture(),
+            10,
+            "hybrid",
+            AnswerStyle::Baseline,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(run.skipped_no_golden, 0);
         assert_eq!(run.errors, 0);
@@ -852,9 +910,20 @@ mod tests {
             ..Default::default()
         }));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
         let chat = MockChat::new(vec![]);
-        let run = qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid", AnswerStyle::Baseline).await.unwrap();
+        let run = qa_conversation(
+            &client,
+            &chat,
+            &conv_fixture(),
+            10,
+            "hybrid",
+            AnswerStyle::Baseline,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(run.records.len(), 0);
         assert_eq!(run.errors, 2);
@@ -865,11 +934,22 @@ mod tests {
     async fn qa_records_error_and_continues_when_chat_fails() {
         let state = Arc::new(Mutex::new(StubState::default()));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
         // Only enough mock responses for the first question (answer + judge);
         // the second question's answer call runs dry -> error, not panic.
         let chat = MockChat::new(vec!["Caroline".into(), "correct".into()]);
-        let run = qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid", AnswerStyle::Baseline).await.unwrap();
+        let run = qa_conversation(
+            &client,
+            &chat,
+            &conv_fixture(),
+            10,
+            "hybrid",
+            AnswerStyle::Baseline,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(run.records.len(), 1);
         assert_eq!(run.errors, 1);
@@ -903,15 +983,28 @@ mod tests {
     async fn qa_concurrent_processes_all_questions() {
         let state = Arc::new(Mutex::new(StubState::default()));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
         let chat = MockChat::with_handler(handler_chat);
-        let run =
-            qa_conversation_concurrent(&client, &chat, &conv_with_ungolden_qa(), 10, "hybrid", 3, AnswerStyle::Baseline)
-                .await
-                .unwrap();
+        let run = qa_conversation_concurrent(
+            &client,
+            &chat,
+            &conv_with_ungolden_qa(),
+            10,
+            "hybrid",
+            3,
+            AnswerStyle::Baseline,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(run.records.len(), 2);
-        assert!(run.records.iter().all(|r| r.verdict == Some(Verdict::Correct)));
+        assert!(
+            run.records
+                .iter()
+                .all(|r| r.verdict == Some(Verdict::Correct))
+        );
         assert_eq!(run.skipped_no_golden, 1);
         assert_eq!(run.errors, 0);
         // 2 judged questions x (answer + judge) calls.
@@ -922,7 +1015,9 @@ mod tests {
     async fn recall_concurrent_collects_all_questions() {
         let state = Arc::new(Mutex::new(StubState::default()));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
         let run = recall_conversation_concurrent(&client, &conv_fixture(), 10, "hybrid", 4)
             .await
             .unwrap();
@@ -936,11 +1031,25 @@ mod tests {
     async fn qa_aggregate_style_reaches_answer_prompt() {
         let state = Arc::new(Mutex::new(StubState::default()));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("conv-test");
-        let chat = MockChat::new(vec!["ans".into(), "correct".into(), "ans".into(), "correct".into()]);
-        qa_conversation(&client, &chat, &conv_fixture(), 10, "hybrid", AnswerStyle::Aggregate)
-            .await
-            .unwrap();
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("conv-test");
+        let chat = MockChat::new(vec![
+            "ans".into(),
+            "correct".into(),
+            "ans".into(),
+            "correct".into(),
+        ]);
+        qa_conversation(
+            &client,
+            &chat,
+            &conv_fixture(),
+            10,
+            "hybrid",
+            AnswerStyle::Aggregate,
+        )
+        .await
+        .unwrap();
         let seen = chat.seen();
         // First call is the answer generation; its system prompt must carry
         // the aggregation instructions.
@@ -951,15 +1060,30 @@ mod tests {
 
     // ── personamem in-situ replay ──
 
-    fn pm_fixture() -> (crate::personamem::PmContext, Vec<crate::personamem::PmQuestion>) {
+    fn pm_fixture() -> (
+        crate::personamem::PmContext,
+        Vec<crate::personamem::PmQuestion>,
+    ) {
         use crate::personamem::{PmContext, PmMessage, PmQuestion};
         let ctx = PmContext {
             id: "ctxA".into(),
             messages: vec![
-                PmMessage { role: "system".into(), content: "scenario boilerplate".into() },
-                PmMessage { role: "user".into(), content: "I love jazz".into() },
-                PmMessage { role: "assistant".into(), content: "noted".into() },
-                PmMessage { role: "user".into(), content: "now I prefer ambient".into() },
+                PmMessage {
+                    role: "system".into(),
+                    content: "scenario boilerplate".into(),
+                },
+                PmMessage {
+                    role: "user".into(),
+                    content: "I love jazz".into(),
+                },
+                PmMessage {
+                    role: "assistant".into(),
+                    content: "noted".into(),
+                },
+                PmMessage {
+                    role: "user".into(),
+                    content: "now I prefer ambient".into(),
+                },
             ],
         };
         let q = |id: &str, end: usize, correct: char| PmQuestion {
@@ -969,7 +1093,12 @@ mod tests {
             topic: "music".into(),
             question: format!("question {id}"),
             correct_letter: correct,
-            options: vec!["(a) x".into(), "(b) y".into(), "(c) z".into(), "(d) w".into()],
+            options: vec![
+                "(a) x".into(),
+                "(b) y".into(),
+                "(c) z".into(),
+                "(d) w".into(),
+            ],
             context_id: "ctxA".into(),
             end_index: end,
         };
@@ -986,11 +1115,15 @@ mod tests {
     async fn pm_replays_checkpoints_incrementally_and_scores_choices() {
         let state = Arc::new(Mutex::new(StubState::default()));
         let base = spawn_stub(state.clone()).await;
-        let client = HttpMerkurClient::new(&base).unwrap().with_namespace("pm-ctxA");
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("pm-ctxA");
         let (ctx, qs) = pm_fixture();
         let refs: Vec<&crate::personamem::PmQuestion> = qs.iter().collect();
         let chat = MockChat::with_handler(pm_handler);
-        let run = pm_run_context(&client, &chat, &ctx, &refs, 10, "hybrid", 2).await.unwrap();
+        let run = pm_run_context(&client, &chat, &ctx, &refs, 10, "hybrid", 2)
+            .await
+            .unwrap();
 
         assert_eq!(run.records.len(), 2);
         assert_eq!(run.errors, 0);
@@ -1018,7 +1151,11 @@ mod tests {
         assert_eq!(report.correct, 1);
         assert_eq!(report.parse_failures, 0);
         assert!((report.accuracy() - 0.5).abs() < 1e-9);
-        let t = report.per_type.iter().find(|t| t.question_type == "recall_user_shared_facts").unwrap();
+        let t = report
+            .per_type
+            .iter()
+            .find(|t| t.question_type == "recall_user_shared_facts")
+            .unwrap();
         assert_eq!(t.questions, 2);
         assert_eq!(t.correct, 1);
     }

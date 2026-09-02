@@ -36,14 +36,15 @@ pub async fn trigger_consolidate(State(state): State<AppState>) -> ApiResult<imp
 }
 
 pub async fn trigger_forget(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
-    let (archived, downgraded, upgraded, cleaned, purged) = scheduler::Scheduler::run_forgetting_once(
-        &*state.storage,
-        &*state.forgetter,
-        state.config.forgetting.batch_size,
-        state.config.forgetting.archive_days,
-        state.config.forgetting.purge_invalidated_days,
-    )
-    .await;
+    let (archived, downgraded, upgraded, cleaned, purged) =
+        scheduler::Scheduler::run_forgetting_once(
+            &*state.storage,
+            &*state.forgetter,
+            state.config.forgetting.batch_size,
+            state.config.forgetting.archive_days,
+            state.config.forgetting.purge_invalidated_days,
+        )
+        .await;
     Ok((
         StatusCode::OK,
         Json(json!({

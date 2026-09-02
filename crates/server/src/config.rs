@@ -638,7 +638,8 @@ mod tests {
     fn fusion_validation_rejects_degenerate_configs() {
         let mut cfg = Config::test_config();
         cfg.retrieval.fusion = Some(FusionConfig {
-            rrf_k: Some(0.0), ..Default::default()
+            rrf_k: Some(0.0),
+            ..Default::default()
         });
         assert!(cfg.validate().is_err());
 

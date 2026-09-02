@@ -271,17 +271,13 @@ fn build_consolidator(cfg: &config::Config) -> Result<Arc<dyn Consolidator>> {
                 lc.model,
                 lc.backend()
             );
-            let mut consolidator = LlmConsolidator::new(
-                lc.base_url.clone(),
-                lc.model.clone(),
-                lc.backend(),
-            )?;
+            let mut consolidator =
+                LlmConsolidator::new(lc.base_url.clone(), lc.model.clone(), lc.backend())?;
             if let Some(key) = &lc.api_key {
                 consolidator = consolidator.with_api_key(key.clone());
             }
             if let Some(secs) = lc.timeout_seconds {
-                consolidator =
-                    consolidator.with_timeout(std::time::Duration::from_secs(secs));
+                consolidator = consolidator.with_timeout(std::time::Duration::from_secs(secs));
             }
             Ok(Arc::new(consolidator))
         }

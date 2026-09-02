@@ -83,24 +83,30 @@ pub fn build_answer_prompt_styled(
     style: AnswerStyle,
 ) -> (String, String) {
     let system = match style {
-        AnswerStyle::Baseline => "You are a question-answering assistant. Answer using ONLY the provided \
+        AnswerStyle::Baseline => {
+            "You are a question-answering assistant. Answer using ONLY the provided \
         conversation memories. If the memories do not contain the answer, say you don't know \
         instead of guessing."
-            .to_string(),
-        AnswerStyle::Aggregate => "You are a question-answering assistant. Answer using ONLY the provided \
+                .to_string()
+        }
+        AnswerStyle::Aggregate => {
+            "You are a question-answering assistant. Answer using ONLY the provided \
         conversation memories. Combine all relevant facts across the memories into one complete \
         answer — when the question asks about activities, preferences, places, or people, list \
         every item mentioned. If the memories contain partial information, answer with what is \
         stated. Say you don't know ONLY when no memory mentions anything relevant."
-            .to_string(),
-        AnswerStyle::Guarded => "You are a question-answering assistant. Answer using ONLY the provided \
+                .to_string()
+        }
+        AnswerStyle::Guarded => {
+            "You are a question-answering assistant. Answer using ONLY the provided \
         conversation memories. Combine all relevant facts across the memories into one complete \
         answer — when the question asks about activities, preferences, places, or people, list \
         every item mentioned. If the memories contain partial information, answer with what is \
         stated. However: if the question presupposes a fact or event that the memories do not \
         establish, say you don't know — related topics appearing in the memories do NOT count \
         as establishing it."
-            .to_string(),
+                .to_string()
+        }
     };
     let mut user = String::from("Memories:\n");
     for m in memories {
@@ -213,7 +219,11 @@ pub struct OpenAiChat {
 }
 
 impl OpenAiChat {
-    pub fn new(base_url: impl Into<String>, api_key: Option<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        model: impl Into<String>,
+    ) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
@@ -273,7 +283,10 @@ mod tests {
     #[test]
     fn verdict_prefers_incorrect_when_both_substrings_present() {
         // "incorrect" contains "correct"; the negative must win.
-        assert_eq!(parse_verdict("incorrect, the dates differ"), Some(Verdict::Incorrect));
+        assert_eq!(
+            parse_verdict("incorrect, the dates differ"),
+            Some(Verdict::Incorrect)
+        );
         assert_eq!(parse_verdict("not correct"), Some(Verdict::Incorrect));
     }
 
@@ -362,10 +375,13 @@ mod tests {
         assert_eq!(mock.chat("s1", "u1").await.unwrap(), "first");
         assert_eq!(mock.chat("s2", "u2").await.unwrap(), "second");
         let seen = mock.seen();
-        assert_eq!(seen, vec![
-            ("s1".to_string(), "u1".to_string()),
-            ("s2".to_string(), "u2".to_string()),
-        ]);
+        assert_eq!(
+            seen,
+            vec![
+                ("s1".to_string(), "u1".to_string()),
+                ("s2".to_string(), "u2".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -392,11 +408,11 @@ mod tests {
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_owned);
-                    let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+                    let body = axum::body::to_bytes(req.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
                     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                    seen.lock()
-                        .unwrap()
-                        .push(("POST".to_string(), auth, json));
+                    seen.lock().unwrap().push(("POST".to_string(), auth, json));
                     axum::Json(serde_json::json!({
                         "choices": [{"message": {"content": "pong"}}]
                     }))

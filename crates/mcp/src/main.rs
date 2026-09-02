@@ -92,7 +92,16 @@ impl MerkurMcp {
             Ok(v) => v,
             Err(e) => return format!("Embedding error: {e}"),
         };
-        match merkur_core::hybrid_recall(self.storage.as_ref(), &vec, &args.query, merkur_core::DEFAULT_NAMESPACE, args.limit, 0.0, &merkur_core::FusionParams::default()).await
+        match merkur_core::hybrid_recall(
+            self.storage.as_ref(),
+            &vec,
+            &args.query,
+            merkur_core::DEFAULT_NAMESPACE,
+            args.limit,
+            0.0,
+            &merkur_core::FusionParams::default(),
+        )
+        .await
         {
             Ok(results) => {
                 // Best-effort demand signal for the served results.

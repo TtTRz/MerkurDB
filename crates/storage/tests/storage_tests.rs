@@ -343,13 +343,12 @@ async fn test_update_memory_nonexistent_returns_error() -> MerkurResult<()> {
 async fn test_fts_tracks_insert_update_delete() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
     let id = storage
-        .insert_memory(&new_test_memory(
-            "postgres vacuum tuning guide",
-            None,
-        ))
+        .insert_memory(&new_test_memory("postgres vacuum tuning guide", None))
         .await?;
 
-    let hits = storage.text_search("vacuum tuning", merkur_core::DEFAULT_NAMESPACE, 5).await?;
+    let hits = storage
+        .text_search("vacuum tuning", merkur_core::DEFAULT_NAMESPACE, 5)
+        .await?;
     assert_eq!(hits.len(), 1, "inserted row must be BM25-searchable");
     assert_eq!(hits[0].0, id);
 
@@ -358,15 +357,25 @@ async fn test_fts_tracks_insert_update_delete() -> MerkurResult<()> {
         .update_memory(&id, "postgres replication setup", None)
         .await?;
     assert!(
-        storage.text_search("vacuum", merkur_core::DEFAULT_NAMESPACE, 5).await?.is_empty(),
+        storage
+            .text_search("vacuum", merkur_core::DEFAULT_NAMESPACE, 5)
+            .await?
+            .is_empty(),
         "old term must leave the index after content update"
     );
-    let hits = storage.text_search("replication setup", merkur_core::DEFAULT_NAMESPACE, 5).await?;
+    let hits = storage
+        .text_search("replication setup", merkur_core::DEFAULT_NAMESPACE, 5)
+        .await?;
     assert_eq!(hits.len(), 1);
 
     // Deleting the memory removes it from the index too.
     storage.delete_memory(&id).await?;
-    assert!(storage.text_search("replication", merkur_core::DEFAULT_NAMESPACE, 5).await?.is_empty());
+    assert!(
+        storage
+            .text_search("replication", merkur_core::DEFAULT_NAMESPACE, 5)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -374,12 +383,11 @@ async fn test_fts_tracks_insert_update_delete() -> MerkurResult<()> {
 async fn test_text_search_cjk_substring() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
     storage
-        .insert_memory(&new_test_memory(
-            "用户喜欢用 Rust 写数据库内核",
-            None,
-        ))
+        .insert_memory(&new_test_memory("用户喜欢用 Rust 写数据库内核", None))
         .await?;
-    let hits = storage.text_search("喜欢用", merkur_core::DEFAULT_NAMESPACE, 5).await?;
+    let hits = storage
+        .text_search("喜欢用", merkur_core::DEFAULT_NAMESPACE, 5)
+        .await?;
     assert_eq!(hits.len(), 1, "trigram tokenizer must match CJK substrings");
     Ok(())
 }
@@ -392,7 +400,10 @@ async fn test_text_search_excludes_archived() -> MerkurResult<()> {
         .await?;
     storage.update_level(&id, -1).await?;
     assert!(
-        storage.text_search("affinity", merkur_core::DEFAULT_NAMESPACE, 5).await?.is_empty(),
+        storage
+            .text_search("affinity", merkur_core::DEFAULT_NAMESPACE, 5)
+            .await?
+            .is_empty(),
         "archived memories must not surface via the BM25 channel"
     );
     Ok(())
@@ -402,14 +413,16 @@ async fn test_text_search_excludes_archived() -> MerkurResult<()> {
 async fn test_text_search_short_query_yields_empty() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
     storage
-        .insert_memory(&new_test_memory(
-            "ab cd ef something long enough",
-            None,
-        ))
+        .insert_memory(&new_test_memory("ab cd ef something long enough", None))
         .await?;
     // Fewer than three characters: trigram cannot index any term, so the
     // channel short-circuits to empty (vector channel covers these queries).
-    assert!(storage.text_search("ab", merkur_core::DEFAULT_NAMESPACE, 5).await?.is_empty());
+    assert!(
+        storage
+            .text_search("ab", merkur_core::DEFAULT_NAMESPACE, 5)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -429,12 +442,20 @@ async fn test_text_search_ranks_by_term_frequency() -> MerkurResult<()> {
         ))
         .await?;
     let _c = storage
-        .insert_memory(&new_test_memory("completely unrelated garbage content here", None))
+        .insert_memory(&new_test_memory(
+            "completely unrelated garbage content here",
+            None,
+        ))
         .await?;
 
-    let hits = storage.text_search("rust", merkur_core::DEFAULT_NAMESPACE, 5).await?;
+    let hits = storage
+        .text_search("rust", merkur_core::DEFAULT_NAMESPACE, 5)
+        .await?;
     let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
-    assert!(!ids.contains(&_c.as_str()), "non-matching doc must be absent");
+    assert!(
+        !ids.contains(&_c.as_str()),
+        "non-matching doc must be absent"
+    );
     let ai = ids.iter().position(|i| *i == a.as_str()).unwrap();
     let bi = ids.iter().position(|i| *i == b.as_str()).unwrap();
     assert!(
@@ -446,7 +467,6 @@ async fn test_text_search_ranks_by_term_frequency() -> MerkurResult<()> {
 
 #[tokio::test]
 async fn test_migration_backfills_preexisting_rows() -> MerkurResult<()> {
-
     // Build a hand-rolled "v1" database: pre-migration schema with rows and
     // the old version marker, no memories_fts, no triggers.
     //
@@ -477,7 +497,9 @@ async fn test_migration_backfills_preexisting_rows() -> MerkurResult<()> {
     let storage = SqliteStorage::new(&path, 4)?;
 
     // Pre-existing row must be searchable through the BM25 channel.
-    let hits = storage.text_search("resharding", merkur_core::DEFAULT_NAMESPACE, 5).await?;
+    let hits = storage
+        .text_search("resharding", merkur_core::DEFAULT_NAMESPACE, 5)
+        .await?;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0, "mem_old1");
 
@@ -485,10 +507,15 @@ async fn test_migration_backfills_preexisting_rows() -> MerkurResult<()> {
     storage
         .insert_memory(&new_test_memory("postgres replication setup", None))
         .await?;
-    assert_eq!(storage.text_search("replication", merkur_core::DEFAULT_NAMESPACE, 5).await?.len(), 1);
+    assert_eq!(
+        storage
+            .text_search("replication", merkur_core::DEFAULT_NAMESPACE, 5)
+            .await?
+            .len(),
+        1
+    );
     Ok(())
 }
-
 
 #[tokio::test]
 async fn test_migration_replay_after_version_rollback_is_safe() -> MerkurResult<()> {
@@ -509,8 +536,8 @@ async fn test_migration_replay_after_version_rollback_is_safe() -> MerkurResult<
     .unwrap();
     drop(conn);
 
-    let replayed = SqliteStorage::new(&path, 4)
-        .expect("migration replay after partial upgrade must succeed");
+    let replayed =
+        SqliteStorage::new(&path, 4).expect("migration replay after partial upgrade must succeed");
     let hits = replayed
         .text_search("resharding", merkur_core::DEFAULT_NAMESPACE, 5)
         .await?;
@@ -624,7 +651,10 @@ async fn test_dedup_probe_is_not_recorded_as_access() -> MerkurResult<()> {
     // demand for the memory it merely compared against.
     let probe = new_test_memory("related new fact", Some(vec![0.85, 0.53, 0.0, 0.0]));
     let new_id = storage.insert_memory_dedup(&probe, 0.92).await?;
-    assert_ne!(new_id, existing, "below-threshold probe must insert, not NOOP");
+    assert_ne!(
+        new_id, existing,
+        "below-threshold probe must insert, not NOOP"
+    );
     settle_background_tasks().await;
     let m = storage.get_memory(&existing).await?.unwrap();
     assert_eq!(
@@ -673,11 +703,16 @@ async fn test_namespace_isolated_text_search() -> MerkurResult<()> {
         })
         .await?;
 
-    let hits_alpha = storage.text_search("shared vocabulary", "alpha", 10).await?;
+    let hits_alpha = storage
+        .text_search("shared vocabulary", "alpha", 10)
+        .await?;
     assert_eq!(hits_alpha.len(), 1);
     let hits_beta = storage.text_search("shared vocabulary", "beta", 10).await?;
     assert_eq!(hits_beta.len(), 1);
-    assert_ne!(hits_alpha[0].0, hits_beta[0].0, "same content in two buckets must stay separate");
+    assert_ne!(
+        hits_alpha[0].0, hits_beta[0].0,
+        "same content in two buckets must stay separate"
+    );
     Ok(())
 }
 
@@ -705,7 +740,9 @@ async fn test_namespace_isolated_vector_search() -> MerkurResult<()> {
         })
         .await?;
 
-    let hits = storage.vector_search_ns(&[1.0, 0.0, 0.0, 0.0], "alpha", 10).await?;
+    let hits = storage
+        .vector_search_ns(&[1.0, 0.0, 0.0, 0.0], "alpha", 10)
+        .await?;
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].id, _a);
     Ok(())
@@ -914,7 +951,12 @@ async fn test_invalidated_memory_hidden_from_retrieval_but_auditable() -> Merkur
         "BM25 channel must hide invalidated rows"
     );
     let graph = storage
-        .bfs_expand_ns(std::slice::from_ref(&keep), merkur_core::DEFAULT_NAMESPACE, 2, 10)
+        .bfs_expand_ns(
+            std::slice::from_ref(&keep),
+            merkur_core::DEFAULT_NAMESPACE,
+            2,
+            10,
+        )
         .await?;
     assert!(
         graph.iter().all(|m| m.id != doomed),
@@ -1015,7 +1057,10 @@ async fn test_namespace_migration_preserves_rows() -> MerkurResult<()> {
 
     let storage = SqliteStorage::new(&path, 4)?;
     let m = storage.get_memory("mem_v2_1").await?.unwrap();
-    assert_eq!(m.namespace, "default", "v2 rows must be backfilled into the default bucket");
+    assert_eq!(
+        m.namespace, "default",
+        "v2 rows must be backfilled into the default bucket"
+    );
     Ok(())
 }
 

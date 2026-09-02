@@ -59,7 +59,9 @@ impl Qa {
     /// Answer a judge should grade against: the real answer for normal QA,
     /// the trap answer for adversarial QA.
     pub fn golden_answer(&self) -> Option<String> {
-        self.answer.clone().or_else(|| self.adversarial_answer.clone())
+        self.answer
+            .clone()
+            .or_else(|| self.adversarial_answer.clone())
     }
 }
 
@@ -130,8 +132,7 @@ impl From<RawConversation> for Conversation {
                     dt_by_idx.insert(n, s.to_string());
                 }
             } else if let Ok(n) = rest.parse::<u32>() {
-                let turns: Vec<RawTurn> =
-                    serde_json::from_value(value.clone()).unwrap_or_default();
+                let turns: Vec<RawTurn> = serde_json::from_value(value.clone()).unwrap_or_default();
                 turns_by_idx.push((
                     n,
                     turns

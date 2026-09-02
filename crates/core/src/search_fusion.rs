@@ -259,7 +259,10 @@ pub async fn hybrid_recall(
 ) -> MerkurResult<Vec<ScoredMemory>> {
     let oversample = limit.saturating_mul(2).max(limit);
 
-    let vec_hits = match storage.vector_search_ns(query_vec, namespace, oversample).await {
+    let vec_hits = match storage
+        .vector_search_ns(query_vec, namespace, oversample)
+        .await
+    {
         Ok(hits) => hits,
         Err(e) => {
             tracing::warn!(error = %e, "vector channel failed; falling back to BM25 only");
@@ -279,8 +282,7 @@ pub async fn hybrid_recall(
         Vec::new()
     };
 
-    let vec_ranked: Vec<(String, f64)> =
-        vec_hits.iter().map(|s| (s.id.clone(), s.score)).collect();
+    let vec_ranked: Vec<(String, f64)> = vec_hits.iter().map(|s| (s.id.clone(), s.score)).collect();
     let fused = rrf_fuse_weighted(
         &bm25,
         &vec_ranked,
@@ -290,10 +292,8 @@ pub async fn hybrid_recall(
         limit,
     );
 
-    let mut by_id: std::collections::HashMap<String, ScoredMemory> = vec_hits
-        .into_iter()
-        .map(|m| (m.id.clone(), m))
-        .collect();
+    let mut by_id: std::collections::HashMap<String, ScoredMemory> =
+        vec_hits.into_iter().map(|m| (m.id.clone(), m)).collect();
 
     let mut out = Vec::with_capacity(fused.len());
     for (id, fused_score) in fused {
@@ -434,14 +434,8 @@ mod tests {
 
     #[test]
     fn fuse_orders_dual_hits_above_single_hits() {
-        let bm25 = vec![
-            ("m1".to_string(), 5.0),
-            ("b_only".to_string(), 4.0),
-        ];
-        let vec = vec![
-            ("m1".to_string(), 0.9),
-            ("v_only".to_string(), 0.5),
-        ];
+        let bm25 = vec![("m1".to_string(), 5.0), ("b_only".to_string(), 4.0)];
+        let vec = vec![("m1".to_string(), 0.9), ("v_only".to_string(), 0.5)];
         let out = rrf_fuse(&bm25, &vec, K, 10);
         assert_eq!(out[0].0, "m1", "dual-channel top must win");
         let singles = &out[1..];
@@ -463,7 +457,9 @@ mod tests {
 
     #[test]
     fn fuse_respects_limit() {
-        let bm25: Vec<(String, f64)> = (0..50).map(|i| (format!("m{i}"), 100.0 - i as f64)).collect();
+        let bm25: Vec<(String, f64)> = (0..50)
+            .map(|i| (format!("m{i}"), 100.0 - i as f64))
+            .collect();
         let vec: Vec<(String, f64)> = (0..30).map(|i| (format!("m{i}"), 0.5)).collect();
         let out = rrf_fuse(&bm25, &vec, K, 10);
         assert_eq!(out.len(), 10);
@@ -512,7 +508,11 @@ mod tests {
     #[test]
     fn composite_score_with_custom_weights() {
         // Pure-relevance configuration: score == fused, ignoring salience.
-        let w = ScoreWeights { search: 1.0, weight: 0.0, importance: 0.0 };
+        let w = ScoreWeights {
+            search: 1.0,
+            weight: 0.0,
+            importance: 0.0,
+        };
         assert!((composite_score_with(&w, 0.7, 1.0, 0.5) - 0.7).abs() < 1e-9);
         // Default weights match the legacy function exactly.
         assert_eq!(
@@ -579,14 +579,17 @@ mod tests {
     #[test]
     fn greedy_pack_respects_token_budget() {
         let items = vec![
-            mk_scored("big", &"x".repeat(400), 0.9),   // ~100 tokens
-            mk_scored("mid", &"y".repeat(200), 0.8),   // ~50 tokens
-            mk_scored("small", &"z".repeat(40), 0.7),  // ~10 tokens
+            mk_scored("big", &"x".repeat(400), 0.9),  // ~100 tokens
+            mk_scored("mid", &"y".repeat(200), 0.8),  // ~50 tokens
+            mk_scored("small", &"z".repeat(40), 0.7), // ~10 tokens
         ];
         let (packed, dropped) = greedy_pack(&items, 60);
         let ids: Vec<&str> = packed.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"mid") && ids.contains(&"small"));
-        assert_eq!(dropped, 1, "the 100-token item must not fit a 60-token budget");
+        assert_eq!(
+            dropped, 1,
+            "the 100-token item must not fit a 60-token budget"
+        );
     }
 
     #[test]
@@ -650,11 +653,7 @@ mod tests {
         async fn insert_memory(&self, _: &crate::NewMemory) -> MerkurResult<String> {
             unimplemented!()
         }
-        async fn insert_memory_dedup(
-            &self,
-            _: &crate::NewMemory,
-            _: f64,
-        ) -> MerkurResult<String> {
+        async fn insert_memory_dedup(&self, _: &crate::NewMemory, _: f64) -> MerkurResult<String> {
             unimplemented!()
         }
         async fn update_memory(&self, _: &str, _: &str, _: Option<&[f32]>) -> MerkurResult<()> {
@@ -677,11 +676,7 @@ mod tests {
         async fn purge_invalidated_older_than(&self, _: i32) -> MerkurResult<usize> {
             unimplemented!()
         }
-        async fn vector_search(
-            &self,
-            _: &[f32],
-            _: usize,
-        ) -> MerkurResult<Vec<ScoredMemory>> {
+        async fn vector_search(&self, _: &[f32], _: usize) -> MerkurResult<Vec<ScoredMemory>> {
             unimplemented!()
         }
         async fn vector_search_ns(
@@ -802,9 +797,17 @@ mod tests {
     #[tokio::test]
     async fn hybrid_recall_skips_hits_whose_hydration_fails() {
         let storage = StubStorage::new(vec![("b1".to_string(), 1.0)], true);
-        let out = hybrid_recall(&storage, &[1.0], "some query", "default", 10, 0.0, &FusionParams::default())
-            .await
-            .expect("a hydration failure must degrade, not fail the recall");
+        let out = hybrid_recall(
+            &storage,
+            &[1.0],
+            "some query",
+            "default",
+            10,
+            0.0,
+            &FusionParams::default(),
+        )
+        .await
+        .expect("a hydration failure must degrade, not fail the recall");
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["v1"]);
     }
@@ -820,9 +823,17 @@ mod tests {
             vec![("v1".to_string(), 2.0), ("b1".to_string(), 1.0)],
             false,
         );
-        let out = hybrid_recall(&storage, &[1.0], "some query", "default", 10, 0.6, &FusionParams::default())
-            .await
-            .unwrap();
+        let out = hybrid_recall(
+            &storage,
+            &[1.0],
+            "some query",
+            "default",
+            10,
+            0.6,
+            &FusionParams::default(),
+        )
+        .await
+        .unwrap();
         let ids: Vec<&str> = out.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["v1"], "BM25-rank-2-only hit must be gated by 0.6");
         assert_eq!(

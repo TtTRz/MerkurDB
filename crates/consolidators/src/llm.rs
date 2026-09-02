@@ -447,10 +447,9 @@ mod tests {
 
         let base = format!("http://{addr}");
         let mems = vec![test_memory("m1", "hello")];
-        let with_key =
-            LlmConsolidator::new(base.clone(), "m".into(), LlmBackend::OpenAI)
-                .unwrap()
-                .with_api_key("sk-test");
+        let with_key = LlmConsolidator::new(base.clone(), "m".into(), LlmBackend::OpenAI)
+            .unwrap()
+            .with_api_key("sk-test");
         with_key.consolidate(&mems).await.ok();
         assert_eq!(seen.lock().unwrap().as_deref(), Some("Bearer sk-test"));
 

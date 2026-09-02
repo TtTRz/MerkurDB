@@ -31,7 +31,12 @@ struct Cli {
     data: PathBuf,
 
     /// Base URL of a running merkur-server
-    #[arg(long, global = true, env = "MERKUR_EVAL_SERVER", default_value = "http://127.0.0.1:1934")]
+    #[arg(
+        long,
+        global = true,
+        env = "MERKUR_EVAL_SERVER",
+        default_value = "http://127.0.0.1:1934"
+    )]
     server: String,
 
     /// Bearer token for the server
@@ -133,8 +138,7 @@ fn base_client(cli: &Cli) -> Result<HttpMerkurClient, Box<dyn std::error::Error>
     // Remote embedding/chat providers can be slow to cold-start; the SDK's
     // 30 s default is too tight for a benchmark run.
     let timeout = std::time::Duration::from_secs(120);
-    let client =
-        HttpMerkurClient::with_options(&cli.server, cli.token.clone(), timeout)?;
+    let client = HttpMerkurClient::with_options(&cli.server, cli.token.clone(), timeout)?;
     Ok(client)
 }
 
@@ -199,7 +203,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("total turns written: {total}");
         }
 
-        Command::Recall { limit, mode, jobs, json, dump } => {
+        Command::Recall {
+            limit,
+            mode,
+            jobs,
+            json,
+            dump,
+        } => {
             let ds = load_dataset(&cli)?;
             let client = base_client(&cli)?;
             let mut questions: Vec<RecallQuestion> = Vec::new();
@@ -222,7 +232,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let report = score_recall(&questions);
             println!("\nrecall@{limit} mode={mode}");
-            println!("{:<9} {:>9} {:>6} {:>9} {:>13}", "category", "questions", "hits", "hit_rate", "mean_coverage");
+            println!(
+                "{:<9} {:>9} {:>6} {:>9} {:>13}",
+                "category", "questions", "hits", "hit_rate", "mean_coverage"
+            );
             for c in &report.per_category {
                 println!(
                     "{:<9} {:>9} {:>6} {:>9.3} {:>13.3}",
@@ -271,7 +284,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for conv in selected(&ds, &cli.conv) {
                 let namespaced = client.clone().with_namespace(&conv.sample_id);
                 let run = if *jobs > 1 {
-                    qa_conversation_concurrent(&namespaced, &chat, conv, *limit, mode, *jobs, *answer_style).await?
+                    qa_conversation_concurrent(
+                        &namespaced,
+                        &chat,
+                        conv,
+                        *limit,
+                        mode,
+                        *jobs,
+                        *answer_style,
+                    )
+                    .await?
                 } else {
                     qa_conversation(&namespaced, &chat, conv, *limit, mode, *answer_style).await?
                 };
@@ -288,7 +310,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let report = score_qa(&records);
             println!("\nqa accuracy (judge={chat_model})");
-            println!("{:<9} {:>9} {:>7} {:>9}", "category", "questions", "correct", "accuracy");
+            println!(
+                "{:<9} {:>9} {:>7} {:>9}",
+                "category", "questions", "correct", "accuracy"
+            );
             for c in &report.per_category {
                 println!(
                     "{:<9} {:>9} {:>7} {:>9.3}",
@@ -336,20 +361,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let contexts = merkur_eval::personamem::parse_contexts_jsonl(&contexts_jsonl)?;
 
             // Group questions by shared context, preserving checkpoint replay.
-            let mut by_context: std::collections::BTreeMap<String, Vec<&merkur_eval::personamem::PmQuestion>> =
-                Default::default();
+            let mut by_context: std::collections::BTreeMap<
+                String,
+                Vec<&merkur_eval::personamem::PmQuestion>,
+            > = Default::default();
             for q in &questions {
                 by_context.entry(q.context_id.clone()).or_default().push(q);
             }
 
             let client = base_client(&cli)?;
-            let chat = std::sync::Arc::new(OpenAiChat::new(chat_base_url, chat_api_key.clone(), chat_model));
+            let chat = std::sync::Arc::new(OpenAiChat::new(
+                chat_base_url,
+                chat_api_key.clone(),
+                chat_model,
+            ));
             // Contexts are namespace-isolated, so replay them concurrently;
             // per-checkpoint answer fan-out stays at `jobs`.
             let ctx_units: Vec<_> = by_context
                 .iter()
                 .filter(|(ctx_id, _)| {
-                    context.as_ref().is_none_or(|f| ctx_id.starts_with(f.as_str()))
+                    context
+                        .as_ref()
+                        .is_none_or(|f| ctx_id.starts_with(f.as_str()))
                 })
                 .collect();
             let runs: Vec<_> = futures::stream::iter(ctx_units)
@@ -364,8 +397,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let ns = format!("pm-{}", &ctx_id[..16.min(ctx_id.len())]);
                         let namespaced = client.with_namespace(&ns);
-                        match pm_run_context(&namespaced, chat.as_ref(), ctx, qs, *limit, mode, *jobs)
-                            .await
+                        match pm_run_context(
+                            &namespaced,
+                            chat.as_ref(),
+                            ctx,
+                            qs,
+                            *limit,
+                            mode,
+                            *jobs,
+                        )
+                        .await
                         {
                             Ok(run) => {
                                 println!(
@@ -378,7 +419,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Some(run)
                             }
                             Err(e) => {
-                                eprintln!("[pm] context {} failed: {e}", &ctx_id[..8.min(ctx_id.len())]);
+                                eprintln!(
+                                    "[pm] context {} failed: {e}",
+                                    &ctx_id[..8.min(ctx_id.len())]
+                                );
                                 None
                             }
                         }
@@ -401,7 +445,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let report = score_pm(&records);
             println!("\npersonamem accuracy (model={chat_model})");
-            println!("{:<40} {:>9} {:>7} {:>9}", "question_type", "questions", "correct", "accuracy");
+            println!(
+                "{:<40} {:>9} {:>7} {:>9}",
+                "question_type", "questions", "correct", "accuracy"
+            );
             for t in &report.per_type {
                 println!(
                     "{:<40} {:>9} {:>7} {:>9.3}",
@@ -413,7 +460,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!(
                 "{:<40} {:>9} {:>7} {:>9.3}",
-                "overall", report.questions, report.correct, report.accuracy()
+                "overall",
+                report.questions,
+                report.correct,
+                report.accuracy()
             );
             println!("unparseable choices: {}", report.parse_failures);
             println!("errors (retried out): {errors}");

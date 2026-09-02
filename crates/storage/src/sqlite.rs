@@ -74,7 +74,17 @@ CREATE TABLE IF NOT EXISTS consolidate_log (
 ";
 
 /// Row shape shared by both backends' namespace-scoped vector search.
-pub(crate) type MemoryRow = (String, String, Option<String>, String, f64, i32, String, String, f64);
+pub(crate) type MemoryRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    f64,
+    i32,
+    String,
+    String,
+    f64,
+);
 
 /// Batch-fetch live memory rows of one bucket for the candidate ids.
 ///
@@ -259,11 +269,7 @@ impl Storage for SqliteStorage {
         Ok(id)
     }
 
-    async fn insert_memory_dedup(
-        &self,
-        mem: &NewMemory,
-        threshold: f64,
-    ) -> MerkurResult<String> {
+    async fn insert_memory_dedup(&self, mem: &NewMemory, threshold: f64) -> MerkurResult<String> {
         // Only the vector channel can answer "is this near-duplicate?"; a
         // memory without an embedding has no dedup signal and inserts plainly.
         if let Some(embedding) = mem.embedding.as_deref() {
@@ -368,9 +374,7 @@ impl Storage for SqliteStorage {
                 .get()
                 .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
             let mut stmt = conn
-                .prepare(
-                    "SELECT id FROM memories WHERE invalid_at IS NOT NULL AND invalid_at < ?1",
-                )
+                .prepare("SELECT id FROM memories WHERE invalid_at IS NOT NULL AND invalid_at < ?1")
                 .map_err(|e| MerkurError::Storage(format!("Failed to prepare purge query: {e}")))?;
             let ids: Vec<String> = stmt
                 .query_map(params![threshold], |row| row.get::<_, String>(0))
@@ -425,10 +429,8 @@ impl Storage for SqliteStorage {
         let expr = escape_fts_query(query);
         let namespace = namespace.to_string();
         let pool = self.pool.clone();
-        run_blocking(move || {
-            sqlite_helpers::text_search_bm25(&pool, &expr, &namespace, limit)
-        })
-        .await
+        run_blocking(move || sqlite_helpers::text_search_bm25(&pool, &expr, &namespace, limit))
+            .await
     }
 
     async fn vector_search_ns(
@@ -495,7 +497,17 @@ impl Storage for SqliteStorage {
         let mut out: Vec<ScoredMemory> = memories
             .into_iter()
             .map(
-                |(id, content, abstract_, category, weight, level_i32, created_at, namespace, importance)| {
+                |(
+                    id,
+                    content,
+                    abstract_,
+                    category,
+                    weight,
+                    level_i32,
+                    created_at,
+                    namespace,
+                    importance,
+                )| {
                     let level = MemoryLevel::from_i32(level_i32);
                     let score = scores.get(&id).copied().unwrap_or(0.0);
                     let context = ctx_map.get(&id).cloned().unwrap_or_default();
@@ -531,10 +543,7 @@ impl Storage for SqliteStorage {
         run_blocking(move || sqlite_helpers::update_access(&pool, &ids)).await
     }
 
-    async fn get_embeddings(
-        &self,
-        ids: &[String],
-    ) -> MerkurResult<HashMap<String, Vec<f32>>> {
+    async fn get_embeddings(&self, ids: &[String]) -> MerkurResult<HashMap<String, Vec<f32>>> {
         let pool = self.pool.clone();
         let ids = ids.to_vec();
         run_blocking(move || sqlite_helpers::get_embeddings_batch(&pool, &ids)).await
@@ -580,10 +589,8 @@ impl Storage for SqliteStorage {
         // have not adopted namespaces yet.
         let seeds = seed_ids.to_vec();
         let pool = self.pool.clone();
-        run_blocking(move || {
-            sqlite_helpers::bfs_expand(&pool, &seeds, None, depth, degree_limit)
-        })
-        .await
+        run_blocking(move || sqlite_helpers::bfs_expand(&pool, &seeds, None, depth, degree_limit))
+            .await
     }
 
     async fn bfs_expand_ns(
@@ -671,8 +678,7 @@ impl Storage for SqliteStorage {
     async fn update_importance(&self, id: &str, importance: f64) -> MerkurResult<()> {
         let id_owned = id.to_string();
         let pool = self.pool.clone();
-        run_blocking(move || sqlite_helpers::update_importance(&pool, &id_owned, importance))
-            .await
+        run_blocking(move || sqlite_helpers::update_importance(&pool, &id_owned, importance)).await
     }
 
     async fn delete_archived_older_than(&self, days: i32) -> MerkurResult<usize> {

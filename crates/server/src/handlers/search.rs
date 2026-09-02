@@ -87,9 +87,7 @@ pub async fn search(
         // to cover the requested page) so post-filters and offset pagination
         // do not silently starve.
         SearchMode::Hybrid => {
-            let pool = limit
-                .saturating_mul(2)
-                .max(offset.saturating_add(limit));
+            let pool = limit.saturating_mul(2).max(offset.saturating_add(limit));
             merkur_core::hybrid_recall(
                 state.storage.as_ref(),
                 &query_vec,
@@ -101,10 +99,12 @@ pub async fn search(
             )
             .await?
         }
-        SearchMode::Fast => state
-            .storage
-            .vector_search_ns(&query_vec, &ns.0, limit * 2)
-            .await?,
+        SearchMode::Fast => {
+            state
+                .storage
+                .vector_search_ns(&query_vec, &ns.0, limit * 2)
+                .await?
+        }
         SearchMode::Deep => {
             let seeds = state
                 .storage

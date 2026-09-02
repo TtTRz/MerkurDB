@@ -279,7 +279,18 @@ pub fn bfs_expand(
     let mut ctx_map = get_context_tags_batch(pool, &neighbor_ids)?;
 
     let mut results = Vec::with_capacity(intermediate.len());
-    for (id, bfs_depth, weight, content, abstract_, level_i32, category, created_at, namespace, importance) in intermediate
+    for (
+        id,
+        bfs_depth,
+        weight,
+        content,
+        abstract_,
+        level_i32,
+        category,
+        created_at,
+        namespace,
+        importance,
+    ) in intermediate
     {
         let level = MemoryLevel::from_i32(level_i32);
         let decay = 0.5_f64.powi(bfs_depth);

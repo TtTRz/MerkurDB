@@ -345,12 +345,7 @@ mod tests {
         // Two half-lives (1h) old -> decay = 0.25; bonus ~1.58 for 50 hits.
         // Derived weight lands at ~0.4: inside the hysteresis band
         // [threshold_to_l0=0.2, threshold_upgrade=0.6) -> Keep.
-        let mem = make_memory(
-            now - Duration::seconds(7200),
-            1.0,
-            MemoryLevel::Summary,
-            50,
-        );
+        let mem = make_memory(now - Duration::seconds(7200), 1.0, MemoryLevel::Summary, 50);
         let w = f.compute_weight(&mem, now);
         assert!(
             (0.2..0.6).contains(&w),

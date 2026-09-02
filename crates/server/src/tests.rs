@@ -480,7 +480,10 @@ mod integration {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let results = json["results"].as_array().unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0]["content"].as_str().unwrap(), "trigram bm25 exact match target sentence");
+        assert_eq!(
+            results[0]["content"].as_str().unwrap(),
+            "trigram bm25 exact match target sentence"
+        );
         // P1-5: the visible score is the composite, not raw RRF. A rank-1
         // dual hit (fused=1.0) on a fresh memory (weight=1.0, importance
         // prior 0.5) yields 0.5*1.0 + 0.2*1.0 + 0.3*0.5 = 0.85.
@@ -571,11 +574,9 @@ mod integration {
 
         let resp = app
             .oneshot(
-                Request::get(
-                    "/v1/search?q=the+threshold+wiring+probe+memory&score_threshold=0.9",
-                )
-                .body(Body::empty())
-                .unwrap(),
+                Request::get("/v1/search?q=the+threshold+wiring+probe+memory&score_threshold=0.9")
+                    .body(Body::empty())
+                    .unwrap(),
             )
             .await
             .unwrap();
@@ -653,10 +654,7 @@ mod integration {
             if *id == served {
                 assert!(count >= 1, "served result must record access");
             } else {
-                assert_eq!(
-                    count, 0,
-                    "unserved memory must not record access (id={id})"
-                );
+                assert_eq!(count, 0, "unserved memory must not record access (id={id})");
             }
         }
     }
@@ -773,7 +771,8 @@ mod integration {
     }
 
     #[async_trait::async_trait]
-    impl merkur_core::Consolidator for ScriptedConsolidator {        async fn consolidate(
+    impl merkur_core::Consolidator for ScriptedConsolidator {
+        async fn consolidate(
             &self,
             memories: &[merkur_core::Memory],
         ) -> merkur_core::MerkurResult<merkur_core::ConsolidationReport> {
@@ -820,7 +819,11 @@ mod integration {
             .await
             .unwrap();
         // X is already consolidated; only the pending P gets adjudicated.
-        state.storage.mark_consolidated(std::slice::from_ref(&x)).await.unwrap();
+        state
+            .storage
+            .mark_consolidated(std::slice::from_ref(&x))
+            .await
+            .unwrap();
         let p = state
             .storage
             .insert_memory(&gov_memory("the deploy region is now us-west", 0.9, 0.1))
@@ -858,7 +861,11 @@ mod integration {
             .insert_memory(&gov_memory("the deploy region is us-east", 1.0, 0.0))
             .await
             .unwrap();
-        state.storage.mark_consolidated(std::slice::from_ref(&x)).await.unwrap();
+        state
+            .storage
+            .mark_consolidated(std::slice::from_ref(&x))
+            .await
+            .unwrap();
         let p = state
             .storage
             .insert_memory(&gov_memory("the deploy region is now us-west", 0.9, 0.1))
@@ -877,7 +884,10 @@ mod integration {
         )
         .await;
 
-        assert_eq!(report.absorptions, 0, "below-floor verdict must not execute");
+        assert_eq!(
+            report.absorptions, 0,
+            "below-floor verdict must not execute"
+        );
         let xm = state.storage.get_memory(&x).await.unwrap().unwrap();
         assert_eq!(xm.content, "the deploy region is us-east");
         let pm = state.storage.get_memory(&p).await.unwrap().unwrap();
@@ -999,7 +1009,9 @@ mod integration {
                     Request::post("/v1/write")
                         .header("content-type", "application/json")
                         .header("x-merkur-namespace", ns)
-                        .body(Body::from(r#"{"content":"bucket isolation probe sentence"}"#))
+                        .body(Body::from(
+                            r#"{"content":"bucket isolation probe sentence"}"#,
+                        ))
                         .unwrap(),
                 )
                 .await
@@ -1092,9 +1104,7 @@ mod integration {
             .oneshot(
                 Request::post("/v1/context")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"q":"rust preference","token_budget":100}"#,
-                    ))
+                    .body(Body::from(r#"{"q":"rust preference","token_budget":100}"#))
                     .unwrap(),
             )
             .await
@@ -1108,7 +1118,10 @@ mod integration {
         assert!(!digest.is_empty());
         // Near-duplicate was dropped: at most 2 items survive.
         let items = json["items"].as_array().unwrap();
-        assert!(items.len() <= 2, "near-duplicate must be deduped, got {items:?}");
+        assert!(
+            items.len() <= 2,
+            "near-duplicate must be deduped, got {items:?}"
+        );
         // Token estimate respects the budget.
         let est = json["token_estimate"].as_u64().unwrap();
         assert!(est <= 100, "estimate {est} exceeds budget");

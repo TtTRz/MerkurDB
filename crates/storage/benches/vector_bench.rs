@@ -75,7 +75,12 @@ fn bench_hybrid_recall(c: &mut Criterion) {
 
     let bm25_only = || {
         rt.block_on(async {
-            black_box(storage.text_search("vacuum tuning", merkur_core::DEFAULT_NAMESPACE, 20).await.unwrap());
+            black_box(
+                storage
+                    .text_search("vacuum tuning", merkur_core::DEFAULT_NAMESPACE, 20)
+                    .await
+                    .unwrap(),
+            );
         });
     };
 
@@ -88,9 +93,17 @@ fn bench_hybrid_recall(c: &mut Criterion) {
             // channels plus the RRF fuse and record assembly.
             let query_vec = vec![1.0f32, 1.0, 0.0, 0.0];
             black_box(
-                hybrid_recall(&storage, &query_vec, "postgres vacuum tuning", merkur_core::DEFAULT_NAMESPACE, 20, 0.0, &merkur_core::FusionParams::default())
-                    .await
-                    .unwrap(),
+                hybrid_recall(
+                    &storage,
+                    &query_vec,
+                    "postgres vacuum tuning",
+                    merkur_core::DEFAULT_NAMESPACE,
+                    20,
+                    0.0,
+                    &merkur_core::FusionParams::default(),
+                )
+                .await
+                .unwrap(),
             );
         });
     };
