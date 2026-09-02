@@ -44,6 +44,17 @@ retrieval:
   score_threshold: 0.3
   default_depth: 2
   default_degree_limit: 10
+  # Hybrid fusion tuning. Defaults shown; omit the section to keep them.
+  #   rrf_k: RRF smoothing constant (rank damping)
+  #   bm25_weight / vector_weight: per-channel shares in the fused score
+  #   score_search / score_weight / score_importance: composite re-rank shares
+  # fusion:
+  #   rrf_k: 60
+  #   bm25_weight: 1.0
+  #   vector_weight: 1.0
+  #   score_search: 0.5
+  #   score_weight: 0.2
+  #   score_importance: 0.3
 
 # Authentication: provide one or more bearer tokens. Empty list + `disabled: false`
 # is rejected at startup unless `server.dev_mode = true`.

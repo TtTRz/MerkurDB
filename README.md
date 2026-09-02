@@ -45,7 +45,8 @@ curl localhost:1934/v1/health
 
 ## Key Features
 
-- **Hybrid Retrieval (default)**: FTS5 trigram full-text (BM25) x vector cosine, fused with Reciprocal Rank Fusion; results re-ranked by a composite of relevance, stored weight, and **system-learned importance** (Consolidator-assessed, never client-reported). Works on CJK/unsegmented text out of the box; see [Hybrid Search](#hybrid-search)
+- **Hybrid Retrieval (default)**: FTS5 trigram full-text (BM25) x vector cosine, fused with Reciprocal Rank Fusion; results re-ranked by a composite of relevance, stored weight, and **system-learned importance** (Consolidator-assessed, never client-reported). Fusion knobs (`retrieval.fusion.*`) are configurable. Works on CJK/unsegmented text out of the box; see [Hybrid Search](#hybrid-search)
+- **Evaluated in the open**: reproducible LoCoMo + PersonaMem harness in `crates/eval` with per-question dumps; see [Evaluation](#evaluation)
 - **Fast & Deep modes**: `mode=fast` for pure vector top-k, `mode=deep` for BFS graph diffusion via SQLite CTE
 - **Ebbinghaus Forgetting Curve**: Exponential weight decay, access boost, cascade downgrade (Full→Summary→Title→Archive) with hysteresis-based promotion back up on repeated retrieval
 - **Write Governance (mem0-style)**: near-duplicate writes NOOP onto the existing memory (top-1 cosine ≥ 0.92, same bucket); the async Consolidator adjudicates each new memory against its neighbors — UPDATE absorbs the new content into the existing row (salience, edges, and access history preserved; audit pointer kept), DELETE soft-invalidates the loser. Verdicts execute only with an LLM consolidator AND pair similarity ≥ `consolidation.adjudication_floor` (dual-signal); the synchronous write path stays LLM-free
@@ -74,6 +75,26 @@ Design properties:
 - **CJK-ready.** The trigram tokenizer indexes every 3-character sliding window, so Chinese/Japanese/Korean queries match without a word segmentation dependency.
 - **Short-query fallback.** Queries under 3 characters cannot produce a trigram; the BM25 channel yields no candidates and vector similarity covers those queries alone.
 - **Always-on consistency.** FTS5 triggers mirror every insert/update/delete — including writes from the LanceDB backend and admin tools — so both channels always see the same data.
+- **Tunable fusion.** `retrieval.fusion.rrf_k` (rank smoothing), `bm25_weight`/`vector_weight` (channel shares), and `score_search`/`score_weight`/`score_importance` (composite re-rank shares) are configurable per deployment; the shipped defaults are validated against the public benchmarks below.
+
+## Evaluation
+
+The `merkur-eval` harness (`crates/eval`, MIT) runs two public benchmarks end-to-end against a live server — the same serving path real clients use — and writes per-question JSONL dumps so every number is auditable.
+
+| Benchmark | Metric | MerkurDB | Reference points |
+|---|---|---|---|
+| LoCoMo (1,986 QA) | QA accuracy (LLM-judged) | **64.8%** | mem0 paper 66.9% (GPT-4-class answerer + full extraction pipeline) |
+| LoCoMo | retrieval hit@30 / coverage | **0.762 / 0.703** | — |
+| PersonaMem 32k (589 MC QA) | accuracy | **73.2%** | frontier LLMs full-context ~52%; TencentDB Agent Memory 76.1% (same answer model, full pipeline) |
+
+Measured with raw dialog-turn ingest (no consolidation pipeline) and lightweight answer models (`deepseek-v4-flash-vision-exp` judge on LoCoMo, `kimi-k2.5` on PersonaMem); judge/answer-model choices make cross-paper numbers approximate. Harness design: LLM-free retrieval-recall track scored against LoCoMo evidence annotations, judge-graded QA track (adversarial questions score abstention as correct), and in-situ checkpoint replay for PersonaMem (no future-turn leakage).
+
+```bash
+scripts/fetch_locomo.sh          # datasets (CC BY-NC / MIT, gitignored)
+scripts/run_locomo.sh            # ingest + recall + qa, throwaway server
+scripts/run_personamem.sh        # in-situ PersonaMem replay
+scripts/sweep_fusion.sh          # P1-5 fusion-parameter sweep (persistent corpus)
+```
 
 ## API
 
