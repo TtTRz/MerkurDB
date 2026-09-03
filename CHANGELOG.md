@@ -14,7 +14,7 @@ All notable changes to MerkurDB. Format follows [Keep a Changelog](https://keepa
 
 ### Evaluation results (reference configuration)
 
-- **LoCoMo**: QA accuracy 64.8% (1,962 judged, 0 judge parse failures), retrieval hit@30 0.762 / coverage 0.703; adversarial category 86.5%. Raw-turn ingest, `deepseek-v4-flash-vision-exp` judge.
+- **LoCoMo**: QA accuracy 64.8% on raw-turn ingest, **68.3% with the consolidation pipeline enabled** (LLM abstracts + importance + edges; adjudication off) — retrieval hit@30 0.762 → 0.816, coverage 0.703 → 0.759; adversarial category 86.5-88.3%. Judge: `deepseek-v4-flash-vision-exp`.
 - **PersonaMem 32k**: 73.2% across 589 questions, 0 unparseable answers; `kimi-k2.5` answering (same model family as the TencentDB Agent Memory reference, 76.1% with a full extraction pipeline).
 
 

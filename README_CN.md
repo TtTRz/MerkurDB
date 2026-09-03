@@ -81,13 +81,13 @@ curl localhost:1934/v1/health
 
 `merkur-eval` harness（`crates/eval`，MIT）对运行中的真实服务端到端跑两个公开 benchmark —— 与真实客户端同一条 serving 路径 —— 并输出逐题 JSONL 明细，每个数字都可审计。
 
-| Benchmark | 指标 | MerkurDB | 参照 |
-|---|---|---|---|
-| LoCoMo（1,986 题） | QA 准确率（LLM 裁判） | **64.8%** | mem0 论文 66.9%（GPT-4 级答题 + 完整抽取管线） |
-| LoCoMo | 检索 hit@30 / 覆盖率 | **0.762 / 0.703** | — |
-| PersonaMem 32k（589 选择题） | 准确率 | **73.2%** | 前沿 LLM 全上下文 ~52%；TencentDB Agent Memory 76.1%（同答题模型，完整管线） |
+| Benchmark | 指标 | MerkurDB（裸写入） | MerkurDB（开启巩固管线） | 参照 |
+|---|---|---|---|---|
+| LoCoMo（1,986 题） | QA 准确率（LLM 裁判） | 64.8% | **68.3%** | mem0 论文 66.9%（GPT-4 级答题 + 完整抽取管线） |
+| LoCoMo | 检索 hit@30 / 覆盖率 | 0.762 / 0.703 | **0.816 / 0.759** | — |
+| PersonaMem 32k（589 选择题） | 准确率 | **73.2%** | — | 前沿 LLM 全上下文 ~52%；TencentDB Agent Memory 76.1%（同答题模型，完整管线） |
 
-测量条件：原始对话轮次直接写入（未开巩固管线）+ 轻量答题模型（LoCoMo 裁判 `deepseek-v4-flash-vision-exp`，PersonaMem 答题 `kimi-k2.5`）；裁判/答题模型差异使跨论文数字为近似对比。harness 设计：免 LLM 的检索召回轨（对照 evidence 标注评分）、裁判打分的 QA 轨（对抗题拒答判对）、PersonaMem 的 in-situ checkpoint 回放（无未来信息泄漏）。
+开启巩固管线（LLM 摘要 + 重要性 + 建边，裁决关闭）使 LoCoMo QA +3.5pt、检索 hit@30 +5.4pt：importance 方差让复合分重排在 top-k 截断时把更靠谱的记忆推进前列。其余测量条件：原始对话轮次写入 + 轻量答题模型（LoCoMo 裁判 `deepseek-v4-flash-vision-exp`，PersonaMem 答题 `kimi-k2.5`）；裁判/答题模型差异使跨论文数字为近似对比。harness 设计：免 LLM 的检索召回轨（对照 evidence 标注评分）、裁判打分的 QA 轨（对抗题拒答判对）、PersonaMem 的 in-situ checkpoint 回放（无未来信息泄漏）。
 
 ```bash
 scripts/fetch_locomo.sh          # 数据集（CC BY-NC / MIT，gitignored）

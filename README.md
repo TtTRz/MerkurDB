@@ -81,13 +81,13 @@ Design properties:
 
 The `merkur-eval` harness (`crates/eval`, MIT) runs two public benchmarks end-to-end against a live server — the same serving path real clients use — and writes per-question JSONL dumps so every number is auditable.
 
-| Benchmark | Metric | MerkurDB | Reference points |
-|---|---|---|---|
-| LoCoMo (1,986 QA) | QA accuracy (LLM-judged) | **64.8%** | mem0 paper 66.9% (GPT-4-class answerer + full extraction pipeline) |
-| LoCoMo | retrieval hit@30 / coverage | **0.762 / 0.703** | — |
-| PersonaMem 32k (589 MC QA) | accuracy | **73.2%** | frontier LLMs full-context ~52%; TencentDB Agent Memory 76.1% (same answer model, full pipeline) |
+| Benchmark | Metric | MerkurDB (raw ingest) | MerkurDB (consolidation on) | Reference points |
+|---|---|---|---|---|
+| LoCoMo (1,986 QA) | QA accuracy (LLM-judged) | 64.8% | **68.3%** | mem0 paper 66.9% (GPT-4-class answerer + full extraction pipeline) |
+| LoCoMo | retrieval hit@30 / coverage | 0.762 / 0.703 | **0.816 / 0.759** | — |
+| PersonaMem 32k (589 MC QA) | accuracy | **73.2%** | — | frontier LLMs full-context ~52%; TencentDB Agent Memory 76.1% (same answer model, full pipeline) |
 
-Measured with raw dialog-turn ingest (no consolidation pipeline) and lightweight answer models (`deepseek-v4-flash-vision-exp` judge on LoCoMo, `kimi-k2.5` on PersonaMem); judge/answer-model choices make cross-paper numbers approximate. Harness design: LLM-free retrieval-recall track scored against LoCoMo evidence annotations, judge-graded QA track (adversarial questions score abstention as correct), and in-situ checkpoint replay for PersonaMem (no future-turn leakage).
+Enabling the consolidation pipeline (LLM abstracts + importance + edges, adjudication off) lifts LoCoMo QA by +3.5pt and retrieval hit@30 by +5.4pt over raw-turn ingest: importance variance lets the composite re-rank promote better candidates into the top-k cut. Measured otherwise with raw dialog-turn ingest and lightweight answer models (`deepseek-v4-flash-vision-exp` judge on LoCoMo, `kimi-k2.5` on PersonaMem); judge/answer-model choices make cross-paper numbers approximate. Harness design: LLM-free retrieval-recall track scored against LoCoMo evidence annotations, judge-graded QA track (adversarial questions score abstention as correct), and in-situ checkpoint replay for PersonaMem (no future-turn leakage).
 
 ```bash
 scripts/fetch_locomo.sh          # datasets (CC BY-NC / MIT, gitignored)
