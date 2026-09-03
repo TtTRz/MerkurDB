@@ -4,8 +4,17 @@
 # restarts the server per config (env-overridden fusion params) and runs
 # recall only — no judge, no re-ingest, ranking-only comparison.
 #
-#   scripts/sweep_fusion.sh            # full sweep (ingest once + 9 recalls)
+#   scripts/sweep_fusion.sh            # full sweep (ingest once + recalls)
 #   scripts/sweep_fusion.sh --no-ingest # skip phase A (corpus already built)
+#
+# Knobs:
+#   MERKUR_EVAL_TUNE_DIR       corpus dir (default crates/eval/data/tune;
+#                              use a different dir per pipeline variant)
+#   MERKUR_EVAL_CONSOLIDATOR   "llm" = ingest with the extraction pipeline on
+#                              (drain before measuring; composite-weight
+#                              sweeps are only meaningful on such a corpus)
+#   MERKUR_EVAL_CONSOL_*       consolidator chat endpoint (defaults to CHAT_*)
+#   MERKUR_EVAL_LIMIT / _JOBS  recall depth / concurrency
 #
 # Corpus persistence note: access_count drifts as recalls run, but with the
 # forgetting tick parked the drifted counts never feed ranking — every config
@@ -13,7 +22,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TUNE_DIR="$ROOT/crates/eval/data/tune"
+TUNE_DIR="${MERKUR_EVAL_TUNE_DIR:-$ROOT/crates/eval/data/tune}"
 DB="$TUNE_DIR/merkur.db"
 LIMIT="${MERKUR_EVAL_LIMIT:-30}"
 JOBS="${MERKUR_EVAL_JOBS:-8}"
@@ -36,6 +45,28 @@ trap stop_server EXIT
 
 boot() {
   # $1 = log tag (server stderr is appended to the sweep output)
+  local consolidator_block='  consolidator:
+    type: "noop"'
+  local consolidation_knobs="consolidation:
+  interval_seconds: 86400"
+  if [ "${MERKUR_EVAL_CONSOLIDATOR:-}" = "llm" ]; then
+    local consol_base="${MERKUR_EVAL_CONSOL_BASE_URL:-${MERKUR_EVAL_CHAT_BASE_URL:-}}"
+    local consol_key="${MERKUR_EVAL_CONSOL_API_KEY:-${MERKUR_EVAL_CHAT_API_KEY:-}}"
+    local consol_model="${MERKUR_EVAL_CONSOL_MODEL:-${MERKUR_EVAL_CHAT_MODEL:-}}"
+    : "${consol_base:?llm consolidator needs MERKUR_EVAL_CONSOL_* or CHAT_* env}"
+    consolidator_block="  consolidator:
+    type: \"llm\"
+    llm:
+      base_url: \"$consol_base\"
+      api_key: \"$consol_key\"
+      model: \"$consol_model\"
+      backend: \"openai\"
+      timeout_seconds: 600"
+    consolidation_knobs="consolidation:
+  interval_seconds: 5
+  batch_size: 100
+  adjudication_candidates: 0"
+  fi
   cat > "$TUNE_DIR/config.yaml" <<EOF
 server:
   host: "127.0.0.1"
@@ -52,12 +83,10 @@ plugins:
       base_url: "$MERKUR_EVAL_EMBED_BASE_URL"
       api_key: "$MERKUR_EVAL_EMBED_API_KEY"
       model: "$MERKUR_EVAL_EMBED_MODEL"
-  consolidator:
-    type: "noop"
+$consolidator_block
 auth:
   tokens: ["$TOKEN"]
-consolidation:
-  interval_seconds: 86400
+$consolidation_knobs
 forgetting:
   interval_seconds: 86400
 logging:
@@ -90,24 +119,37 @@ else
   rm -f "$DB" "$DB-shm" "$DB-wal"
   boot ingest
   "$EVAL_BIN" --server "http://127.0.0.1:$PORT" --token "$TOKEN" ingest
+  if [ "${MERKUR_EVAL_CONSOLIDATOR:-}" = "llm" ]; then
+    echo "== draining consolidation queue"
+    for i in $(seq 1 2880); do
+      PENDING=$(curl -fs -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/v1/status" | python3 -c "import json,sys; print(json.load(sys.stdin)['pending_consolidation'])")
+      [ "$PENDING" = "0" ] && break
+      if [ "$i" = "2880" ]; then
+        echo "consolidation did not drain within 4 h — aborting" >&2
+        exit 1
+      fi
+      if [ "$((i % 60))" = "0" ]; then echo "   pending: $PENDING"; fi
+      sleep 5
+    done
+    echo "== consolidation drained"
+  fi
   stop_server
 fi
 
 # ── phase B: sweep (restart per config, same db) ──
-echo "== phase B: fusion sweep (limit=$LIMIT jobs=$JOBS)"
+echo "== phase B: sweep (limit=$LIMIT jobs=$JOBS)"
 
 boot default
 recall default
-# Pure channels need no restart — mode is a per-request knob.
-recall vec-only --mode vector
-recall bm25-only --mode bm25
 stop_server
 
-MERKUR_RETRIEVAL__FUSION__RRF_K=20 boot k20 && recall k20; stop_server
-MERKUR_RETRIEVAL__FUSION__RRF_K=100 boot k100 && recall k100; stop_server
-MERKUR_RETRIEVAL__FUSION__BM25_WEIGHT=1.5 boot bm25x15 && recall bm25x15; stop_server
-MERKUR_RETRIEVAL__FUSION__VECTOR_WEIGHT=1.5 boot vecx15 && recall vecx15; stop_server
-MERKUR_RETRIEVAL__FUSION__BM25_WEIGHT=2.0 boot bm25x2 && recall bm25x2; stop_server
-MERKUR_RETRIEVAL__FUSION__VECTOR_WEIGHT=2.0 boot vecx2 && recall vecx2; stop_server
+# Composite score-weight sweep (meaningful on a consolidator corpus where
+# importance varies). search/weight/importance shares via env overrides.
+MERKUR_RETRIEVAL__FUSION__SCORE_SEARCH=1.0 MERKUR_RETRIEVAL__FUSION__SCORE_WEIGHT=0.0 MERKUR_RETRIEVAL__FUSION__SCORE_IMPORTANCE=0.0 boot sw_rel_only && recall sw_rel_only; stop_server
+MERKUR_RETRIEVAL__FUSION__SCORE_SEARCH=0.6 MERKUR_RETRIEVAL__FUSION__SCORE_WEIGHT=0.2 MERKUR_RETRIEVAL__FUSION__SCORE_IMPORTANCE=0.2 boot sw_622 && recall sw_622; stop_server
+MERKUR_RETRIEVAL__FUSION__SCORE_SEARCH=0.4 MERKUR_RETRIEVAL__FUSION__SCORE_WEIGHT=0.3 MERKUR_RETRIEVAL__FUSION__SCORE_IMPORTANCE=0.3 boot sw_433 && recall sw_433; stop_server
+MERKUR_RETRIEVAL__FUSION__SCORE_SEARCH=0.7 MERKUR_RETRIEVAL__FUSION__SCORE_WEIGHT=0.15 MERKUR_RETRIEVAL__FUSION__SCORE_IMPORTANCE=0.15 boot sw_715 && recall sw_715; stop_server
+MERKUR_RETRIEVAL__FUSION__SCORE_SEARCH=0.5 MERKUR_RETRIEVAL__FUSION__SCORE_WEIGHT=0.0 MERKUR_RETRIEVAL__FUSION__SCORE_IMPORTANCE=0.5 boot sw_imp50 && recall sw_imp50; stop_server
+MERKUR_RETRIEVAL__FUSION__SCORE_SEARCH=0.5 MERKUR_RETRIEVAL__FUSION__SCORE_WEIGHT=0.5 MERKUR_RETRIEVAL__FUSION__SCORE_IMPORTANCE=0.0 boot sw_w50 && recall sw_w50; stop_server
 
 echo "== done; reports in $TUNE_DIR/sweep_*.json"
