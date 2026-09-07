@@ -54,6 +54,14 @@ boot() {
     local consol_key="${MERKUR_EVAL_CONSOL_API_KEY:-${MERKUR_EVAL_CHAT_API_KEY:-}}"
     local consol_model="${MERKUR_EVAL_CONSOL_MODEL:-${MERKUR_EVAL_CHAT_MODEL:-}}"
     : "${consol_base:?llm consolidator needs MERKUR_EVAL_CONSOL_* or CHAT_* env}"
+    # Preflight: a 1-token call catches a dead endpoint (402/quota/auth) in
+    # seconds instead of after a stalled drain.
+    if ! curl -fs -m 30 "$consol_base/v1/chat/completions" \
+        -H "Authorization: Bearer $consol_key" -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$consol_model\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" >/dev/null; then
+      echo "consolidator LLM preflight FAILED ($consol_base model=$consol_model) — check balance/key" >&2
+      exit 1
+    fi
     consolidator_block="  consolidator:
     type: \"llm\"
     llm:
@@ -111,27 +119,49 @@ recall() {
     --json "$TUNE_DIR/sweep_${tag}.json" 2>&1 | grep -E "^overall|^category|errors"
 }
 
+drain() {
+  echo "== draining consolidation queue"
+  local last_pending=-1 stuck=0
+  for i in $(seq 1 2880); do
+    PENDING=$(curl -fs -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/v1/status" | python3 -c "import json,sys; print(json.load(sys.stdin)['pending_consolidation'])")
+    [ "$PENDING" = "0" ] && break
+    # Stall detector: pending flat for 25 min (>2 max-timeout ticks at 600s)
+    # means the LLM endpoint is dead — abort loudly instead of burning 4 h.
+    if [ "$PENDING" = "$last_pending" ]; then
+      stuck=$((stuck + 1))
+      if [ "$stuck" -ge 300 ]; then
+        echo "consolidation stalled at pending=$PENDING for 25 min — check LLM endpoint/balance, aborting" >&2
+        exit 1
+      fi
+    else
+      stuck=0; last_pending=$PENDING
+    fi
+    if [ "$i" = "2880" ]; then
+      echo "consolidation did not drain within 4 h — aborting" >&2
+      exit 1
+    fi
+    if [ "$((i % 60))" = "0" ]; then echo "   pending: $PENDING"; fi
+    sleep 5
+  done
+  echo "== consolidation drained"
+}
+
 # ── phase A: persistent corpus ──
 if [ "${1:-}" = "--no-ingest" ] && [ -f "$DB" ]; then
   echo "== ingest skipped (corpus exists: $DB)"
+  # A previous run may have died mid-drain: finish it before measuring.
+  if [ "${MERKUR_EVAL_CONSOLIDATOR:-}" = "llm" ]; then
+    boot drain
+    drain
+    stop_server
+  fi
 else
   echo "== phase A: ingest (persistent corpus at $DB)"
   rm -f "$DB" "$DB-shm" "$DB-wal"
   boot ingest
   "$EVAL_BIN" --server "http://127.0.0.1:$PORT" --token "$TOKEN" ingest
   if [ "${MERKUR_EVAL_CONSOLIDATOR:-}" = "llm" ]; then
-    echo "== draining consolidation queue"
-    for i in $(seq 1 2880); do
-      PENDING=$(curl -fs -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/v1/status" | python3 -c "import json,sys; print(json.load(sys.stdin)['pending_consolidation'])")
-      [ "$PENDING" = "0" ] && break
-      if [ "$i" = "2880" ]; then
-        echo "consolidation did not drain within 4 h — aborting" >&2
-        exit 1
-      fi
-      if [ "$((i % 60))" = "0" ]; then echo "   pending: $PENDING"; fi
-      sleep 5
-    done
-    echo "== consolidation drained"
+    drain
   fi
   stop_server
 fi
