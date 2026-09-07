@@ -165,18 +165,21 @@ pub fn insert_edge(pool: &Pool<SqliteConnectionManager>, edge: &NewEdge) -> Merk
 
 /// BFS expand from seed IDs using the edges table.
 ///
-/// Seed IDs flow into SQL as a JSON array parameter (fully parameterized — no
-/// string concatenation). Cycle detection uses a delimited path string
+/// Seeds are `(id, relevance)` pairs flowing into SQL as one JSON array
+/// parameter (fully parameterized — no string concatenation). The relevance
+/// anchors diffusion: a path's weight starts from the seed's own score
+/// instead of 1.0, so neighbors of a weak seed cannot outrank neighbors of
+/// a strong one. Cycle detection uses a delimited path string
 /// (`,id1,id2,` → substring match of `,id,`) so that IDs which are prefixes of
 /// other IDs cannot cause false cycle hits.
 pub fn bfs_expand(
     pool: &Pool<SqliteConnectionManager>,
-    seed_ids: &[String],
+    seeds: &[(String, f64)],
     namespace: Option<&str>,
     depth: usize,
     degree_limit: usize,
 ) -> MerkurResult<Vec<ScoredMemory>> {
-    if seed_ids.is_empty() || depth == 0 {
+    if seeds.is_empty() || depth == 0 {
         return Ok(Vec::new());
     }
 
@@ -184,8 +187,8 @@ pub fn bfs_expand(
     let depth = depth.min(merkur_core::limits::MAX_BFS_DEPTH);
     let degree_limit = degree_limit.min(merkur_core::limits::MAX_BFS_DEGREE);
 
-    let seeds_json = serde_json::to_string(seed_ids)
-        .map_err(|e| MerkurError::Storage(format!("Failed to encode seed ids: {e}")))?;
+    let seeds_json = serde_json::to_string(seeds)
+        .map_err(|e| MerkurError::Storage(format!("Failed to encode seeds: {e}")))?;
 
     let conn = pool
         .get()
@@ -207,8 +210,12 @@ pub fn bfs_expand(
     };
     let sql = format!("WITH RECURSIVE
             bfs(id, d, w, path) AS (
-                SELECT value, 0, 1.0, ',' || value || ','
-                FROM (SELECT DISTINCT value FROM json_each(?1))
+                SELECT key_id, 0, MAX(score), ',' || key_id || ','
+                FROM (
+                    SELECT value ->> 0 AS key_id, CAST(value ->> 1 AS REAL) AS score
+                    FROM json_each(?1)
+                )
+                GROUP BY key_id
                 UNION
                 SELECT
                     CASE WHEN e.source_id = bfs.id THEN e.target_id ELSE e.source_id END,

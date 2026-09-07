@@ -637,12 +637,12 @@ impl Storage for LanceDbStorage {
 
     async fn bfs_expand(
         &self,
-        seed_ids: &[String],
+        seeds: &[(String, f64)],
         depth: usize,
         degree_limit: usize,
     ) -> MerkurResult<Vec<ScoredMemory>> {
         // Legacy cross-bucket traversal.
-        let seeds = seed_ids.to_vec();
+        let seeds = seeds.to_vec();
         let pool = self.sqlite_pool.clone();
         run_blocking(move || sqlite_helpers::bfs_expand(&pool, &seeds, None, depth, degree_limit))
             .await
@@ -650,12 +650,12 @@ impl Storage for LanceDbStorage {
 
     async fn bfs_expand_ns(
         &self,
-        seed_ids: &[String],
+        seeds: &[(String, f64)],
         namespace: &str,
         depth: usize,
         degree_limit: usize,
     ) -> MerkurResult<Vec<ScoredMemory>> {
-        let seeds = seed_ids.to_vec();
+        let seeds = seeds.to_vec();
         let namespace = namespace.to_string();
         let pool = self.sqlite_pool.clone();
         run_blocking(move || {

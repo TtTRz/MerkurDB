@@ -256,6 +256,57 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn test_deep_search_includes_vector_seeds() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        // No edges exist: diffusion has nothing to expand, so anything
+        // returned must be a vector seed. Regression: deep mode used to
+        // drop its own seeds (BFS anchor filtered at d > 0), answering
+        // "neighbors of the answer" instead of the answer.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/write")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"content":"deep seed inclusion probe"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let id = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = app
+            .oneshot(
+                Request::get(
+                    "/v1/search?q=deep+seed+inclusion+probe&mode=deep&score_threshold=0.0",
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ids: Vec<&str> = json["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["id"].as_str())
+            .collect();
+        assert!(
+            ids.contains(&id.as_str()),
+            "deep mode must serve its own vector seeds; got {ids:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_relate_self_edge_rejected() {
         let state = test_app().await;
         let app = router::create_router(state);

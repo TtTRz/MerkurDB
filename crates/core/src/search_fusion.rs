@@ -718,7 +718,7 @@ mod tests {
         }
         async fn bfs_expand(
             &self,
-            _: &[String],
+            _: &[(String, f64)],
             _: usize,
             _: usize,
         ) -> MerkurResult<Vec<ScoredMemory>> {
@@ -726,7 +726,7 @@ mod tests {
         }
         async fn bfs_expand_ns(
             &self,
-            _: &[String],
+            _: &[(String, f64)],
             _: &str,
             _: usize,
             _: usize,

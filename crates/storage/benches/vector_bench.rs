@@ -156,7 +156,7 @@ fn bench_bfs_expand(c: &mut Criterion) {
     c.bench_function("bfs_expand_1k_depth3", |b| {
         b.iter(|| {
             rt.block_on(async {
-                let seeds = vec![ids[0].clone()];
+                let seeds = vec![(ids[0].clone(), 1.0)];
                 black_box(storage.bfs_expand(&seeds, 3, 100).await.unwrap());
             });
         });

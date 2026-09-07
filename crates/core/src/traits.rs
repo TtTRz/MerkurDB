@@ -144,18 +144,25 @@ pub trait Storage: Send + Sync {
     ) -> MerkurResult<HashMap<String, Vec<crate::Edge>>>;
 
     /// Graph traversal over **every** bucket (legacy, cross-bucket).
+    ///
+    /// `seeds` are `(id, relevance)` pairs: the relevance anchors diffusion,
+    /// so a neighbor's score decays from the seed's own score along the path
+    /// (`seed_score × edge-weight product`, plus a per-depth decay applied by
+    /// the backend). Returns **neighbors only** — the caller owns the seeds
+    /// and merges them if the semantics call for it (search does).
     async fn bfs_expand(
         &self,
-        seed_ids: &[String],
+        seeds: &[(String, f64)],
         depth: usize,
         degree_limit: usize,
     ) -> MerkurResult<Vec<ScoredMemory>>;
 
     /// Graph traversal restricted to one bucket: edges whose endpoints live
-    /// in other buckets are silently not followed.
+    /// in other buckets are silently not followed. Same seed semantics as
+    /// [`Storage::bfs_expand`].
     async fn bfs_expand_ns(
         &self,
-        seed_ids: &[String],
+        seeds: &[(String, f64)],
         namespace: &str,
         depth: usize,
         degree_limit: usize,

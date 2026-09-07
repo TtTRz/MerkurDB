@@ -2,7 +2,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use merkur_core::{MemoryLevel, SearchMode, limits};
+use merkur_core::{MemoryLevel, ScoredMemory, SearchMode, limits};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -106,15 +106,35 @@ pub async fn search(
                 .await?
         }
         SearchMode::Deep => {
+            // Deep = vector seeds + graph diffusion anchored to them. The
+            // seeds carry the query's relevance; dropping them (the old
+            // behavior) answered "neighbors of the answer" instead of the
+            // answer and collapsed benchmark recall from 0.81 to 0.17.
             let seeds = state
                 .storage
                 .vector_search_ns(&query_vec, &ns.0, limit)
                 .await?;
-            let seed_ids: Vec<String> = seeds.iter().map(|s| s.id.clone()).collect();
-            state
+            let seed_pairs: Vec<(String, f64)> =
+                seeds.iter().map(|s| (s.id.clone(), s.score)).collect();
+            let neighbors = state
                 .storage
-                .bfs_expand_ns(&seed_ids, &ns.0, depth, degree_limit)
-                .await?
+                .bfs_expand_ns(&seed_pairs, &ns.0, depth, degree_limit)
+                .await?;
+            // Direct hits dominate diffusion: a node reached both ways keeps
+            // the higher score, as does a node reachable from several seeds.
+            let mut by_id: std::collections::HashMap<String, ScoredMemory> =
+                seeds.into_iter().map(|s| (s.id.clone(), s)).collect();
+            for n in neighbors {
+                by_id
+                    .entry(n.id.clone())
+                    .and_modify(|e| {
+                        if n.score > e.score {
+                            e.score = n.score;
+                        }
+                    })
+                    .or_insert(n);
+            }
+            by_id.into_values().collect()
         }
     };
 

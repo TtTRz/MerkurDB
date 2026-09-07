@@ -98,10 +98,49 @@ async fn test_edge_and_bfs() -> MerkurResult<()> {
         })
         .await?;
 
-    let expanded = storage.bfs_expand(std::slice::from_ref(&a), 2, 20).await?;
+    let expanded = storage.bfs_expand(&[(a.clone(), 1.0)], 2, 20).await?;
     let ids: Vec<_> = expanded.iter().map(|m| m.id.clone()).collect();
     assert!(ids.contains(&b));
     assert!(ids.contains(&c));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_bfs_expand_anchors_diffusion_to_seed_score() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+
+    let a = storage
+        .insert_memory(&new_test_memory("seed A", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+    let b = storage
+        .insert_memory(&new_test_memory(
+            "neighbor B",
+            Some(vec![0.0, 1.0, 0.0, 0.0]),
+        ))
+        .await?;
+    storage
+        .insert_edge(&NewEdge {
+            source_id: a.clone(),
+            target_id: b.clone(),
+            weight: Some(1.0),
+            relation: None,
+            edge_type: EdgeType::Auto,
+        })
+        .await?;
+
+    let expanded = storage.bfs_expand(&[(a.clone(), 0.4)], 1, 20).await?;
+    let b_row = expanded
+        .iter()
+        .find(|m| m.id == b)
+        .expect("neighbor reachable");
+    // seed relevance 0.4 × edge weight 1.0 × depth-1 decay 0.5
+    assert!(
+        (b_row.score - 0.2).abs() < 1e-9,
+        "diffusion must anchor to the seed's score: got {}",
+        b_row.score
+    );
+    // The primitive stays neighbors-only; the caller owns the seeds.
+    assert!(!expanded.iter().any(|m| m.id == a));
     Ok(())
 }
 
@@ -792,7 +831,7 @@ async fn test_namespace_isolated_bfs() -> MerkurResult<()> {
         .await?;
 
     let expanded = storage
-        .bfs_expand_ns(&[a_ids[0].clone()], "alpha", 2, 20)
+        .bfs_expand_ns(&[(a_ids[0].clone(), 1.0)], "alpha", 2, 20)
         .await?;
     assert!(
         expanded.iter().all(|m| m.namespace == "alpha"),
@@ -836,7 +875,7 @@ async fn test_namespace_isolated_bfs_does_not_traverse_foreign_nodes() -> Merkur
     }
 
     let expanded = storage
-        .bfs_expand_ns(std::slice::from_ref(&a), "alpha", 3, 20)
+        .bfs_expand_ns(&[(a.clone(), 1.0)], "alpha", 3, 20)
         .await?;
     assert!(
         expanded.iter().all(|m| m.namespace == "alpha"),
@@ -952,7 +991,7 @@ async fn test_invalidated_memory_hidden_from_retrieval_but_auditable() -> Merkur
     );
     let graph = storage
         .bfs_expand_ns(
-            std::slice::from_ref(&keep),
+            &[(keep.clone(), 1.0)],
             merkur_core::DEFAULT_NAMESPACE,
             2,
             10,

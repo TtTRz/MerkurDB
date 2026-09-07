@@ -199,10 +199,12 @@ pub async fn get_graph(
         .unwrap_or_else(|| state.config.default_degree_limit())
         .clamp(1, limits::MAX_BFS_DEGREE);
 
-    let seeds = std::slice::from_ref(&id);
+    // Neutral relevance (1.0): a graph neighborhood view has no query, so
+    // diffusion decays only by depth and edge weight.
+    let seeds = [(id.clone(), 1.0)];
     let neighborhood = state
         .storage
-        .bfs_expand_ns(seeds, &ns.0, depth, degree_limit)
+        .bfs_expand_ns(&seeds, &ns.0, depth, degree_limit)
         .await?;
 
     let mut node_ids: HashSet<String> = neighborhood.iter().map(|m| m.id.clone()).collect();
