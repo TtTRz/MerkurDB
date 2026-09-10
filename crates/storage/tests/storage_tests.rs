@@ -227,6 +227,32 @@ async fn test_stats() -> MerkurResult<()> {
 }
 
 #[tokio::test]
+async fn test_stats_pending_excludes_invalidated() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+
+    storage
+        .insert_memory(&new_test_memory(
+            "pending and valid",
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+        ))
+        .await?;
+    let dead = storage
+        .insert_memory(&new_test_memory(
+            "pending then absorbed",
+            Some(vec![0.0, 1.0, 0.0, 0.0]),
+        ))
+        .await?;
+    storage.invalidate_memory(&dead, None).await?;
+
+    let stats = storage.stats().await?;
+    // Invalidated rows never become consolidation work again (list_pending
+    // excludes them); the status metric must match that semantics or every
+    // queue-drain wait spins on phantoms.
+    assert_eq!(stats.pending_consolidation, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_memory_exists() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
     let id = storage

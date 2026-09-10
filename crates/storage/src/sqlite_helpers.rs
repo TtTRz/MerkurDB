@@ -539,7 +539,10 @@ pub fn stats(pool: &Pool<SqliteConnectionManager>) -> MerkurResult<StorageStats>
 
     let pending_consolidation: usize = conn
         .query_row(
-            "SELECT COUNT(*) FROM memories WHERE pending_consolidation = 1",
+            // Match list_pending: invalidated rows are dead weight, never
+            // consolidation work — counting them makes drain-waits spin on
+            // phantoms that can never clear.
+            "SELECT COUNT(*) FROM memories WHERE pending_consolidation = 1 AND invalid_at IS NULL",
             [],
             |row| row.get(0),
         )
