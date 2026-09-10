@@ -228,7 +228,23 @@ impl OpenAiChat {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             api_key,
             model: model.into(),
-            client: reqwest::Client::new(),
+            // An unbounded default would let a dead-but-open socket (host
+            // sleep, VPN drop) hang a multi-hour batch run forever.
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(180))
+                .build()
+                .expect("reqwest client builds"),
+        }
+    }
+
+    /// Override the per-request timeout (tests, slow reasoning endpoints).
+    pub fn with_timeout(self, timeout: std::time::Duration) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(timeout)
+                .build()
+                .expect("reqwest client builds"),
+            ..self
         }
     }
 }
@@ -434,5 +450,33 @@ mod tests {
         assert_eq!(seen[0].2["model"], "judge-1");
         assert_eq!(seen[0].2["messages"][0]["content"], "sys");
         assert_eq!(seen[0].2["messages"][1]["content"], "usr");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_times_out_on_hung_endpoint() {
+        // A dead-but-open socket (host sleep, VPN drop) must surface as an
+        // error, not freeze a batch run: the endpoint answers after 500 ms,
+        // the client is capped at 50 ms.
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                axum::Json(serde_json::json!({
+                    "choices": [{"message": {"content": "late"}}]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let chat = OpenAiChat::new(format!("http://{addr}"), None, "m")
+            .with_timeout(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let result = chat.chat("sys", "usr").await;
+        assert!(result.is_err(), "hung endpoint must error, not hang");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 }

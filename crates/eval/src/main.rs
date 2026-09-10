@@ -92,6 +92,14 @@ enum Command {
         /// Contexts replayed concurrently (namespaces are isolated).
         #[arg(long, default_value_t = 4)]
         context_jobs: usize,
+        /// Wait for the consolidation queue to drain before answering each
+        /// checkpoint (use with an LLM consolidator pipeline).
+        #[arg(long)]
+        drain_consolidation: bool,
+        /// Serve distilled abstracts (when present) instead of raw turn
+        /// content to the answer model.
+        #[arg(long)]
+        serve_abstracts: bool,
         #[arg(long, env = "MERKUR_EVAL_CHAT_BASE_URL")]
         chat_base_url: String,
         #[arg(long, env = "MERKUR_EVAL_CHAT_API_KEY")]
@@ -347,6 +355,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             jobs,
             context,
             context_jobs,
+            drain_consolidation,
+            serve_abstracts,
             chat_base_url,
             chat_api_key,
             chat_model,
@@ -405,6 +415,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             *limit,
                             mode,
                             *jobs,
+                            *drain_consolidation,
+                            *serve_abstracts,
                         )
                         .await
                         {

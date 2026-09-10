@@ -108,6 +108,27 @@ async fn search_with_retry(
     Err(last_err.expect("retry loop always sets an error"))
 }
 
+/// Same retry discipline as [`search_with_retry`]: chat endpoints have bursty
+/// 429/timeout windows under concurrent load; one transient failure must not
+/// cost a benchmark question.
+async fn chat_with_retry(chat: &dyn ChatModel, system: &str, user: &str) -> RunResult<String> {
+    let mut delay = std::time::Duration::from_millis(200);
+    let mut last_err: Option<crate::llm::ChatError> = None;
+    for attempt in 0..3 {
+        match chat.chat(system, user).await {
+            Ok(reply) => return Ok(reply),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 2 {
+                    tokio::time::sleep(delay).await;
+                    delay *= 4;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("retry loop always sets an error").into())
+}
+
 fn ungated_params(limit: usize, mode: &str) -> SearchParams {
     SearchParams {
         mode: Some(mode.to_string()),
@@ -327,9 +348,9 @@ async fn qa_one(
     let resp = search_with_retry(client, &qa.question, params).await?;
     let memories: Vec<String> = resp.results.iter().map(|m| m.content.clone()).collect();
     let (sys, user) = build_answer_prompt_styled(&qa.question, &memories, style);
-    let prediction = chat.chat(&sys, &user).await?;
+    let prediction = chat_with_retry(chat, &sys, &user).await?;
     let (jsys, juser) = build_judge_prompt(&qa.question, &golden, &prediction, qa.is_adversarial());
-    let raw = chat.chat(&jsys, &juser).await?;
+    let raw = chat_with_retry(chat, &jsys, &juser).await?;
     Ok(Some(QaRecord {
         category: qa.category,
         verdict: parse_verdict(&raw),
@@ -465,6 +486,56 @@ pub fn score_pm(records: &[PmRecord]) -> PmReport {
 /// in ascending order, ingesting only the newly visible user/assistant
 /// messages, then answer that checkpoint's questions against the accumulated
 /// memories — no future leakage, minimal writes.
+/// Wait until the server's consolidation queue is empty, so a checkpoint's
+/// answers see the fully processed memory state (extraction + adjudication
+/// settle together: `pending_consolidation` clears only after the tick's
+/// adjudication ran). On budget exhaustion, log and proceed — answering
+/// against a partially processed pipeline is a valid measurement, a hung
+/// replay is not.
+async fn drain_consolidation(
+    client: &HttpMerkurClient,
+    label: &str,
+    poll: std::time::Duration,
+    budget: std::time::Duration,
+) {
+    let started = std::time::Instant::now();
+    loop {
+        match client.status().await {
+            Ok(s) if s.pending_consolidation == 0 => return,
+            Ok(s) => {
+                if started.elapsed() >= budget {
+                    eprintln!(
+                        "[pm] {label}: drain budget exhausted with {} pending — answering against partial pipeline state",
+                        s.pending_consolidation
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                if started.elapsed() >= budget {
+                    eprintln!("[pm] {label}: drain aborted after repeated status failures: {e}");
+                    return;
+                }
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
+/// What the answer model sees for one retrieved memory. Raw content is the
+/// baseline; with `serve_abstracts`, a pipeline-distilled abstract replaces
+/// the raw turn — the distilled-serving shape whose value C-pm measures.
+fn served_content(m: &merkur_core::ScoredMemory, serve_abstracts: bool) -> String {
+    if serve_abstracts
+        && let Some(a) = &m.abstract_
+        && !a.is_empty()
+    {
+        return a.clone();
+    }
+    m.content.clone()
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn pm_run_context(
     client: &HttpMerkurClient,
     chat: &dyn ChatModel,
@@ -473,6 +544,8 @@ pub async fn pm_run_context(
     limit: usize,
     mode: &str,
     jobs: usize,
+    drain: bool,
+    serve_abstracts: bool,
 ) -> RunResult<PmRun> {
     use crate::personamem::{build_mc_prompt, parse_choice};
 
@@ -509,6 +582,19 @@ pub async fn pm_run_context(
         }
         prev = Some(end);
 
+        // Pipeline runs must settle before questions: consolidation is
+        // asynchronous, and answers taken against a half-drained queue would
+        // measure the scheduler's latency instead of the pipeline's value.
+        if drain {
+            drain_consolidation(
+                client,
+                &format!("{}@{}", ctx.id, end),
+                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(20 * 60),
+            )
+            .await;
+        }
+
         // Answer this checkpoint's questions concurrently.
         let checkpoint_qs: Vec<&crate::personamem::PmQuestion> = questions
             .iter()
@@ -521,10 +607,13 @@ pub async fn pm_run_context(
                 let params = &params;
                 async move {
                     let resp = search_with_retry(client, &q.question, params).await?;
-                    let memories: Vec<String> =
-                        resp.results.iter().map(|m| m.content.clone()).collect();
+                    let memories: Vec<String> = resp
+                        .results
+                        .iter()
+                        .map(|m| served_content(m, serve_abstracts))
+                        .collect();
                     let (sys, user) = build_mc_prompt(&q.question, &q.options, &memories);
-                    let raw = chat.chat(&sys, &user).await?;
+                    let raw = chat_with_retry(chat, &sys, &user).await?;
                     let chosen = parse_choice(&raw, q.options.len());
                     Ok(PmRecord {
                         question_id: q.question_id.clone(),
@@ -611,7 +700,122 @@ mod tests {
         }
     }
 
-    // ── stub MerkurDB server ──
+    // ── drain (consolidation settle) ──
+
+    async fn spawn_status_stub(pending_sequence: Vec<usize>) -> (String, Arc<Mutex<usize>>) {
+        let polls = Arc::new(Mutex::new(0usize));
+        let polls_handler = polls.clone();
+        let app = axum::Router::new().route(
+            "/v1/status",
+            axum::routing::get(move || {
+                let polls = polls_handler.clone();
+                let pending_sequence = pending_sequence.clone();
+                async move {
+                    let mut n = polls.lock().unwrap();
+                    *n += 1;
+                    // The sequence's tail repeats forever: a stub either
+                    // settles at 0 (drain succeeds) or never does (budget).
+                    let pending = pending_sequence
+                        .get(*n - 1)
+                        .copied()
+                        .unwrap_or_else(|| *pending_sequence.last().unwrap());
+                    axum::Json(serde_json::json!({
+                        "total_memories": 10,
+                        "total_edges": 0,
+                        "pending_consolidation": pending,
+                        "by_level": {},
+                        "uptime_seconds": 1
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), polls)
+    }
+
+    #[tokio::test]
+    async fn drain_waits_until_pending_clears() {
+        let (base, polls) = spawn_status_stub(vec![7, 3, 0]).await;
+        let client = HttpMerkurClient::new(&base).unwrap();
+        drain_consolidation(
+            &client,
+            "test",
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            *polls.lock().unwrap(),
+            3,
+            "drain must keep polling until pending hits 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_gives_up_after_budget() {
+        let (base, _polls) = spawn_status_stub(vec![usize::MAX]).await;
+        let client = HttpMerkurClient::new(&base).unwrap();
+        let started = std::time::Instant::now();
+        drain_consolidation(
+            &client,
+            "test",
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a never-draining queue must not hang the replay"
+        );
+    }
+
+    // ── chat retry ──
+
+    struct FlakyChat {
+        fails_remaining: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::llm::ChatModel for FlakyChat {
+        async fn chat(&self, _system: &str, _user: &str) -> crate::llm::ChatResult<String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let fails = self
+                .fails_remaining
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if fails > 0 {
+                self.fails_remaining
+                    .store(fails - 1, std::sync::atomic::Ordering::SeqCst);
+                return Err(crate::llm::ChatError::Http("boom".into()));
+            }
+            Ok("recovered".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_retry_recovers_from_transient_failures() {
+        let chat = FlakyChat {
+            fails_remaining: std::sync::atomic::AtomicUsize::new(2),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let reply = chat_with_retry(&chat, "s", "u").await.unwrap();
+        assert_eq!(reply, "recovered");
+        assert_eq!(chat.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn chat_retry_gives_up_after_three_attempts() {
+        let chat = FlakyChat {
+            fails_remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(chat_with_retry(&chat, "s", "u").await.is_err());
+        assert_eq!(chat.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
 
     #[derive(Default)]
     struct StubState {
@@ -619,13 +823,20 @@ mod tests {
         search_queries: Vec<(Option<String>, String)>,
         /// When > 0, /v1/search replies 500 this many times before serving.
         search_failures_remaining: usize,
+        /// Serve distilled abstracts on results (pipeline corpus simulation).
+        with_abstracts: bool,
     }
 
-    fn scored_memory_json(id: &str, dia_id: &str, content: &str) -> serde_json::Value {
+    fn scored_memory_json(
+        id: &str,
+        dia_id: &str,
+        content: &str,
+        with_abstract: bool,
+    ) -> serde_json::Value {
         serde_json::json!({
             "id": id,
             "content": content,
-            "abstract": null,
+            "abstract": if with_abstract { serde_json::json!(format!("DISTILLED#{id}")) } else { serde_json::Value::Null },
             "score": 0.9,
             "weight": 1.0,
             "level": "full",
@@ -685,11 +896,12 @@ mod tests {
                                     .into_response();
                             }
                         }
+                        let with_abstracts = state.lock().unwrap().with_abstracts;
                         axum::Json(serde_json::json!({
                             "mode": "hybrid",
                             "results": [
-                                scored_memory_json("mem_1", "D1:1", "[8 May, 2023] Caroline: hello"),
-                                scored_memory_json("mem_2", "D1:2", "[8 May, 2023] Melanie: hi there"),
+                                scored_memory_json("mem_1", "D1:1", "[8 May, 2023] Caroline: hello", with_abstracts),
+                                scored_memory_json("mem_2", "D1:2", "[8 May, 2023] Melanie: hi there", with_abstracts),
                             ],
                             "total": 2,
                             "time_ms": 1,
@@ -1121,7 +1333,7 @@ mod tests {
         let (ctx, qs) = pm_fixture();
         let refs: Vec<&crate::personamem::PmQuestion> = qs.iter().collect();
         let chat = MockChat::with_handler(pm_handler);
-        let run = pm_run_context(&client, &chat, &ctx, &refs, 10, "hybrid", 2)
+        let run = pm_run_context(&client, &chat, &ctx, &refs, 10, "hybrid", 2, false, false)
             .await
             .unwrap();
 
@@ -1158,6 +1370,53 @@ mod tests {
             .unwrap();
         assert_eq!(t.questions, 2);
         assert_eq!(t.correct, 1);
+    }
+
+    #[tokio::test]
+    async fn pm_serves_abstracts_only_when_enabled() {
+        // Corpus where every result carries a distilled abstract (pipeline on).
+        let mk_state = || {
+            Arc::new(Mutex::new(StubState {
+                with_abstracts: true,
+                ..Default::default()
+            }))
+        };
+        let (ctx, qs) = pm_fixture();
+        let refs: Vec<&crate::personamem::PmQuestion> = qs.iter().collect();
+
+        // Flag off: raw content reaches the answer prompt (baseline shape).
+        let base = spawn_stub(mk_state()).await;
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("pm-ctxA");
+        let chat = MockChat::with_handler(pm_handler);
+        pm_run_context(&client, &chat, &ctx, &refs, 10, "hybrid", 2, false, false)
+            .await
+            .unwrap();
+        let seen = chat.seen();
+        assert!(
+            seen[0].1.contains("Caroline: hello"),
+            "flag off must serve raw content: {}",
+            seen[0].1
+        );
+        assert!(!seen[0].1.contains("DISTILLED"));
+
+        // Flag on: the distilled form replaces raw turns in the prompt.
+        let base = spawn_stub(mk_state()).await;
+        let client = HttpMerkurClient::new(&base)
+            .unwrap()
+            .with_namespace("pm-ctxA");
+        let chat = MockChat::with_handler(pm_handler);
+        pm_run_context(&client, &chat, &ctx, &refs, 10, "hybrid", 2, false, true)
+            .await
+            .unwrap();
+        let seen = chat.seen();
+        assert!(
+            seen[0].1.contains("DISTILLED"),
+            "flag on must serve abstracts: {}",
+            seen[0].1
+        );
+        assert!(!seen[0].1.contains("[8 May, 2023] Caroline: hello"));
     }
 
     #[test]
