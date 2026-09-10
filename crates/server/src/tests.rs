@@ -944,6 +944,71 @@ mod integration {
         let pm = state.storage.get_memory(&p).await.unwrap().unwrap();
         assert!(pm.invalid_at.is_none());
     }
+
+    /// Below-floor candidate sets can never execute a verdict (the dual-signal
+    /// rule gates execution on cosine >= floor), so the LLM adjudication call
+    /// must be skipped entirely — it is pure cost.
+    #[tokio::test]
+    async fn test_consolidation_skips_adjudication_call_below_floor() {
+        struct CountingConsolidator {
+            calls: std::sync::atomic::AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl merkur_core::Consolidator for CountingConsolidator {
+            async fn consolidate(
+                &self,
+                _memories: &[merkur_core::Memory],
+            ) -> merkur_core::MerkurResult<merkur_core::ConsolidationReport> {
+                Ok(merkur_core::ConsolidationReport::empty())
+            }
+
+            async fn adjudicate(
+                &self,
+                _pending: &merkur_core::Memory,
+                _candidates: &[merkur_core::ScoredMemory],
+            ) -> merkur_core::MerkurResult<merkur_core::Adjudication> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(merkur_core::Adjudication::default())
+            }
+        }
+
+        let state = test_app().await;
+        // Orthogonal axes -> cosine ~0.0, far below the 0.6 floor.
+        let x = state
+            .storage
+            .insert_memory(&gov_memory("the deploy region is us-east", 1.0, 0.0))
+            .await
+            .unwrap();
+        state
+            .storage
+            .mark_consolidated(std::slice::from_ref(&x))
+            .await
+            .unwrap();
+        let _p = state
+            .storage
+            .insert_memory(&gov_memory("favorite tea is chamomile", 0.0, 1.0))
+            .await
+            .unwrap();
+
+        let consolidator = CountingConsolidator {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let _report = crate::scheduler::Scheduler::run_consolidation_once(
+            &*state.storage,
+            &consolidator,
+            10,
+            0.6,
+            5,
+        )
+        .await;
+
+        assert_eq!(
+            consolidator.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no candidate clears the floor; adjudication must not be called"
+        );
+    }
     /// Write-governance retention (Q7): the forgetting tick hard-deletes rows
     /// whose invalid_at is older than purge_invalidated_days — and must do so
     /// even when no forgetting candidates exist (invalidated rows are

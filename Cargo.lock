@@ -3672,6 +3672,7 @@ dependencies = [
  "axum",
  "chrono",
  "figment",
+ "futures",
  "governor",
  "merkur-consolidators",
  "merkur-core",

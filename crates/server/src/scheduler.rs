@@ -153,7 +153,16 @@ impl Scheduler {
         // nearest neighbors in the same bucket. UPDATE/DELETE are destructive,
         // so an LLM verdict alone is never enough — it executes only when the
         // pair's cosine similarity clears `adjudication_floor`.
+        //
+        // Candidates are pre-filtered by that floor: a set with no pair above
+        // it can never execute, so the adjudication call is skipped as pure
+        // cost. Verdict *gathering* (candidate search + LLM call, both
+        // read-only) runs concurrently; verdict *execution* (absorb /
+        // invalidate writes) runs serially in pending order so two verdicts
+        // cannot race on the same target.
         if adjudication_candidates > 0 {
+            const ADJUDICATION_CONCURRENCY: usize = 4;
+
             let pending_ids: Vec<String> = pending.iter().map(|m| m.id.clone()).collect();
             let embeddings = match storage.get_embeddings(&pending_ids).await {
                 Ok(e) => e,
@@ -162,38 +171,74 @@ impl Scheduler {
                     Default::default()
                 }
             };
-            for memory in &pending {
-                let Some(embedding) = embeddings.get(&memory.id) else {
-                    continue;
-                };
-                let hits = match storage
-                    .vector_search_ns(embedding, &memory.namespace, adjudication_candidates + 1)
-                    .await
-                {
-                    Ok(h) => h,
-                    Err(e) => {
-                        error!(
-                            "Adjudication candidate search failed for {}: {e}",
-                            memory.id
-                        );
-                        continue;
-                    }
-                };
-                let candidates: Vec<_> = hits
-                    .into_iter()
-                    .filter(|h| h.id != memory.id)
-                    .take(adjudication_candidates)
+
+            // (pending index, verdict, above-floor candidates, adjudication failed)
+            type Gathered = (
+                usize,
+                merkur_core::Adjudication,
+                Vec<merkur_core::ScoredMemory>,
+                bool,
+            );
+            let embeddings = &embeddings;
+            let mut gathered: Vec<Gathered> = Vec::new();
+            let indexed: Vec<(usize, &merkur_core::Memory)> = pending.iter().enumerate().collect();
+            for chunk in indexed.chunks(ADJUDICATION_CONCURRENCY) {
+                let futs: Vec<_> = chunk
+                    .iter()
+                    .map(|&(index, memory)| async move {
+                        let embedding = embeddings.get(&memory.id)?;
+                        let hits = match storage
+                            .vector_search_ns(
+                                embedding,
+                                &memory.namespace,
+                                adjudication_candidates + 1,
+                            )
+                            .await
+                        {
+                            Ok(h) => h,
+                            Err(e) => {
+                                error!(
+                                    "Adjudication candidate search failed for {}: {e}",
+                                    memory.id
+                                );
+                                return None;
+                            }
+                        };
+                        let candidates: Vec<_> = hits
+                            .into_iter()
+                            .filter(|h| h.id != memory.id && h.score >= adjudication_floor)
+                            .take(adjudication_candidates)
+                            .collect();
+                        if candidates.is_empty() {
+                            return None;
+                        }
+                        match consolidator.adjudicate(memory, &candidates).await {
+                            Ok(verdict) => Some((index, verdict, candidates, false)),
+                            Err(e) => {
+                                error!("Adjudication failed for {}: {e}", memory.id);
+                                Some((
+                                    index,
+                                    merkur_core::Adjudication::default(),
+                                    Vec::new(),
+                                    true,
+                                ))
+                            }
+                        }
+                    })
                     .collect();
-                if candidates.is_empty() {
+                gathered.extend(futures::future::join_all(futs).await.into_iter().flatten());
+            }
+
+            // Execute in pending order, exactly as a serial loop would.
+            gathered.sort_by_key(|(index, _, _, _)| *index);
+            for (index, verdict, candidates, failed) in gathered {
+                if failed {
+                    report.errors += 1;
                     continue;
                 }
-                let verdict = match consolidator.adjudicate(memory, &candidates).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("Adjudication failed for {}: {e}", memory.id);
-                        report.errors += 1;
-                        continue;
-                    }
+                let memory = &pending[index];
+                let Some(embedding) = embeddings.get(&memory.id) else {
+                    continue;
                 };
                 let score_of = |id: &str| candidates.iter().find(|c| c.id == id).map(|c| c.score);
                 match verdict.action {
