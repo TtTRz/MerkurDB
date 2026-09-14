@@ -253,6 +253,28 @@ async fn test_stats_pending_excludes_invalidated() -> MerkurResult<()> {
 }
 
 #[tokio::test]
+async fn test_consolidation_log_records_governance_counts() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+
+    let mut report = merkur_core::ConsolidationReport::empty();
+    report.memories_processed = 10;
+    report.edges_created = 3;
+    report.absorptions = 2;
+    report.invalidations = 1;
+    storage
+        .log_consolidation(chrono::Utc::now(), chrono::Utc::now(), &report)
+        .await?;
+
+    let entries = storage.get_consolidation_log(10).await?;
+    assert_eq!(entries.len(), 1);
+    // The audit trail is incomplete without the governance half of the tick:
+    // absorptions and invalidations must persist alongside processed/edges.
+    assert_eq!(entries[0].absorptions, 2);
+    assert_eq!(entries[0].invalidations, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_stats_groups_by_namespace() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
     storage
@@ -977,7 +999,10 @@ async fn test_migration_v5_backfills_valid_at() -> MerkurResult<()> {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(v, "5");
+    // Version-agnostic: this scenario only requires the v5 backfill to have
+    // run; later migrations may raise the stored version further.
+    let v: i64 = v.parse().expect("schema_version is an integer");
+    assert!(v >= 5, "v5 backfill must have run; stored version {v}");
     Ok(())
 }
 

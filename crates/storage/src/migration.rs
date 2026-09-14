@@ -4,7 +4,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use tracing::info;
 
-const CURRENT_VERSION: i64 = 5;
+const CURRENT_VERSION: i64 = 6;
 
 const META_DDL: &str = "
 CREATE TABLE IF NOT EXISTS merkur_meta (
@@ -78,8 +78,11 @@ pub fn migrate(pool: &Pool<SqliteConnectionManager>) -> MerkurResult<()> {
     if version < 5 {
         migrate_step(&mut conn, 5, run_v5)?;
     }
+    if version < 6 {
+        migrate_step(&mut conn, 6, run_v6)?;
+    }
     // Future migrations go here:
-    // if version < 6 { migrate_step(&mut conn, 6, run_v6)?; }
+    // if version < 7 { migrate_step(&mut conn, 7, run_v7)?; }
 
     info!("Migrations complete (schema v{CURRENT_VERSION})");
     Ok(())
@@ -211,6 +214,26 @@ fn run_v5(conn: &rusqlite::Connection) -> MerkurResult<()> {
              CREATE INDEX IF NOT EXISTS idx_mem_invalid_at ON memories(invalid_at);",
         )
         .map_err(|e| MerkurError::Storage(format!("migration v5: invalid_at: {e}")))?;
+    }
+    Ok(())
+}
+
+/// v5 -> v6: governance audit columns on the consolidation log. The tick
+/// already counted absorptions/invalidations in its report; the log only
+/// persisted processed/edges/errors, so the audit trail lost the
+/// write-governance half. Pure additive with a 0 default for existing entries.
+fn run_v6(conn: &rusqlite::Connection) -> MerkurResult<()> {
+    if !has_column(conn, "consolidate_log", "absorptions")? {
+        conn.execute_batch(
+            "ALTER TABLE consolidate_log ADD COLUMN absorptions INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|e| MerkurError::Storage(format!("migration v6: absorptions: {e}")))?;
+    }
+    if !has_column(conn, "consolidate_log", "invalidations")? {
+        conn.execute_batch(
+            "ALTER TABLE consolidate_log ADD COLUMN invalidations INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|e| MerkurError::Storage(format!("migration v6: invalidations: {e}")))?;
     }
     Ok(())
 }

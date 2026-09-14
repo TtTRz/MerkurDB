@@ -72,7 +72,9 @@ CREATE TABLE IF NOT EXISTS consolidate_log (
     finished_at         TEXT,
     memories_processed  INTEGER NOT NULL DEFAULT 0,
     edges_created       INTEGER NOT NULL DEFAULT 0,
-    errors              INTEGER NOT NULL DEFAULT 0
+    errors              INTEGER NOT NULL DEFAULT 0,
+    absorptions         INTEGER NOT NULL DEFAULT 0,
+    invalidations       INTEGER NOT NULL DEFAULT 0
 );
 ";
 

@@ -235,6 +235,10 @@ pub struct ConsolidationLogEntry {
     pub memories_processed: i64,
     pub edges_created: i64,
     pub errors: i64,
+    /// Write-governance absorptions applied in this tick (UPDATE verdicts).
+    pub absorptions: i64,
+    /// Write-governance invalidations applied in this tick (DELETE verdicts).
+    pub invalidations: i64,
 }
 
 #[derive(Debug, Clone)]

@@ -563,14 +563,16 @@ pub fn log_consolidation(
         .get()
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
     conn.execute(
-        "INSERT INTO consolidate_log (started_at, finished_at, memories_processed, edges_created, errors)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO consolidate_log (started_at, finished_at, memories_processed, edges_created, errors, absorptions, invalidations)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             started_at.to_rfc3339(),
             finished_at.to_rfc3339(),
             report.memories_processed as i64,
             report.edges_created as i64,
             report.errors as i64,
+            report.absorptions as i64,
+            report.invalidations as i64,
         ],
     )
     .map_err(|e| MerkurError::Storage(format!("Failed to log consolidation: {e}")))?;
@@ -587,7 +589,7 @@ pub fn get_consolidation_log(
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, started_at, finished_at, memories_processed, edges_created, errors
+            "SELECT id, started_at, finished_at, memories_processed, edges_created, errors, absorptions, invalidations
              FROM consolidate_log ORDER BY id DESC LIMIT ?1",
         )
         .map_err(|e| MerkurError::Storage(format!("Failed to prepare log query: {e}")))?;
@@ -602,6 +604,8 @@ pub fn get_consolidation_log(
                 memories_processed: row.get(3)?,
                 edges_created: row.get(4)?,
                 errors: row.get(5)?,
+                absorptions: row.get(6)?,
+                invalidations: row.get(7)?,
             })
         })
         .map_err(|e| MerkurError::Storage(format!("Log query failed: {e}")))?;

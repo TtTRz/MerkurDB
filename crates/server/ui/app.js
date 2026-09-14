@@ -624,10 +624,12 @@ function renderLog() {
             <td class="num">${fmtDuration(e.started_at, e.finished_at)}</td>
             <td class="num">${fmtNum(e.memories_processed)}</td>
             <td class="num">${fmtNum(e.edges_created)}</td>
+            <td class="num">${fmtNum(e.absorptions)}</td>
+            <td class="num">${fmtNum(e.invalidations)}</td>
             <td class="num cell-errors">${fmtNum(errs)}</td>
           </tr>`;
         }).join('')
-      : '<tr><td colspan="7" class="muted">No consolidation runs recorded yet.</td></tr>';
+      : '<tr><td colspan="9" class="muted">No consolidation runs recorded yet.</td></tr>';
 
     view().innerHTML = `
       <section class="panel">
@@ -637,7 +639,8 @@ function renderLog() {
         <table class="tbl tbl-zebra">
           <thead><tr>
             <th class="num">#</th><th>Started</th><th>Finished</th><th class="num">Duration</th>
-            <th class="num">Processed</th><th class="num">Edges created</th><th class="num">Errors</th>
+            <th class="num">Processed</th><th class="num">Edges created</th>
+            <th class="num">Absorbed</th><th class="num">Invalidated</th><th class="num">Errors</th>
           </tr></thead>
           <tbody>${rows}</tbody>
         </table>
