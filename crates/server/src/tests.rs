@@ -1285,4 +1285,73 @@ mod integration {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["namespace"].as_str(), Some("alpha"));
     }
+
+    #[tokio::test]
+    async fn test_list_memories_endpoint_filters_paginates_and_isolates() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        // 3 default + 1 foreign-namespace memories.
+        for (content, ns) in [
+            ("alpha one", None),
+            ("alpha two", None),
+            ("alpha three", None),
+            ("beta fact", Some("beta")),
+        ] {
+            let mut req = Request::post("/v1/write").header("content-type", "application/json");
+            if let Some(ns) = ns {
+                req = req.header("x-merkur-namespace", ns);
+            }
+            let resp = app
+                .clone()
+                .oneshot(
+                    req.body(Body::from(format!(r#"{{"content":"{content}"}}"#)))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        let get = |uri: &str| {
+            let app = app.clone();
+            let uri = uri.to_string();
+            async move {
+                let resp = app
+                    .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()
+            }
+        };
+
+        let page1 = get("/v1/memories?limit=2&offset=0").await;
+        assert_eq!(page1["total"], 3);
+        assert_eq!(page1["items"].as_array().unwrap().len(), 2);
+        let page2 = get("/v1/memories?limit=2&offset=2").await;
+        assert_eq!(page2["items"].as_array().unwrap().len(), 1);
+        let ids: std::collections::HashSet<&str> = page1["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(page2["items"].as_array().unwrap())
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert_eq!(ids.len(), 3, "pages must not repeat and must not leak beta");
+        assert!(
+            page1["items"][0]["embedding"].is_null()
+                || page1["items"][0].get("embedding").is_none(),
+            "embeddings never leave the API"
+        );
+
+        let beta = get("/v1/memories?namespace=beta").await;
+        assert_eq!(beta["total"], 1);
+        assert_eq!(beta["items"][0]["content"], "beta fact");
+
+        let status = get("/v1/status").await;
+        assert_eq!(status["by_namespace"]["default"], 3);
+        assert_eq!(status["by_namespace"]["beta"], 1);
+    }
 }

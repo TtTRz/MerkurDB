@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod context;
+pub mod memories;
 pub mod memory;
 pub mod namespace;
 pub mod search;

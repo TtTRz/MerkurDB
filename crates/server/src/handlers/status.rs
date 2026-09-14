@@ -16,6 +16,7 @@ pub async fn status(State(state): State<AppState>) -> ApiResult<impl IntoRespons
             "total_edges": stats.total_edges,
             "pending_consolidation": stats.pending_consolidation,
             "by_level": stats.by_level,
+            "by_namespace": stats.by_namespace,
             "uptime_seconds": (chrono::Utc::now() - state.started_at).num_seconds(),
         })),
     ))

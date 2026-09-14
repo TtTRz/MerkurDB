@@ -270,7 +270,7 @@ fn parse_optional_rfc3339(s: &Option<String>) -> ApiResult<Option<chrono::DateTi
 
 /// Parse comma-separated level filter into typed values. Unknown tokens are
 /// silently skipped.
-fn parse_level_list(s: &str) -> Vec<MemoryLevel> {
+pub(crate) fn parse_level_list(s: &str) -> Vec<MemoryLevel> {
     s.split(',')
         .map(str::trim)
         .filter(|tok| !tok.is_empty())
