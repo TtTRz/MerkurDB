@@ -41,19 +41,22 @@ curl -H "Authorization: Bearer $MERKUR_TOKEN" \
 
 # 健康检查（无需认证）
 curl localhost:1934/v1/health
+
+# Web 观测台：浏览器打开 http://localhost:1934/ui 并输入 token
 ```
 
 ## 核心特性
 
 - **混合检索（默认）**：FTS5 trigram 全文（BM25）x 向量余弦，经 RRF 融合；结果按相关度、存储权重与**系统习得的重要性**（Consolidator 评估，客户端不可上报）的复合分重排。融合旋钮（`retrieval.fusion.*`）可配置。开箱支持 CJK 无分词文本；见[混合检索](#混合检索)
 - **公开可复现评测**：`crates/eval` 内置 LoCoMo + PersonaMem harness，逐题明细 dump；见[评测](#评测)
-- **Fast & Deep 模式**：`mode=fast` 纯向量 top-k；`mode=deep` SQLite CTE BFS 图扩散
+- **Fast & Deep 模式**：`mode=fast` 纯向量 top-k；`mode=deep` 返回向量种子 + 以种子相关度为锚的 BFS 图扩散（SQLite CTE）
 - **艾宾浩斯遗忘曲线**：指数权重衰减、访问加成、级联降级（Full→Summary→Title→Archive），被反复检索的记忆经滞回机制回升
 - **写时治理（mem0 式）**：近重复写入 NOOP 归并到既有记忆（同桶 top-1 余弦 ≥ 0.92）；异步 Consolidator 对每条新记忆与近邻裁决 —— UPDATE 就地吸收（salience、边、访问历史保留，留审计指针），DELETE 软失效。裁决执行需同时满足 LLM consolidator 在线且成对相似度 ≥ `consolidation.adjudication_floor`（双信号）；同步写路径不含 LLM
 - **软失效与保留期**：被裁决淘汰的记忆立刻从所有检索通道消失，但在 `forgetting.purge_invalidated_days`（30 天）硬删除前可通过 `GET /v1/memory/{id}` 审计；客户端 `DELETE` 仍是立即硬删
 - **上下文装配**：`POST /v1/context` 从混合召回打包出 token 预算内、去重、可直接拼 prompt 的摘要 —— MCP 友好的入口
 - **离线巩固**：LLM 驱动的摘要生成、实体提取与自动建边
 - **逻辑命名空间**：`X-Merkur-Namespace` 请求头将写入与所有搜索模式限定到单个桶；桶间逻辑隔离，非安全边界
+- **内嵌 Web 观测台**：服务自身在 `/ui` 提供的只读观测界面（静态资源编译进二进制，无需独立部署）—— 状态总览（level/namespace 分布）、记忆浏览与详情、图邻域探索、巩固审计日志。页面公开，数据经认证 API 获取
 - **插件架构**：Embedder / Storage / Consolidator / Forgetter — 通过 trait + 配置注入独立替换
 - **双存储**：SQLite（默认）+ LanceDB 磁盘索引（feature gate）
 - **Rust SDK**：`merkur-client` crate，含 `MerkurClient` trait 和 `HttpMerkurClient`
@@ -83,11 +86,12 @@ curl localhost:1934/v1/health
 
 | Benchmark | 指标 | MerkurDB（裸写入） | MerkurDB（开启巩固管线） | 参照 |
 |---|---|---|---|---|
-| LoCoMo（1,986 题） | QA 准确率（LLM 裁判） | 64.8% | **68.3%** | mem0 论文 66.9%（GPT-4 级答题 + 完整抽取管线） |
+| LoCoMo（1,986 题） | QA 准确率 @30（LLM 裁判） | 64.8% | **68.3%** | mem0 论文 66.9%（GPT-4 级答题 + 完整抽取管线） |
+| LoCoMo（1,986 题） | QA 准确率 @200（guarded） | **74.6%** | 73.0% | 检索预算主导；管线增益是浅池现象 |
 | LoCoMo | 检索 hit@30 / 覆盖率 | 0.762 / 0.703 | **0.816 / 0.759** | — |
-| PersonaMem 32k（589 选择题） | 准确率 | **73.2%** | — | 前沿 LLM 全上下文 ~52%；TencentDB Agent Memory 76.1%（同答题模型，完整管线） |
+| PersonaMem 32k（589 选择题） | 准确率 | **73.2%** | 71.2%（喂原文）/ 68.9%（喂蒸馏摘要） | 前沿 LLM 全上下文 ~52%；TencentDB Agent Memory 76.1%（同答题模型，完整管线） |
 
-开启巩固管线（LLM 摘要 + 重要性 + 建边，裁决关闭）使 LoCoMo QA +3.5pt、检索 hit@30 +5.4pt：importance 方差让复合分重排在 top-k 截断时把更靠谱的记忆推进前列。其余测量条件：原始对话轮次写入 + 轻量答题模型（LoCoMo 裁判 `deepseek-v4-flash-vision-exp`，PersonaMem 答题 `kimi-k2.5`）；裁判/答题模型差异使跨论文数字为近似对比。harness 设计：免 LLM 的检索召回轨（对照 evidence 标注评分）、裁判打分的 QA 轨（对抗题拒答判对）、PersonaMem 的 in-situ checkpoint 回放（无未来信息泄漏）。
+开启巩固管线（LLM 摘要 + 重要性 + 建边，裁决关闭）使 LoCoMo QA +3.5pt、检索 hit@30 +5.4pt（深度 30 下）：importance 方差让复合分重排在浅 top-k 截断时把更靠谱的记忆推进前列。两条诚实的边界发现：深度 200 时预算独自承载全部增益（裸 74.6% ≈ 管线 73.0%）；而在 PersonaMem 的判别式选择题上管线是净负收益——裁决吸收抹掉了事实召回的证据行，蒸馏摘要丢失了区分近似干扰项所需的逐字细节。其余测量条件：原始对话轮次写入 + 轻量答题模型（LoCoMo 裁判 `deepseek-v4-flash-vision-exp`，PersonaMem 答题 `kimi-k2.5`）；裁判/答题模型差异使跨论文数字为近似对比。harness 设计：免 LLM 的检索召回轨（对照 evidence 标注评分）、裁判打分的 QA 轨（对抗题拒答判对）、PersonaMem 的 in-situ checkpoint 回放（无未来信息泄漏）。
 
 ```bash
 scripts/fetch_locomo.sh          # 数据集（CC BY-NC / MIT，gitignored）

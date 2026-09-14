@@ -80,6 +80,57 @@ paths:
               schema:
                 type: string
 
+  /ui:
+    get:
+      tags: [Admin]
+      summary: Embedded observability console (HTML shell)
+      operationId: uiIndex
+      security: []
+      servers:
+        - url: http://localhost:1934
+          description: Server root (the console lives outside the /v1 API prefix)
+      responses:
+        "200":
+          description: Single-page read-only console — status dashboard, memory browse/detail, graph neighborhood, consolidation log. The page and its assets are public; the console prompts for a bearer token in the browser and calls the authenticated API with it.
+          content:
+            text/html:
+              schema:
+                type: string
+
+  /ui/app.js:
+    get:
+      tags: [Admin]
+      summary: Console application script (static asset)
+      operationId: uiAppJs
+      security: []
+      servers:
+        - url: http://localhost:1934
+          description: Server root (the console lives outside the /v1 API prefix)
+      responses:
+        "200":
+          description: Console JavaScript, compiled into the server binary (no build step or separate deployment)
+          content:
+            text/javascript:
+              schema:
+                type: string
+
+  /ui/style.css:
+    get:
+      tags: [Admin]
+      summary: Console stylesheet (static asset)
+      operationId: uiStyleCss
+      security: []
+      servers:
+        - url: http://localhost:1934
+          description: Server root (the console lives outside the /v1 API prefix)
+      responses:
+        "200":
+          description: Console stylesheet, compiled into the server binary
+          content:
+            text/css:
+              schema:
+                type: string
+
   /write:
     post:
       tags: [Write]
@@ -217,7 +268,7 @@ paths:
             type: string
             enum: [hybrid, fast, deep]
             default: hybrid
-          description: hybrid=BM25 x vector RRF fusion (default), fast=vector retrieval, deep=BFS graph diffusion
+          description: hybrid=BM25 x vector RRF fusion (default), fast=vector retrieval, deep=vector seeds plus BFS graph diffusion anchored to seed relevance
         - name: limit
           in: query
           schema:
@@ -230,7 +281,7 @@ paths:
           schema:
             type: number
             default: 0.3
-          description: Relevance floor applied to the returned score. Gates raw cosine in fast mode, normalized RRF fused relevance in hybrid mode (not the composite score), and the diffusion-decayed score in deep mode. Any number is accepted; out-of-range values simply over- or under-filter.
+          description: Relevance floor applied to the returned score. Gates raw cosine in fast mode, normalized RRF fused relevance in hybrid mode (not the composite score), and the seed-anchored diffusion score in deep mode (seeds carry raw cosine). Any number is accepted; out-of-range values simply over- or under-filter.
         - name: context
           in: query
           schema:
@@ -303,6 +354,59 @@ paths:
           $ref: "#/components/responses/Error"
         "502":
           $ref: "#/components/responses/EmbedFailed"
+
+  /memories:
+    get:
+      tags: [Memory]
+      summary: Browse memories (filter + paginate)
+      description: Operator/UI-oriented listing of live memories, newest first. Soft-invalidated rows are excluded, matching every retrieval channel. Embeddings are never serialized.
+      operationId: listMemories
+      parameters:
+        - $ref: "#/components/parameters/NamespaceHeader"
+        - name: namespace
+          in: query
+          schema:
+            type: string
+          description: Bucket to list. Overrides the X-Merkur-Namespace header for this request; falls back to the header (then `default`) when absent. Logical isolation only — not a security boundary.
+        - name: level
+          in: query
+          schema:
+            type: string
+          description: Comma-separated level filter, e.g. "Full,Summary". Unknown tokens are ignored.
+        - name: category
+          in: query
+          schema:
+            type: string
+          description: Exact category match
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 20
+          description: Page size; values outside 1-200 are clamped.
+      responses:
+        "200":
+          description: Page of memories, ordered created_at DESC, id ASC
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MemoryListResponse"
+        "400":
+          $ref: "#/components/responses/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/Error"
 
   /memory/{id}:
     get:
@@ -982,6 +1086,53 @@ components:
           type: string
           description: system (LLM-created) or manual (client-created)
 
+    MemoryListResponse:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              content:
+                type: string
+              abstract:
+                type: string
+                nullable: true
+              weight:
+                type: number
+              level:
+                type: string
+                enum: [full, summary, title, archived]
+              category:
+                type: string
+              context:
+                type: object
+                additionalProperties:
+                  type: string
+              created_at:
+                type: string
+                format: date-time
+              namespace:
+                type: string
+              importance:
+                type: number
+              invalid_at:
+                type: string
+                format: date-time
+                nullable: true
+                description: Always null in this listing — soft-invalidated rows are excluded
+        total:
+          type: integer
+          description: Rows matching the filters across all pages
+        offset:
+          type: integer
+        limit:
+          type: integer
+          description: Effective page size after clamping to 1-200
+
     StatusResponse:
       type: object
       properties:
@@ -995,6 +1146,11 @@ components:
           type: object
           additionalProperties:
             type: integer
+        by_namespace:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Per-bucket memory counts; same counting semantics as total_memories (soft-invalidated rows included)
         uptime_seconds:
           type: integer
           nullable: true
@@ -1018,7 +1174,7 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
     Unauthorized:
-      description: Missing or invalid bearer token (code UNAUTHORIZED). Applies to every route except /health and /metrics.
+      description: Missing or invalid bearer token (code UNAUTHORIZED). Applies to every route except /health, /metrics, and the /ui console assets.
       content:
         application/json:
           schema:

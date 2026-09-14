@@ -41,19 +41,22 @@ curl -H "Authorization: Bearer $MERKUR_TOKEN" \
 
 # Health (no auth required)
 curl localhost:1934/v1/health
+
+# Web console: open http://localhost:1934/ui in a browser and enter your token
 ```
 
 ## Key Features
 
 - **Hybrid Retrieval (default)**: FTS5 trigram full-text (BM25) x vector cosine, fused with Reciprocal Rank Fusion; results re-ranked by a composite of relevance, stored weight, and **system-learned importance** (Consolidator-assessed, never client-reported). Fusion knobs (`retrieval.fusion.*`) are configurable. Works on CJK/unsegmented text out of the box; see [Hybrid Search](#hybrid-search)
 - **Evaluated in the open**: reproducible LoCoMo + PersonaMem harness in `crates/eval` with per-question dumps; see [Evaluation](#evaluation)
-- **Fast & Deep modes**: `mode=fast` for pure vector top-k, `mode=deep` for BFS graph diffusion via SQLite CTE
+- **Fast & Deep modes**: `mode=fast` for pure vector top-k, `mode=deep` serves vector seeds plus BFS graph diffusion anchored to seed relevance (SQLite CTE)
 - **Ebbinghaus Forgetting Curve**: Exponential weight decay, access boost, cascade downgrade (Full→Summary→Title→Archive) with hysteresis-based promotion back up on repeated retrieval
 - **Write Governance (mem0-style)**: near-duplicate writes NOOP onto the existing memory (top-1 cosine ≥ 0.92, same bucket); the async Consolidator adjudicates each new memory against its neighbors — UPDATE absorbs the new content into the existing row (salience, edges, and access history preserved; audit pointer kept), DELETE soft-invalidates the loser. Verdicts execute only with an LLM consolidator AND pair similarity ≥ `consolidation.adjudication_floor` (dual-signal); the synchronous write path stays LLM-free
 - **Soft-Invalidation & Retention**: adjudicated-out memories vanish from every retrieval channel immediately but stay auditable via `GET /v1/memory/{id}` until `forgetting.purge_invalidated_days` (30d) hard-deletes them; client `DELETE` stays an immediate hard delete
 - **Context Assembly**: `POST /v1/context` packs a token-budgeted, deduplicated, prompt-ready digest from hybrid recall — the MCP-friendly entry point
 - **Offline Consolidation**: LLM-driven summarization, entity extraction, and automatic edge creation
 - **Logical Namespaces**: `X-Merkur-Namespace` header scopes writes & all search modes to one bucket; hybrid retrieval stays isolated per bucket. Logical isolation, not a security boundary
+- **Embedded Web Console**: read-only observability UI served by the server itself at `/ui` (assets compiled into the binary, no separate deployment) — status dashboard with level/namespace distribution, memory browse + detail, graph neighborhood explorer, consolidation audit log. Pages are public; data flows through the authenticated API
 - **Plugin Architecture**: Embedder / Storage / Consolidator / Forgetter — independently replaceable via trait + config injection
 - **Dual Storage**: SQLite (default) + LanceDB disk-based index (feature gated)
 - **Rust SDK**: `merkur-client` crate with `MerkurClient` trait and `HttpMerkurClient`
@@ -83,11 +86,12 @@ The `merkur-eval` harness (`crates/eval`, MIT) runs two public benchmarks end-to
 
 | Benchmark | Metric | MerkurDB (raw ingest) | MerkurDB (consolidation on) | Reference points |
 |---|---|---|---|---|
-| LoCoMo (1,986 QA) | QA accuracy (LLM-judged) | 64.8% | **68.3%** | mem0 paper 66.9% (GPT-4-class answerer + full extraction pipeline) |
+| LoCoMo (1,986 QA) | QA accuracy @30 (LLM-judged) | 64.8% | **68.3%** | mem0 paper 66.9% (GPT-4-class answerer + full extraction pipeline) |
+| LoCoMo (1,986 QA) | QA accuracy @200 (guarded) | **74.6%** | 73.0% | retrieval budget dominates; pipeline gain is shallow-pool |
 | LoCoMo | retrieval hit@30 / coverage | 0.762 / 0.703 | **0.816 / 0.759** | — |
-| PersonaMem 32k (589 MC QA) | accuracy | **73.2%** | — | frontier LLMs full-context ~52%; TencentDB Agent Memory 76.1% (same answer model, full pipeline) |
+| PersonaMem 32k (589 MC QA) | accuracy | **73.2%** | 71.2% (raw served) / 68.9% (abstracts served) | frontier LLMs full-context ~52%; TencentDB Agent Memory 76.1% (same answer model, full pipeline) |
 
-Enabling the consolidation pipeline (LLM abstracts + importance + edges, adjudication off) lifts LoCoMo QA by +3.5pt and retrieval hit@30 by +5.4pt over raw-turn ingest: importance variance lets the composite re-rank promote better candidates into the top-k cut. Measured otherwise with raw dialog-turn ingest and lightweight answer models (`deepseek-v4-flash-vision-exp` judge on LoCoMo, `kimi-k2.5` on PersonaMem); judge/answer-model choices make cross-paper numbers approximate. Harness design: LLM-free retrieval-recall track scored against LoCoMo evidence annotations, judge-graded QA track (adversarial questions score abstention as correct), and in-situ checkpoint replay for PersonaMem (no future-turn leakage).
+Enabling the consolidation pipeline (LLM abstracts + importance + edges, adjudication off) lifts LoCoMo QA by +3.5pt and retrieval hit@30 by +5.4pt at depth 30: importance variance lets the composite re-rank promote better candidates into a shallow top-k cut. Two honest boundary findings: at depth 200 the budget alone carries the gain (raw 74.6% ≈ consolidated 73.0%), and on PersonaMem's discriminating-choice questions the pipeline is net-negative — adjudicated absorptions erase fact-recall evidence and distilled abstracts lose the verbatim detail near-duplicate distractors are built on. Measured otherwise with raw dialog-turn ingest and lightweight answer models (`deepseek-v4-flash-vision-exp` judge on LoCoMo, `kimi-k2.5` on PersonaMem); judge/answer-model choices make cross-paper numbers approximate. Harness design: LLM-free retrieval-recall track scored against LoCoMo evidence annotations, judge-graded QA track (adversarial questions score abstention as correct), and in-situ checkpoint replay for PersonaMem (no future-turn leakage).
 
 ```bash
 scripts/fetch_locomo.sh          # datasets (CC BY-NC / MIT, gitignored)
