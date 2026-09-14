@@ -1378,3 +1378,49 @@ async fn test_list_memories_filters_level_category_namespace() -> MerkurResult<(
     assert!(none.is_empty() && zero == 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_list_memories_filters_levels() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let a = storage
+        .insert_memory(&new_test_memory(
+            "level probe alpha",
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+        ))
+        .await?;
+    let b = storage
+        .insert_memory(&new_test_memory(
+            "level probe beta",
+            Some(vec![0.0, 1.0, 0.0, 0.0]),
+        ))
+        .await?;
+
+    // Positive path: the json_each arm matches level=2 and keeps both rows
+    // (new_test_memory always inserts at Full).
+    let (full_items, full_total) = storage
+        .list_memories(&merkur_core::MemoryListFilter {
+            levels: Some(vec![MemoryLevel::Full]),
+            limit: 10,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(full_total, 2, "Full filter keeps both rows");
+    assert!(full_items.iter().any(|m| m.id == a));
+    assert!(full_items.iter().any(|m| m.id == b));
+    assert!(full_items.iter().all(|m| m.level == MemoryLevel::Full));
+
+    // Negative path: nothing sits at Archived, so the json_each arm must
+    // match zero rows rather than fall back to unfiltered.
+    let (archived_items, archived_total) = storage
+        .list_memories(&merkur_core::MemoryListFilter {
+            levels: Some(vec![MemoryLevel::Archived]),
+            limit: 10,
+            ..Default::default()
+        })
+        .await?;
+    assert!(
+        archived_items.is_empty() && archived_total == 0,
+        "Archived filter must not leak Full rows"
+    );
+    Ok(())
+}
