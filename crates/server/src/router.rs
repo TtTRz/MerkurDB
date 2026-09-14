@@ -13,7 +13,10 @@ use crate::rate_limit;
 pub fn create_router(state: AppState) -> Router {
     let public = Router::new()
         .route("/v1/health", get(handlers::admin::health))
-        .route("/v1/metrics", get(metrics::metrics_handler));
+        .route("/v1/metrics", get(metrics::metrics_handler))
+        .route("/ui", get(handlers::ui::index))
+        .route("/ui/app.js", get(handlers::ui::app_js))
+        .route("/ui/style.css", get(handlers::ui::style_css));
 
     let protected = Router::new()
         .route("/v1/write", post(handlers::write::write))

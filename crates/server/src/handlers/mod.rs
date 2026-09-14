@@ -6,4 +6,5 @@ pub mod namespace;
 pub mod search;
 pub mod status;
 pub mod trigger;
+pub mod ui;
 pub mod write;

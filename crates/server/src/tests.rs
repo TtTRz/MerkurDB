@@ -1354,4 +1354,30 @@ mod integration {
         assert_eq!(status["by_namespace"]["default"], 3);
         assert_eq!(status["by_namespace"]["beta"], 1);
     }
+
+    #[tokio::test]
+    async fn test_ui_static_routes() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+        for (uri, ct) in [
+            ("/ui", "text/html"),
+            ("/ui/app.js", "text/javascript"),
+            ("/ui/style.css", "text/css"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let got = resp
+                .headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            assert!(got.starts_with(ct), "{uri} content-type: {got}");
+        }
+    }
 }
