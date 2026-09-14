@@ -182,6 +182,7 @@ pub async fn relate_batch(
 pub struct GraphQuery {
     pub depth: Option<usize>,
     pub degree_limit: Option<usize>,
+    pub namespace: Option<String>,
 }
 
 pub async fn get_graph(
@@ -199,12 +200,16 @@ pub async fn get_graph(
         .unwrap_or_else(|| state.config.default_degree_limit())
         .clamp(1, limits::MAX_BFS_DEGREE);
 
+    // Bucket override, same override semantics as /v1/memories: an explicit
+    // `?namespace=` query param wins over the X-Merkur-Namespace header.
+    let scope = params.namespace.unwrap_or(ns.0);
+
     // Neutral relevance (1.0): a graph neighborhood view has no query, so
     // diffusion decays only by depth and edge weight.
     let seeds = [(id.clone(), 1.0)];
     let neighborhood = state
         .storage
-        .bfs_expand_ns(&seeds, &ns.0, depth, degree_limit)
+        .bfs_expand_ns(&seeds, &scope, depth, degree_limit)
         .await?;
 
     let mut node_ids: HashSet<String> = neighborhood.iter().map(|m| m.id.clone()).collect();

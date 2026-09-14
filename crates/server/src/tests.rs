@@ -307,6 +307,83 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn test_graph_accepts_namespace_query_param() {
+        let state = test_app().await;
+        let app = router::create_router(state);
+
+        let write_beta = |content: &str| {
+            let app = app.clone();
+            let content = content.to_string();
+            async move {
+                let resp = app
+                    .oneshot(
+                        Request::post("/v1/write")
+                            .header("content-type", "application/json")
+                            .header("x-merkur-namespace", "beta")
+                            .body(Body::from(format!(r#"{{"content":"{content}"}}"#)))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+                let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let a = write_beta("beta-adjacent fact A").await;
+        let b = write_beta("beta-adjacent fact B").await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/relate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "source_id": a, "target_id": b, "relation": "mentions", "weight": 0.9
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Default bucket (no header, no param): the beta neighborhood is
+        // out of scope.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/v1/graph/{a}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["neighborhood"].as_array().unwrap().len(), 0);
+
+        // The query param overrides the bucket, same as /v1/memories.
+        let resp = app
+            .oneshot(
+                Request::get(format!("/v1/graph/{a}?namespace=beta"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["neighborhood"].as_array().unwrap().len(), 1);
+        assert_eq!(json["edges"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_relate_self_edge_rejected() {
         let state = test_app().await;
         let app = router::create_router(state);
