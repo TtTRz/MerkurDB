@@ -73,7 +73,7 @@ crates/
 |---|---|---|
 | `hybrid`（默认） | BM25（FTS5 trigram）+ 向量余弦，各自超采，RRF 融合，复合分重排 | composite = `score_search·fused + score_weight·weight + score_importance·importance` |
 | `fast` | 向量 top-k | 原始余弦 |
-| `deep` | fast 种子 → CTE BFS 图扩散 | `0.5^depth × 路径权重` |
+| `deep` | 向量种子 + 以种子分锚定的 CTE BFS 图扩散（种子与邻居按分合并去重） | 邻居分 = `种子分 × 路径边权积 × 0.5^depth` |
 
 ```mermaid
 flowchart LR
@@ -147,6 +147,7 @@ sequenceDiagram
     rect rgb(40, 40, 40)
         Note over S,L: 裁决阶段（adjudication_candidates > 0）
         S->>D: get_embeddings(pending) + vector_search_ns（同桶候选）
+        Note over S: 候选先按 floor 预过滤（全低于 floor 的集合跳过 LLM 调用）；<br/>收集相 4 路并发（只读），执行相按序串行（写）
         S->>L: adjudicate(pending, candidates)
         L-->>S: 每条记忆的 ADD/UPDATE/DELETE/NOOP
         S->>D: 仅当余弦 ≥ adjudication_floor 才执行

@@ -73,7 +73,7 @@ Three modes on `GET /v1/search`:
 |---|---|---|
 | `hybrid` (default) | BM25 (FTS5 trigram) + vector cosine, both oversampled, fused via RRF, then re-ranked by composite | composite = `score_search·fused + score_weight·weight + score_importance·importance` |
 | `fast` | vector top-k | raw cosine |
-| `deep` | fast seeds → CTE BFS graph diffusion | `0.5^depth × path weight` |
+| `deep` | vector seeds + CTE BFS diffusion anchored to seed relevance (seeds and neighbors merged, deduped by max score) | neighbor = `seed_score × path edge-weight product × 0.5^depth` |
 
 ```mermaid
 flowchart LR
@@ -147,6 +147,7 @@ sequenceDiagram
     rect rgb(40, 40, 40)
         Note over S,L: adjudication phase (adjudication_candidates > 0)
         S->>D: get_embeddings(pending) + vector_search_ns (same-bucket candidates)
+        Note over S: candidates pre-filtered by floor (below-floor sets skip the LLM call);<br/>gathering runs 4-wide (read-only), execution serial in pending order
         S->>L: adjudicate(pending, candidates)
         L-->>S: ADD/UPDATE/DELETE/NOOP per memory
         S->>D: execute only if cosine ≥ adjudication_floor

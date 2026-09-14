@@ -517,6 +517,11 @@ paths:
           schema:
             type: string
           description: Center memory ID
+        - name: namespace
+          in: query
+          schema:
+            type: string
+          description: Bucket override — wins over the X-Merkur-Namespace header (same override semantics as /v1/memories)
         - name: depth
           in: query
           schema:
@@ -856,6 +861,12 @@ paths:
                           type: integer
                         errors:
                           type: integer
+                        absorptions:
+                          type: integer
+                          description: Write-governance UPDATE absorptions applied in this run (0 for runs before schema v6)
+                        invalidations:
+                          type: integer
+                          description: Write-governance DELETE invalidations applied in this run (0 for runs before schema v6)
 
         "401":
           $ref: "#/components/responses/Unauthorized"
