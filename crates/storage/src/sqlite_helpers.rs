@@ -652,11 +652,27 @@ pub fn stats(pool: &Pool<SqliteConnectionManager>) -> MerkurResult<StorageStats>
         by_level.insert(level, count);
     }
 
+    let mut by_namespace = HashMap::new();
+    let mut stmt = conn
+        .prepare("SELECT namespace, COUNT(*) FROM memories GROUP BY namespace")
+        .map_err(|e| MerkurError::Storage(format!("Stats query failed: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
+        })
+        .map_err(|e| MerkurError::Storage(format!("Stats query failed: {e}")))?;
+    for row in rows {
+        let (namespace, count) =
+            row.map_err(|e| MerkurError::Storage(format!("Row error: {e}")))?;
+        by_namespace.insert(namespace, count);
+    }
+
     Ok(StorageStats {
         total_memories,
         total_edges,
         pending_consolidation,
         by_level,
+        by_namespace,
     })
 }
 

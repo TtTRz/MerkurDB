@@ -170,6 +170,9 @@ pub struct StorageStats {
     pub total_edges: usize,
     pub pending_consolidation: usize,
     pub by_level: HashMap<i32, usize>,
+    /// Row count per logical bucket, surfaced by the status endpoint so the
+    /// observability console can render namespace distribution.
+    pub by_namespace: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Default)]

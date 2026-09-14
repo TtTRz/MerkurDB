@@ -253,6 +253,25 @@ async fn test_stats_pending_excludes_invalidated() -> MerkurResult<()> {
 }
 
 #[tokio::test]
+async fn test_stats_groups_by_namespace() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    storage
+        .insert_memory(&new_test_memory("one", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+    let mut foreign = new_test_memory("two", Some(vec![0.0, 1.0, 0.0, 0.0]));
+    foreign.namespace = "team-x".into();
+    storage.insert_memory(&foreign).await?;
+
+    let stats = storage.stats().await?;
+    assert_eq!(
+        stats.by_namespace.get(merkur_core::DEFAULT_NAMESPACE),
+        Some(&1)
+    );
+    assert_eq!(stats.by_namespace.get("team-x"), Some(&1));
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_memory_exists() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
     let id = storage
