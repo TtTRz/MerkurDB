@@ -322,7 +322,10 @@ function renderMemoryDetail(id) {
   runView(async () => {
     const [m, g] = await Promise.all([
       api(`/v1/memory/${encodeURIComponent(id)}`),
-      api(`/v1/graph/${encodeURIComponent(id)}`).catch(() => null),
+      api(`/v1/graph/${encodeURIComponent(id)}`).catch(err => {
+        if (err && err.status === 401) throw err; // keep the gate; don't render past a cleared token
+        return null; // other graph failures degrade to an empty edge list
+      }),
     ]);
 
     const banner = m.invalid_at
