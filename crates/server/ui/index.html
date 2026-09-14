@@ -1,1 +1,29 @@
-<!doctype html><title>MerkurDB</title><div id="app"></div><script src="/ui/app.js"></script>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MerkurDB Console</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-left">
+    <span class="brand">MerkurDB</span>
+    <nav class="nav">
+      <a href="#/dashboard" data-nav="/dashboard">Dashboard</a>
+      <a href="#/memories" data-nav="/memories">Memories</a>
+      <a href="#/log" data-nav="/log">Log</a>
+    </nav>
+  </div>
+  <div class="topbar-right">
+    <input id="token-input" type="password" placeholder="Bearer token"
+           autocomplete="off" spellcheck="false">
+    <button id="token-save" type="button">Save token</button>
+  </div>
+</header>
+<main id="view" class="view"></main>
+<noscript><p class="noscript">This console requires JavaScript.</p></noscript>
+<script src="/ui/app.js"></script>
+</body>
+</html>
