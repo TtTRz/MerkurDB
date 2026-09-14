@@ -61,6 +61,15 @@ pub trait Storage: Send + Sync {
         embedding: Option<&[f32]>,
     ) -> MerkurResult<()>;
     async fn get_memory(&self, id: &str) -> MerkurResult<Option<Memory>>;
+
+    /// Browse listing for the observability console: filter + paginate the
+    /// live store. Always excludes soft-invalidated rows, like every
+    /// retrieval channel.
+    async fn list_memories(
+        &self,
+        filter: &crate::MemoryListFilter,
+    ) -> MerkurResult<(Vec<crate::Memory>, usize)>;
+
     async fn delete_memory(&self, id: &str) -> MerkurResult<()>;
 
     /// Soft-invalidate a memory (P1-7 write governance): the row stays for

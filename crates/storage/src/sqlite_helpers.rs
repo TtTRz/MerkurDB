@@ -49,6 +49,109 @@ pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+/// Canonical `memories` projection consumed by [`memory_row_mapper`]. Every
+/// SELECT that feeds the mapper must list exactly these columns in this order,
+/// so the `Memory` read model cannot drift between single-row and listing
+/// queries.
+const MEMORY_COLUMNS: &str = "id, content, abstract, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, access_count, namespace, importance, valid_at, invalid_at";
+
+/// Raw form of one [`MEMORY_COLUMNS`] row. Construction into a `Memory`
+/// (metadata parse, context tags, level coercion) lives in
+/// [`memory_from_row`].
+type MemoryRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    f64,
+    i32,
+    bool,
+    String,
+    String,
+    String,
+    String,
+    u64,
+    String,
+    f64,
+    Option<String>,
+    Option<String>,
+);
+
+/// Map one row of the canonical [`MEMORY_COLUMNS`] projection into its raw
+/// tuple. Shared by every `memories` read path.
+fn memory_row_mapper(row: &rusqlite::Row) -> rusqlite::Result<MemoryRow> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, Option<String>>(2)?,
+        row.get::<_, String>(3)?,
+        row.get::<_, f64>(4)?,
+        row.get::<_, i32>(5)?,
+        row.get::<_, bool>(6)?,
+        row.get::<_, String>(7)?,
+        row.get::<_, String>(8)?,
+        row.get::<_, String>(9)?,
+        row.get::<_, String>(10)?,
+        row.get::<_, i64>(11)? as u64,
+        row.get::<_, String>(12)?,
+        row.get::<_, f64>(13)?,
+        row.get::<_, Option<String>>(14)?,
+        row.get::<_, Option<String>>(15)?,
+    ))
+}
+
+/// Build a `Memory` from a raw row: parses JSON metadata, attaches context
+/// tags, and coerces the stored level.
+fn memory_from_row(pool: &Pool<SqliteConnectionManager>, row: MemoryRow) -> MerkurResult<Memory> {
+    let (
+        id,
+        content,
+        abstract_,
+        category,
+        weight,
+        level_i32,
+        pending,
+        metadata_str,
+        created_at,
+        updated_at,
+        accessed_at,
+        access_count,
+        namespace,
+        importance,
+        valid_at,
+        invalid_at,
+    ) = row;
+    let level = MemoryLevel::from_i32(level_i32);
+    let metadata: HashMap<String, serde_json::Value> =
+        serde_json::from_str(&metadata_str).unwrap_or_default();
+    let context = get_context_tags(pool, &id)?;
+    Ok(Memory {
+        id,
+        content,
+        abstract_,
+        category,
+        weight,
+        level,
+        pending_consolidation: pending,
+        embedding: None,
+        metadata,
+        context,
+        created_at: parse_rfc3339(&created_at),
+        updated_at: parse_rfc3339(&updated_at),
+        accessed_at: parse_rfc3339(&accessed_at),
+        access_count,
+        namespace,
+        importance,
+        // Rows predating v5 are backfilled by the migration; a missing
+        // value falls back to created_at defensively.
+        valid_at: valid_at
+            .as_deref()
+            .map(parse_rfc3339)
+            .unwrap_or_else(|| parse_rfc3339(&created_at)),
+        invalid_at: invalid_at.as_deref().map(parse_rfc3339),
+    })
+}
+
 /// Fetch a full memory row by id, including invalidated ones — this is the
 /// audit read path; retrieval channels filter `invalid_at` at query time.
 /// Shared by both backends so the `Memory` projection cannot drift.
@@ -60,86 +163,73 @@ pub fn get_memory_row(
         .get()
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
     let mut stmt = conn
-        .prepare(
-            "SELECT id, content, abstract, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, access_count, namespace, importance, valid_at, invalid_at
-             FROM memories WHERE id = ?1",
-        )
+        .prepare(&format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories WHERE id = ?1"
+        ))
         .map_err(|e| MerkurError::Storage(format!("Failed to prepare statement: {e}")))?;
 
-    let result = stmt.query_row(params![id], |row| {
-        let metadata_str: String = row.get(7)?;
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, f64>(4)?,
-            row.get::<_, i32>(5)?,
-            row.get::<_, bool>(6)?,
-            metadata_str,
-            row.get::<_, String>(8)?,
-            row.get::<_, String>(9)?,
-            row.get::<_, String>(10)?,
-            row.get::<_, i64>(11)? as u64,
-            row.get::<_, String>(12)?,
-            row.get::<_, f64>(13)?,
-            row.get::<_, Option<String>>(14)?,
-            row.get::<_, Option<String>>(15)?,
-        ))
-    });
+    let result = stmt.query_row(params![id], memory_row_mapper);
 
     match result {
-        Ok((
-            id,
-            content,
-            abstract_,
-            category,
-            weight,
-            level_i32,
-            pending,
-            metadata_str,
-            created_at,
-            updated_at,
-            accessed_at,
-            access_count,
-            namespace,
-            importance,
-            valid_at,
-            invalid_at,
-        )) => {
-            let level = MemoryLevel::from_i32(level_i32);
-            let metadata: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&metadata_str).unwrap_or_default();
-            let context = get_context_tags(pool, &id)?;
-            Ok(Some(Memory {
-                id,
-                content,
-                abstract_,
-                category,
-                weight,
-                level,
-                pending_consolidation: pending,
-                embedding: None,
-                metadata,
-                context,
-                created_at: parse_rfc3339(&created_at),
-                updated_at: parse_rfc3339(&updated_at),
-                accessed_at: parse_rfc3339(&accessed_at),
-                access_count,
-                namespace,
-                importance,
-                // Rows predating v5 are backfilled by the migration; a missing
-                // value falls back to created_at defensively.
-                valid_at: valid_at
-                    .as_deref()
-                    .map(parse_rfc3339)
-                    .unwrap_or_else(|| parse_rfc3339(&created_at)),
-                invalid_at: invalid_at.as_deref().map(parse_rfc3339),
-            }))
-        }
+        Ok(row) => Ok(Some(memory_from_row(pool, row)?)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(MerkurError::Storage(format!("Failed to query memory: {e}"))),
     }
+}
+
+/// Browse listing backing `Storage::list_memories`: filter + paginate the live
+/// store, newest first. Always excludes soft-invalidated rows, like every
+/// retrieval channel. Each filter binds one optional parameter — a NULL
+/// binding disables its predicate (`?N IS NULL OR ...`) so one SQL shape
+/// serves every combination. Ordering pins `id ASC` after `created_at DESC` so
+/// pages stay stable when rows share a timestamp.
+pub fn list_memories_filtered(
+    pool: &Pool<SqliteConnectionManager>,
+    filter: &merkur_core::MemoryListFilter,
+) -> MerkurResult<(Vec<Memory>, usize)> {
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+    // Serializing a Vec<i32> is infallible.
+    let levels_json = filter.levels.as_ref().map(|ls| {
+        serde_json::to_string(&ls.iter().map(|l| l.to_i32()).collect::<Vec<_>>()).unwrap()
+    });
+    let where_sql = "invalid_at IS NULL
+        AND (?1 IS NULL OR namespace = ?1)
+        AND (?2 IS NULL OR level IN (SELECT value FROM json_each(?2)))
+        AND (?3 IS NULL OR category = ?3)";
+    let total: usize = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM memories WHERE {where_sql}"),
+            params![filter.namespace, levels_json, filter.category],
+            |row| row.get(0),
+        )
+        .map_err(|e| MerkurError::Storage(format!("list count failed: {e}")))?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {MEMORY_COLUMNS} FROM memories WHERE {where_sql}
+             ORDER BY created_at DESC, id ASC
+             LIMIT ?4 OFFSET ?5"
+        ))
+        .map_err(|e| MerkurError::Storage(format!("list prepare failed: {e}")))?;
+    let rows = stmt
+        .query_map(
+            params![
+                filter.namespace,
+                levels_json,
+                filter.category,
+                filter.limit as i64,
+                filter.offset as i64
+            ],
+            memory_row_mapper,
+        )
+        .map_err(|e| MerkurError::Storage(format!("list query failed: {e}")))?;
+    let mut items = Vec::new();
+    for row in rows {
+        let row = row.map_err(|e| MerkurError::Storage(format!("list row failed: {e}")))?;
+        items.push(memory_from_row(pool, row)?);
+    }
+    Ok((items, total))
 }
 
 /// Insert an edge into the SQLite edges table.

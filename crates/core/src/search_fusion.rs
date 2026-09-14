@@ -667,6 +667,12 @@ mod tests {
             }
             Ok(Some(hydrated_memory(id)))
         }
+        async fn list_memories(
+            &self,
+            _: &crate::MemoryListFilter,
+        ) -> MerkurResult<(Vec<crate::Memory>, usize)> {
+            unimplemented!()
+        }
         async fn delete_memory(&self, _: &str) -> MerkurResult<()> {
             unimplemented!()
         }

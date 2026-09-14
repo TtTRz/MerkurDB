@@ -316,6 +316,18 @@ pub struct WriteBatchResponse {
     pub count: usize,
 }
 
+/// Filter + pagination for [`crate::Storage::list_memories`], the browse
+/// listing backing the observability console. Every predicate is optional: a
+/// `None` field disables it. Soft-invalidated rows are always excluded.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryListFilter {
+    pub namespace: Option<String>,
+    pub levels: Option<Vec<MemoryLevel>>,
+    pub category: Option<String>,
+    pub offset: usize,
+    pub limit: usize,
+}
+
 /// Hard limits on user-controllable search parameters to avoid DoS.
 pub mod limits {
     pub const MAX_SEARCH_LIMIT: usize = 1000;

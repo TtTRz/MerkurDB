@@ -1250,3 +1250,112 @@ async fn test_dedup_scopes_to_same_namespace() -> MerkurResult<()> {
     assert_ne!(ida, idb, "dedup must not leak across namespaces");
     Ok(())
 }
+
+#[tokio::test]
+async fn test_list_memories_paginates_stably_and_excludes_invalidated() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let mut emb = vec![0.0f32; 4];
+        emb[i % 4] = 1.0;
+        ids.push(
+            storage
+                .insert_memory(&new_test_memory(&format!("row {i}"), Some(emb)))
+                .await?,
+        );
+        // Distinct created_at for deterministic DESC order.
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    // One row leaves the visible set.
+    storage.invalidate_memory(&ids[4], None).await?;
+
+    let page1 = storage
+        .list_memories(&merkur_core::MemoryListFilter {
+            limit: 2,
+            offset: 0,
+            ..Default::default()
+        })
+        .await?;
+    let page2 = storage
+        .list_memories(&merkur_core::MemoryListFilter {
+            limit: 2,
+            offset: 2,
+            ..Default::default()
+        })
+        .await?;
+    let page3 = storage
+        .list_memories(&merkur_core::MemoryListFilter {
+            limit: 2,
+            offset: 4,
+            ..Default::default()
+        })
+        .await?;
+
+    assert_eq!(page1.1, 4, "total excludes the invalidated row");
+    assert_eq!(page1.0.len(), 2);
+    assert_eq!(page2.0.len(), 2);
+    assert!(
+        page3.0.is_empty(),
+        "offset past the visible set is empty, not wrapped"
+    );
+    let seen: std::collections::HashSet<&str> = page1
+        .0
+        .iter()
+        .chain(&page2.0)
+        .map(|m| m.id.as_str())
+        .collect();
+    assert_eq!(seen.len(), 4, "pages must not repeat rows");
+    assert!(
+        !seen.contains(ids[4].as_str()),
+        "invalidated row must not appear"
+    );
+    // created_at DESC: newest first.
+    assert!(page1.0[0].created_at >= page1.0[1].created_at);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_memories_filters_level_category_namespace() -> MerkurResult<()> {
+    let storage = new_test_storage(4)?;
+    let a = storage
+        .insert_memory(&new_test_memory(
+            "alpha fact",
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+        ))
+        .await?;
+    let mut foreign = new_test_memory("beta fact", Some(vec![0.0, 1.0, 0.0, 0.0]));
+    foreign.namespace = "beta".into();
+    let _b = storage.insert_memory(&foreign).await?;
+
+    let (default_items, default_total) = storage
+        .list_memories(&merkur_core::MemoryListFilter {
+            namespace: Some(merkur_core::DEFAULT_NAMESPACE.to_string()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(default_total, 1, "beta bucket must not leak into default");
+    assert_eq!(default_items[0].id, a);
+
+    let (cat_items, _) = storage
+        .list_memories(&merkur_core::MemoryListFilter {
+            category: Some("general".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await?;
+    assert!(
+        cat_items.iter().any(|m| m.id == a),
+        "category filter keeps matches"
+    );
+
+    let (none, zero) = storage
+        .list_memories(&merkur_core::MemoryListFilter {
+            category: Some("nonexistent".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await?;
+    assert!(none.is_empty() && zero == 0);
+    Ok(())
+}

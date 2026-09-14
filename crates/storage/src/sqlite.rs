@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use merkur_core::{
-    ConsolidationLogEntry, ConsolidationReport, Edge, Memory, MemoryLevel, MerkurError,
-    MerkurResult, NewEdge, NewMemory, ScoredMemory, Storage, StorageStats,
+    ConsolidationLogEntry, ConsolidationReport, Edge, Memory, MemoryLevel, MemoryListFilter,
+    MerkurError, MerkurResult, NewEdge, NewMemory, ScoredMemory, Storage, StorageStats,
 };
 use merkur_core::{escape_fts_query, is_bm25_viable};
 use r2d2::Pool;
@@ -333,6 +333,12 @@ impl Storage for SqliteStorage {
         let id_owned = id.to_string();
         let pool = self.pool.clone();
         run_blocking(move || sqlite_helpers::get_memory_row(&pool, &id_owned)).await
+    }
+
+    async fn list_memories(&self, filter: &MemoryListFilter) -> MerkurResult<(Vec<Memory>, usize)> {
+        let filter = filter.clone();
+        let pool = self.pool.clone();
+        run_blocking(move || sqlite_helpers::list_memories_filtered(&pool, &filter)).await
     }
 
     async fn invalidate_memory(&self, id: &str, absorbed_into: Option<&str>) -> MerkurResult<()> {
