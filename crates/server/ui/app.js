@@ -20,8 +20,10 @@ class ApiError extends Error {
   }
 }
 
-async function api(path) {
-  const resp = await fetch(path, { headers: { Authorization: `Bearer ${store.token}` } });
+async function api(path, ns) {
+  const headers = { Authorization: `Bearer ${store.token}` };
+  if (ns) headers['X-Merkur-Namespace'] = ns;
+  const resp = await fetch(path, { headers });
   if (resp.status === 401) {
     store.token = '';
     showTokenGate();
@@ -320,13 +322,13 @@ function kvTable(obj, renderVal) {
 
 function renderMemoryDetail(id) {
   runView(async () => {
-    const [m, g] = await Promise.all([
-      api(`/v1/memory/${encodeURIComponent(id)}`),
-      api(`/v1/graph/${encodeURIComponent(id)}`).catch(err => {
-        if (err && err.status === 401) throw err; // keep the gate; don't render past a cleared token
-        return null; // other graph failures degrade to an empty edge list
-      }),
-    ]);
+    // Graph BFS is scoped by the X-Merkur-Namespace header, so the memory must
+    // be fetched first to learn its namespace (sequential, not Promise.all).
+    const m = await api(`/v1/memory/${encodeURIComponent(id)}`);
+    const g = await api(`/v1/graph/${encodeURIComponent(id)}`, m.namespace).catch(err => {
+      if (err && err.status === 401) throw err; // keep the gate; don't render past a cleared token
+      return null; // other graph failures degrade to an empty edge list
+    });
 
     const banner = m.invalid_at
       ? `<div class="banner-invalid">This memory was invalidated at ${fmtDate(m.invalid_at)} — it is hidden from all retrieval channels.</div>`
@@ -426,13 +428,13 @@ function forceLayout(nodes, edges, centerId, iterations = 300) {
 
 function renderGraph(id) {
   runView(async () => {
-    const [g, m] = await Promise.all([
-      api(`/v1/graph/${encodeURIComponent(id)}?depth=2`),
-      api(`/v1/memory/${encodeURIComponent(id)}`).catch(err => {
-        if (err && err.status === 401) throw err; // keep the gate
-        return null; // center node still renders, labeled by id
-      }),
-    ]);
+    // Memory first: the graph BFS is scoped by the X-Merkur-Namespace header,
+    // which must carry this memory's own namespace.
+    const m = await api(`/v1/memory/${encodeURIComponent(id)}`).catch(err => {
+      if (err && err.status === 401) throw err; // keep the gate
+      return null; // center node still renders, labeled by id
+    });
+    const g = await api(`/v1/graph/${encodeURIComponent(id)}?depth=2`, m ? m.namespace : undefined);
 
     const neighbors = g.neighborhood || [];
     const edges = g.edges || [];
