@@ -1,5 +1,5 @@
 /* MerkurDB observability console — vanilla JS SPA, no build step.
- * Hash routes: #/dashboard, #/memories, #/memory/:id, (#/graph/:id, #/log land in Task 6).
+ * Hash routes: #/dashboard, #/memories, #/memory/:id, #/graph/:id, #/log.
  * All /v1 calls carry the bearer token from localStorage; 401 clears it and shows the gate.
  */
 'use strict';
@@ -121,8 +121,8 @@ function render() {
   switch (route.name) {
     case 'memories': return renderMemories(route.query);
     case 'memory': return renderMemoryDetail(route.id);
-    case 'graph': return renderGraphStub(route.id);
-    case 'log': return renderLogStub();
+    case 'graph': return renderGraph(route.id);
+    case 'log': return renderLog();
     default: return renderDashboard();
   }
 }
@@ -390,23 +390,257 @@ function renderMemoryDetail(id) {
   });
 }
 
-/* ---------------------------------------------------------------- stubs (Task 6) */
+/* ---------------------------------------------------------------- graph view */
 
-function renderGraphStub(id) {
-  view().innerHTML = `
-    <section class="panel">
-      <h2>Graph neighborhood</h2>
-      <p class="muted">The canvas graph view for <code>${esc(id)}</code> is delivered in Task 6.</p>
-      <p><a href="#/memory/${encodeURIComponent(id)}">← Back to memory detail</a></p>
-    </section>`;
+// Force layout (reference implementation from the Task 6 brief): O(n²) charge
+// repulsion + weighted spring attraction, velocity damping. Runs in world
+// coordinates around the origin; the draw step fits the resulting bounding
+// box into the canvas, so the layout itself is resolution-independent.
+function forceLayout(nodes, edges, centerId, iterations = 300) {
+  const pos = new Map(nodes.map((n, i) => [n.id, {
+    x: 250 * Math.cos(i * 2.399), y: 250 * Math.sin(i * 2.399), vx: 0, vy: 0,
+  }]));
+  for (let k = 0; k < iterations; k++) {
+    for (const [id, p] of pos) {                     // charge repulsion
+      for (const [id2, q] of pos) {
+        if (id === id2) continue;
+        const dx = p.x - q.x, dy = p.y - q.y, d2 = dx * dx + dy * dy + 1;
+        const f = Math.min(4000 / d2, 4);
+        p.vx += dx * f / Math.sqrt(d2) * 0.5; p.vy += dy * f / Math.sqrt(d2) * 0.5;
+      }
+    }
+    for (const e of edges) {                         // spring attraction
+      const p = pos.get(e.source_id), q = pos.get(e.target_id);
+      if (!p || !q) continue;
+      const dx = q.x - p.x, dy = q.y - p.y;
+      p.vx += dx * 0.005 * e.weight; p.vy += dy * 0.005 * e.weight;
+      q.vx -= dx * 0.005 * e.weight; q.vy -= dy * 0.005 * e.weight;
+    }
+    for (const [id, p] of pos) {
+      p.vx *= 0.85; p.vy *= 0.85; p.x += p.vx; p.y += p.vy;
+      if (id === centerId) { p.x = 0; p.y = 0; p.vx = 0; p.vy = 0; } // pin center
+    }
+  }
+  return pos;
 }
 
-function renderLogStub() {
-  view().innerHTML = `
-    <section class="panel">
-      <h2>Consolidation log</h2>
-      <p class="muted">The consolidation audit log is delivered in Task 6.</p>
-    </section>`;
+function renderGraph(id) {
+  runView(async () => {
+    const [g, m] = await Promise.all([
+      api(`/v1/graph/${encodeURIComponent(id)}?depth=2`),
+      api(`/v1/memory/${encodeURIComponent(id)}`).catch(err => {
+        if (err && err.status === 401) throw err; // keep the gate
+        return null; // center node still renders, labeled by id
+      }),
+    ]);
+
+    const neighbors = g.neighborhood || [];
+    const edges = g.edges || [];
+
+    const nodes = [];
+    const seen = new Set([g.center]);
+    nodes.push({
+      id: g.center,
+      level: m ? m.level : '',
+      label: m ? truncate(m.abstract || m.content, 28) : truncate(g.center, 28),
+      center: true,
+    });
+    neighbors.forEach(n => {
+      if (seen.has(n.id)) return;
+      seen.add(n.id);
+      nodes.push({
+        id: n.id,
+        level: n.level,
+        label: truncate(n.abstract || n.content, 28) || n.id,
+        center: false,
+      });
+    });
+
+    const head = `
+      <div class="graph-head">
+        <h2 class="detail-title">Graph neighborhood of <code>${esc(g.center)}</code></h2>
+        <a class="btn" href="#/memory/${encodeURIComponent(g.center)}">← Memory detail</a>
+      </div>
+      <p class="graph-meta">${nodes.length} node${nodes.length === 1 ? '' : 's'} ·
+        ${edges.length} edge${edges.length === 1 ? '' : 's'} ·
+        depth ${esc(g.depth)} · degree limit ${esc(g.degree_limit)}</p>`;
+
+    if (!neighbors.length && !edges.length) {
+      view().innerHTML = `
+        <section class="panel">
+          ${head}
+          <div class="graph-empty muted">
+            <p>This memory has no graph neighborhood yet.</p>
+            <p>Edges appear here once consolidation or manual relate calls connect it to other memories.</p>
+          </div>
+        </section>`;
+      return;
+    }
+
+    view().innerHTML = `
+      <section class="panel">
+        ${head}
+        <div class="graph-canvas-wrap"><canvas id="graph-canvas" class="graph-canvas"></canvas></div>
+        <div class="graph-legend">
+          <span><i class="dot dot-center"></i>center</span>
+          <span><i class="dot dot-full"></i>full</span>
+          <span><i class="dot dot-summary"></i>summary</span>
+          <span><i class="dot dot-title"></i>title</span>
+          <span><i class="dot dot-archived"></i>archived</span>
+          <span class="muted">click a node to open its detail</span>
+        </div>
+      </section>`;
+
+    const canvas = document.getElementById('graph-canvas');
+    const wrap = canvas.parentElement;
+    const ctx = canvas.getContext('2d');
+    const cssVars = getComputedStyle(document.documentElement);
+    const col = name => (cssVars.getPropertyValue(name).trim() || '#8b949e');
+    const ACCENT = col('--accent'), MUTED = col('--muted'),
+      BORDER = col('--border'), PANEL = col('--panel');
+    const LEVEL_STROKE = {
+      full: col('--green'), summary: col('--accent'),
+      title: col('--amber'), archived: col('--muted'),
+    };
+
+    const world = forceLayout(nodes, edges, g.center);
+    const NODE_R = 9, CENTER_R = 14;
+    let hitNodes = []; // [{id, x, y, r}] in CSS pixels, rebuilt on every draw
+
+    function draw() {
+      const dpr = window.devicePixelRatio || 1;
+      const w = wrap.clientWidth, h = 600;
+      if (!w) return;
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      // Fit the world bounding box into the canvas with padding.
+      const pad = 40;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const p of world.values()) {
+        minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+      }
+      const bw = Math.max(maxX - minX, 1), bh = Math.max(maxY - minY, 1);
+      const scale = Math.min((w - 2 * pad) / bw, (h - 2 * pad) / bh, 1.6);
+      const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+      const X = wx => (wx - cx) * scale + w / 2;
+      const Y = wy => (wy - cy) * scale + h / 2;
+
+      // Edges: gray lines, width follows weight.
+      for (const e of edges) {
+        const p = world.get(e.source_id), q = world.get(e.target_id);
+        if (!p || !q) continue;
+        ctx.beginPath();
+        ctx.moveTo(X(p.x), Y(p.y));
+        ctx.lineTo(X(q.x), Y(q.y));
+        ctx.strokeStyle = BORDER;
+        ctx.lineWidth = Math.min(0.6 + (Number(e.weight) || 0) * 3, 5);
+        ctx.stroke();
+      }
+
+      // Nodes + labels.
+      hitNodes = [];
+      ctx.textAlign = 'center';
+      ctx.font = '11px -apple-system, "Segoe UI", Roboto, sans-serif';
+      for (const n of nodes) {
+        const p = world.get(n.id);
+        if (!p) continue;
+        const x = X(p.x), y = Y(p.y), r = n.center ? CENTER_R : NODE_R;
+        hitNodes.push({ id: n.id, x, y, r });
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fillStyle = n.center ? ACCENT : PANEL;
+        ctx.fill();
+        ctx.lineWidth = n.center ? 2.5 : 2;
+        ctx.strokeStyle = n.center
+          ? ACCENT
+          : (LEVEL_STROKE[String(n.level || '').toLowerCase()] || MUTED);
+        ctx.stroke();
+        ctx.fillStyle = MUTED;
+        ctx.fillText(n.label || n.id, x, y + r + 14, 160);
+      }
+    }
+
+    function nearestNode(ev) {
+      const rect = canvas.getBoundingClientRect();
+      const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+      let best = null, bestD = Infinity;
+      for (const hn of hitNodes) {
+        const d = Math.hypot(hn.x - mx, hn.y - my);
+        if (d < bestD) { bestD = d; best = hn; }
+      }
+      return best && bestD <= Math.max(best.r + 6, 16) ? best : null;
+    }
+
+    canvas.addEventListener('click', ev => {
+      const hit = nearestNode(ev);
+      if (hit) location.hash = `#/memory/${encodeURIComponent(hit.id)}`;
+    });
+    canvas.addEventListener('mousemove', ev => {
+      const hit = nearestNode(ev);
+      canvas.style.cursor = hit ? 'pointer' : 'default';
+      canvas.title = hit ? hit.id : '';
+    });
+    window.addEventListener('resize', function onResize() {
+      if (!canvas.isConnected) { // view navigated away — self-clean
+        window.removeEventListener('resize', onResize);
+        return;
+      }
+      draw();
+    });
+
+    draw();
+  });
+}
+
+/* ---------------------------------------------------------------- consolidation log */
+
+function fmtDuration(start, end) {
+  const a = new Date(start), b = new Date(end);
+  if (isNaN(a) || isNaN(b)) return '—';
+  const ms = b - a;
+  if (ms < 0) return '—';
+  if (ms < 1000) return `${ms} ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)} s`;
+  return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`;
+}
+
+function renderLog() {
+  runView(async () => {
+    const data = await api('/v1/consolidate/log?limit=100');
+    const entries = data.entries || [];
+    const rows = entries.length
+      ? entries.map(e => {
+          const errs = Number(e.errors) || 0;
+          return `<tr${errs > 0 ? ' class="log-row-err"' : ''}>
+            <td class="num">${fmtNum(e.id)}</td>
+            <td class="cell-date">${fmtDate(e.started_at)}</td>
+            <td class="cell-date">${fmtDate(e.finished_at)}</td>
+            <td class="num">${fmtDuration(e.started_at, e.finished_at)}</td>
+            <td class="num">${fmtNum(e.memories_processed)}</td>
+            <td class="num">${fmtNum(e.edges_created)}</td>
+            <td class="num cell-errors">${fmtNum(errs)}</td>
+          </tr>`;
+        }).join('')
+      : '<tr><td colspan="7" class="muted">No consolidation runs recorded yet.</td></tr>';
+
+    view().innerHTML = `
+      <section class="panel">
+        <h2>Consolidation log</h2>
+        <p class="muted">Latest ${entries.length} run${entries.length === 1 ? '' : 's'} (newest first).
+           Rows in red finished with errors.</p>
+        <table class="tbl tbl-zebra">
+          <thead><tr>
+            <th class="num">#</th><th>Started</th><th>Finished</th><th class="num">Duration</th>
+            <th class="num">Processed</th><th class="num">Edges created</th><th class="num">Errors</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </section>`;
+  });
 }
 
 /* ---------------------------------------------------------------- boot */
