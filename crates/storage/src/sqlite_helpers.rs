@@ -535,6 +535,33 @@ pub fn mark_consolidated(pool: &Pool<SqliteConnectionManager>, ids: &[String]) -
     Ok(())
 }
 
+/// Compare content and acknowledge in one SQL statement, avoiding a read/write race.
+pub fn mark_consolidated_if_unchanged(
+    pool: &Pool<SqliteConnectionManager>,
+    snapshots: &[(String, String)],
+) -> MerkurResult<()> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    let conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
+    let snapshots = serde_json::to_string(snapshots)
+        .map_err(|e| MerkurError::Storage(format!("Failed to encode snapshots: {e}")))?;
+    conn.execute(
+        "UPDATE memories SET pending_consolidation = 0
+         WHERE id IN (SELECT json_extract(value, '$[0]') FROM json_each(?1))
+         AND EXISTS (
+             SELECT 1 FROM json_each(?1) AS snapshot
+             WHERE memories.id = json_extract(snapshot.value, '$[0]')
+               AND memories.content = json_extract(snapshot.value, '$[1]')
+         )",
+        params![snapshots],
+    )
+    .map_err(|e| MerkurError::Storage(format!("Failed to mark consolidated: {e}")))?;
+    Ok(())
+}
+
 /// Update memory level.
 pub fn update_level(
     pool: &Pool<SqliteConnectionManager>,

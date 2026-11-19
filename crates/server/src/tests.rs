@@ -890,6 +890,467 @@ mod integration {
             "graph response must not leak the foreign-bucket id: {text}"
         );
     }
+    struct PausedAdjudicator {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Consolidator for PausedAdjudicator {
+        async fn consolidate(
+            &self,
+            memories: &[merkur_core::Memory],
+        ) -> merkur_core::MerkurResult<merkur_core::ConsolidationReport> {
+            let mut report = merkur_core::ConsolidationReport::empty();
+            report.memories_processed = memories.len();
+            report.new_abstracts = memories
+                .iter()
+                .map(|m| (m.id.clone(), "summary".into()))
+                .collect();
+            Ok(report)
+        }
+
+        async fn adjudicate(
+            &self,
+            _: &merkur_core::Memory,
+            _: &[merkur_core::ScoredMemory],
+        ) -> merkur_core::MerkurResult<merkur_core::Adjudication> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            if self.fail {
+                Err(merkur_core::MerkurError::Consolidation(
+                    "test failure".into(),
+                ))
+            } else {
+                Ok(merkur_core::Adjudication::default())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_batch_without_embedding_finishes_consolidation() {
+        let mut state = test_app().await;
+        let old = state
+            .storage
+            .insert_memory(&gov_memory("existing candidate", 1.0, 0.0))
+            .await
+            .unwrap();
+        state.storage.mark_consolidated(&[old]).await.unwrap();
+
+        let mut text_only = gov_memory("text-only memory", 1.0, 0.0);
+        text_only.embedding = None;
+        let text_id = state.storage.insert_memory(&text_only).await.unwrap();
+        let vector_id = state
+            .storage
+            .insert_memory(&gov_memory("vector memory", 0.9, 0.1))
+            .await
+            .unwrap();
+
+        let consolidator = Arc::new(PausedAdjudicator {
+            entered: Default::default(),
+            release: Default::default(),
+            fail: false,
+        });
+        state.consolidator = consolidator.clone();
+        let mut config = (*state.config).clone();
+        config.consolidation.adjudication_candidates = 5;
+        state.config = Arc::new(config);
+        // Only the vector-backed memory should reach adjudication.
+        consolidator.release.notify_one();
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.start_consolidation().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            consolidator.entered.notified(),
+        )
+        .await
+        .expect("vector-backed memory must still be adjudicated");
+        assert_eq!(report.memories_processed, 2);
+        assert_eq!(
+            report.errors, 0,
+            "absent optional embedding is not an adjudication error"
+        );
+        for id in [&text_id, &vector_id] {
+            let memory = state.storage.get_memory(id).await.unwrap().unwrap();
+            assert_eq!(memory.abstract_.as_deref(), Some("summary"));
+            assert!(!memory.pending_consolidation);
+        }
+        assert_eq!(
+            state.storage.stats().await.unwrap().pending_consolidation,
+            0
+        );
+        assert_eq!(state.consolidation.snapshot().state, "succeeded");
+        assert_eq!(
+            state.storage.get_consolidation_log(1).await.unwrap()[0].errors,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_remains_visible_until_adjudication_finishes() {
+        let state = test_app().await;
+        let old = state
+            .storage
+            .insert_memory(&gov_memory("old", 1.0, 0.0))
+            .await
+            .unwrap();
+        state.storage.mark_consolidated(&[old]).await.unwrap();
+        let id = state
+            .storage
+            .insert_memory(&gov_memory("new", 0.9, 0.1))
+            .await
+            .unwrap();
+        let consolidator = Arc::new(PausedAdjudicator {
+            entered: Default::default(),
+            release: Default::default(),
+            fail: false,
+        });
+        let task = tokio::spawn({
+            let storage = state.storage.clone();
+            let c = consolidator.clone();
+            async move {
+                crate::scheduler::Scheduler::run_consolidation_once(&*storage, &*c, 10, 0.6, 5)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            consolidator.entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            state
+                .storage
+                .get_memory(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_consolidation
+        );
+        consolidator.release.notify_one();
+        assert_eq!(task.await.unwrap().errors, 0);
+        assert!(
+            !state
+                .storage
+                .get_memory(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_consolidation
+        );
+    }
+
+    #[tokio::test]
+    async fn edits_during_adjudication_remain_pending() {
+        let state = test_app().await;
+        let old = state
+            .storage
+            .insert_memory(&gov_memory("old", 1.0, 0.0))
+            .await
+            .unwrap();
+        state.storage.mark_consolidated(&[old]).await.unwrap();
+        let id = state
+            .storage
+            .insert_memory(&gov_memory("new", 0.9, 0.1))
+            .await
+            .unwrap();
+        let c = Arc::new(PausedAdjudicator {
+            entered: Default::default(),
+            release: Default::default(),
+            fail: false,
+        });
+        let job = tokio::spawn({
+            let storage = state.storage.clone();
+            let c = c.clone();
+            async move {
+                crate::scheduler::Scheduler::run_consolidation_once(&*storage, &*c, 10, 0.6, 5)
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.entered.notified())
+            .await
+            .unwrap();
+        state
+            .storage
+            .update_memory(&id, "edited while processing", Some(&[1.0; 16]))
+            .await
+            .unwrap();
+        c.release.notify_one();
+        assert_eq!(job.await.unwrap().errors, 0);
+        let memory = state.storage.get_memory(&id).await.unwrap().unwrap();
+        assert_eq!(memory.content, "edited while processing");
+        assert!(
+            memory.pending_consolidation,
+            "a stale batch must not acknowledge new content"
+        );
+    }
+
+    #[tokio::test]
+    async fn consolidation_rejects_overlap_and_survives_waiter_cancellation() {
+        let mut state = test_app().await;
+        let old = state
+            .storage
+            .insert_memory(&gov_memory("old", 1.0, 0.0))
+            .await
+            .unwrap();
+        state.storage.mark_consolidated(&[old]).await.unwrap();
+        state
+            .storage
+            .insert_memory(&gov_memory("new", 0.9, 0.1))
+            .await
+            .unwrap();
+        let c = Arc::new(PausedAdjudicator {
+            entered: Default::default(),
+            release: Default::default(),
+            fail: false,
+        });
+        state.consolidator = c.clone();
+        let mut config = (*state.config).clone();
+        config.consolidation.adjudication_candidates = 5;
+        state.config = Arc::new(config);
+        // This is the same entry point used by the periodic scheduler.
+        let task = state.start_consolidation().expect("first run starts");
+        tokio::time::timeout(std::time::Duration::from_secs(5), c.entered.notified())
+            .await
+            .unwrap();
+        let app = router::create_router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["consolidation"]["state"], "running");
+        assert_eq!(body["pending_consolidation"], 1);
+        let response = app
+            .oneshot(
+                Request::post("/v1/consolidate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        drop(task); // A disconnected HTTP waiter must not cancel the owned job.
+        c.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.consolidation.wait_idle(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.consolidation.snapshot().state, "succeeded");
+        assert_eq!(
+            state.storage.stats().await.unwrap().pending_consolidation,
+            0
+        );
+        assert_eq!(
+            state.storage.get_consolidation_log(10).await.unwrap().len(),
+            1
+        );
+        assert!(state.start_consolidation().unwrap().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_adjudication_keeps_memory_pending_and_reports_failure() {
+        let mut state = test_app().await;
+        let old = state
+            .storage
+            .insert_memory(&gov_memory("old", 1.0, 0.0))
+            .await
+            .unwrap();
+        state.storage.mark_consolidated(&[old]).await.unwrap();
+        let id = state
+            .storage
+            .insert_memory(&gov_memory("new", 0.9, 0.1))
+            .await
+            .unwrap();
+        let c = Arc::new(PausedAdjudicator {
+            entered: Default::default(),
+            release: Default::default(),
+            fail: true,
+        });
+        state.consolidator = c.clone();
+        let mut config = (*state.config).clone();
+        config.consolidation.adjudication_candidates = 5;
+        state.config = Arc::new(config);
+        c.release.notify_one();
+        let report = state.start_consolidation().unwrap().await.unwrap();
+        assert_eq!(report.errors, 1);
+        assert_eq!(state.consolidation.snapshot().state, "failed");
+        assert!(
+            state
+                .storage
+                .get_memory(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_consolidation
+        );
+        assert_eq!(
+            state.storage.get_consolidation_log(1).await.unwrap()[0].errors,
+            1
+        );
+        // Failure must release the execution gate for a subsequent retry.
+        c.release.notify_one();
+        assert_eq!(
+            state.start_consolidation().unwrap().await.unwrap().errors,
+            1
+        );
+    }
+
+    struct BrokenConsolidator {
+        panic: bool,
+    }
+    #[async_trait::async_trait]
+    impl Consolidator for BrokenConsolidator {
+        async fn consolidate(
+            &self,
+            _: &[merkur_core::Memory],
+        ) -> merkur_core::MerkurResult<merkur_core::ConsolidationReport> {
+            assert!(!self.panic, "scripted panic");
+            Err(merkur_core::MerkurError::Consolidation(
+                "scripted failure".into(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn extraction_error_or_panic_reports_failure_and_releases_gate() {
+        for panic in [false, true] {
+            let mut state = test_app().await;
+            state
+                .storage
+                .insert_memory(&gov_memory("pending", 1.0, 0.0))
+                .await
+                .unwrap();
+            state.consolidator = Arc::new(BrokenConsolidator { panic });
+            let result = state.start_consolidation().unwrap().await;
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap().errors, 1);
+            }
+            let status = state.consolidation.snapshot();
+            assert_eq!(status.state, "failed");
+            assert!(status.finished_at.is_some());
+            assert!(status.errors > 0);
+            assert_eq!(
+                state.storage.stats().await.unwrap().pending_consolidation,
+                1
+            );
+            let response = router::create_router(state.clone())
+                .oneshot(
+                    Request::post("/v1/consolidate")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if panic {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                } else {
+                    StatusCode::OK
+                }
+            );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if !panic {
+                assert_eq!(body["status"], "failed");
+            }
+        }
+    }
+
+    struct ObservedForgetter {
+        calls: AtomicU64,
+    }
+    impl Forgetter for ObservedForgetter {
+        fn compute_weight(&self, _: &merkur_core::Memory, _: chrono::DateTime<chrono::Utc>) -> f64 {
+            1.0
+        }
+        fn decide(
+            &self,
+            _: &merkur_core::Memory,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> merkur_core::LevelAction {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            merkur_core::LevelAction::Keep
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduled_consolidation_does_not_block_forgetting_and_shutdown_drains_it() {
+        let mut state = test_app().await;
+        let old = state
+            .storage
+            .insert_memory(&gov_memory("old", 1.0, 0.0))
+            .await
+            .unwrap();
+        state.storage.mark_consolidated(&[old]).await.unwrap();
+        state
+            .storage
+            .insert_memory(&gov_memory("new", 0.9, 0.1))
+            .await
+            .unwrap();
+        let c = Arc::new(PausedAdjudicator {
+            entered: Default::default(),
+            release: Default::default(),
+            fail: false,
+        });
+        let f = Arc::new(ObservedForgetter {
+            calls: AtomicU64::new(0),
+        });
+        state.consolidator = c.clone();
+        state.forgetter = f.clone();
+        let mut config = (*state.config).clone();
+        config.consolidation.adjudication_candidates = 5;
+        config.consolidation.interval_seconds = 60;
+        config.forgetting.interval_seconds = 1;
+        state.config = Arc::new(config);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let scheduler = Arc::new(crate::scheduler::Scheduler::new(state.clone()));
+        let run = tokio::spawn(scheduler.run(rx));
+        tokio::time::timeout(std::time::Duration::from_secs(10), c.entered.notified())
+            .await
+            .unwrap();
+        assert!(state.start_consolidation().is_none());
+        let before = f.calls.load(Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while f.calls.load(Ordering::SeqCst) == before {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("forgetting stalled behind consolidation");
+        tx.send(true).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!run.is_finished());
+        c.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.consolidation.snapshot().state, "succeeded");
+    }
+
     /// P1-7 write governance: an UPDATE verdict absorbs the pending memory
     /// into the existing one — in-place content update on the target,
     /// invalidation with an audit pointer on the pending row — when the pair

@@ -131,13 +131,14 @@ if [ "${MERKUR_EVAL_CONSOLIDATOR:-}" = "llm" ]; then
   echo "== waiting for consolidation queue to drain"
   # 5882 memories / 25 per tick with a reasoning model ≈ 2-3.5 h; budget 4 h.
   for i in $(seq 1 2880); do
-    PENDING=$(curl -fs -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/v1/status" | python3 -c "import json,sys; print(json.load(sys.stdin)['pending_consolidation'])")
-    [ "$PENDING" = "0" ] && break
+    QUEUE=$(curl -fs -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/v1/status" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pending_consolidation'], (d.get('consolidation') or {}).get('state', 'idle'))")
+    read -r PENDING JOB_STATE <<< "$QUEUE"
+    [ "$PENDING" = "0" ] && { [ "$JOB_STATE" = "idle" ] || [ "$JOB_STATE" = "succeeded" ]; } && break
     if [ "$i" = "2880" ]; then
       echo "consolidation did not drain within 4 h — aborting" >&2
       exit 1
     fi
-    if [ "$((i % 60))" = "0" ]; then echo "   pending: $PENDING"; fi
+    if [ "$((i % 60))" = "0" ]; then echo "   pending: $PENDING, job: $JOB_STATE"; fi
     sleep 5
   done
   echo "== consolidation drained"

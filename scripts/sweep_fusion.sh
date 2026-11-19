@@ -123,8 +123,9 @@ drain() {
   echo "== draining consolidation queue"
   local last_pending=-1 stuck=0
   for i in $(seq 1 2880); do
-    PENDING=$(curl -fs -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/v1/status" | python3 -c "import json,sys; print(json.load(sys.stdin)['pending_consolidation'])")
-    [ "$PENDING" = "0" ] && break
+    QUEUE=$(curl -fs -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/v1/status" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['pending_consolidation'], (d.get('consolidation') or {}).get('state', 'idle'))")
+    read -r PENDING JOB_STATE <<< "$QUEUE"
+    [ "$PENDING" = "0" ] && { [ "$JOB_STATE" = "idle" ] || [ "$JOB_STATE" = "succeeded" ]; } && break
     # Stall detector: pending flat for 25 min (>2 max-timeout ticks at 600s)
     # means the LLM endpoint is dead — abort loudly instead of burning 4 h.
     if [ "$PENDING" = "$last_pending" ]; then
@@ -140,7 +141,7 @@ drain() {
       echo "consolidation did not drain within 4 h — aborting" >&2
       exit 1
     fi
-    if [ "$((i % 60))" = "0" ]; then echo "   pending: $PENDING"; fi
+    if [ "$((i % 60))" = "0" ]; then echo "   pending: $PENDING, job: $JOB_STATE"; fi
     sleep 5
   done
   echo "== consolidation drained"

@@ -14,18 +14,18 @@ use crate::handlers::namespace::Namespace;
 use crate::scheduler;
 
 pub async fn trigger_consolidate(State(state): State<AppState>) -> ApiResult<impl IntoResponse> {
-    let report = scheduler::Scheduler::run_consolidation_once(
-        &*state.storage,
-        &*state.consolidator,
-        state.config.consolidation.batch_size,
-        state.config.consolidation.adjudication_floor,
-        state.config.consolidation.adjudication_candidates,
-    )
-    .await;
+    let job = state.start_consolidation().ok_or_else(|| ApiError {
+        status: StatusCode::CONFLICT,
+        code: "CONSOLIDATION_RUNNING",
+        message: "A consolidation job is already running".into(),
+    })?;
+    let report = job
+        .await
+        .map_err(|_| ApiError::internal("Consolidation task failed"))?;
     Ok((
         StatusCode::OK,
         Json(json!({
-            "status": "ok",
+            "status": if report.errors == 0 { "ok" } else { "failed" },
             "processed": report.memories_processed,
             "edges_created": report.edges_created,
             "absorptions": report.absorptions,

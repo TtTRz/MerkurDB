@@ -669,6 +669,16 @@ impl Storage for SqliteStorage {
         run_blocking(move || sqlite_helpers::mark_consolidated(&pool, &ids)).await
     }
 
+    async fn mark_consolidated_if_unchanged(
+        &self,
+        snapshots: &[(String, String)],
+    ) -> MerkurResult<()> {
+        let snapshots = snapshots.to_vec();
+        let pool = self.pool.clone();
+        run_blocking(move || sqlite_helpers::mark_consolidated_if_unchanged(&pool, &snapshots))
+            .await
+    }
+
     async fn update_level(&self, id: &str, level: i32) -> MerkurResult<()> {
         let id_owned = id.to_string();
         let pool = self.pool.clone();

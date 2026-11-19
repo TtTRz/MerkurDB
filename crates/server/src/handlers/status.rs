@@ -12,6 +12,7 @@ pub async fn status(State(state): State<AppState>) -> ApiResult<impl IntoRespons
     Ok((
         StatusCode::OK,
         Json(json!({
+            "consolidation": state.consolidation.snapshot(),
             "total_memories": stats.total_memories,
             "total_edges": stats.total_edges,
             "pending_consolidation": stats.pending_consolidation,

@@ -1,6 +1,7 @@
 mod app_state;
 mod auth;
 mod config;
+mod consolidation;
 mod error;
 mod handlers;
 mod metrics;
@@ -66,26 +67,6 @@ async fn main() -> Result<()> {
         },
     ));
 
-    // Build the scheduler with a shutdown signal.
-    let (sched_shutdown_tx, sched_shutdown_rx) = watch::channel(false);
-    let sched = Arc::new(scheduler::Scheduler::new(
-        storage.clone(),
-        consolidator.clone(),
-        forgetter.clone(),
-        std::time::Duration::from_secs(cfg.consolidation.interval_seconds),
-        cfg.consolidation.batch_size,
-        std::time::Duration::from_secs(cfg.forgetting.interval_seconds),
-        cfg.forgetting.batch_size,
-        cfg.forgetting.archive_days,
-        cfg.forgetting.purge_invalidated_days,
-        cfg.consolidation.adjudication_floor,
-        cfg.consolidation.adjudication_candidates,
-    ));
-    let sched_handle = tokio::spawn({
-        let sched = sched.clone();
-        async move { sched.run(sched_shutdown_rx).await }
-    });
-
     let started_at = chrono::Utc::now();
     let state = app_state::AppState::new(
         embedder,
@@ -95,6 +76,10 @@ async fn main() -> Result<()> {
         cfg.clone(),
         started_at,
     );
+
+    let (sched_shutdown_tx, sched_shutdown_rx) = watch::channel(false);
+    let sched = Arc::new(scheduler::Scheduler::new(state.clone()));
+    let sched_handle = tokio::spawn(async move { sched.run(sched_shutdown_rx).await });
 
     let cors = build_cors(&cfg.server.cors_allow_origin, cfg.server.dev_mode);
     let app = router::create_router(state).layer(cors);

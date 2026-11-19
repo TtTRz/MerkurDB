@@ -7,6 +7,7 @@ use crate::rate_limit::GlobalLimiter;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub consolidation: Arc<crate::consolidation::ConsolidationControl>,
     pub embedder: Arc<dyn Embedder>,
     pub storage: Arc<dyn Storage>,
     pub consolidator: Arc<dyn Consolidator>,
@@ -17,6 +18,22 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn start_consolidation(
+        &self,
+    ) -> Option<tokio::task::JoinHandle<merkur_core::ConsolidationReport>> {
+        let state = self.clone();
+        self.consolidation.start(async move {
+            crate::scheduler::Scheduler::run_consolidation_once(
+                &*state.storage,
+                &*state.consolidator,
+                state.config.consolidation.batch_size,
+                state.config.consolidation.adjudication_floor,
+                state.config.consolidation.adjudication_candidates,
+            )
+            .await
+        })
+    }
+
     pub fn new(
         embedder: Arc<dyn Embedder>,
         storage: Arc<dyn Storage>,
@@ -33,6 +50,7 @@ impl AppState {
             None
         };
         Self {
+            consolidation: Arc::new(Default::default()),
             embedder,
             storage,
             consolidator,

@@ -757,6 +757,9 @@ mod tests {
         async fn mark_consolidated(&self, _: &[String]) -> MerkurResult<()> {
             unimplemented!()
         }
+        async fn mark_consolidated_if_unchanged(&self, _: &[(String, String)]) -> MerkurResult<()> {
+            unimplemented!()
+        }
         async fn update_level(&self, _: &str, _: i32) -> MerkurResult<()> {
             unimplemented!()
         }

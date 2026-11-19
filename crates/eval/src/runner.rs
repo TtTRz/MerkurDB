@@ -488,8 +488,9 @@ pub fn score_pm(records: &[PmRecord]) -> PmReport {
 /// memories — no future leakage, minimal writes.
 /// Wait until the server's consolidation queue is empty, so a checkpoint's
 /// answers see the fully processed memory state (extraction + adjudication
-/// settle together: `pending_consolidation` clears only after the tick's
-/// adjudication ran). On budget exhaustion, log and proceed — answering
+/// settle together: pending work must be zero and the current job must
+/// be idle or successful). Older servers without job status use pending only.
+/// On budget exhaustion, log and proceed — answering
 /// against a partially processed pipeline is a valid measurement, a hung
 /// replay is not.
 async fn drain_consolidation(
@@ -501,12 +502,22 @@ async fn drain_consolidation(
     let started = std::time::Instant::now();
     loop {
         match client.status().await {
-            Ok(s) if s.pending_consolidation == 0 => return,
+            Ok(s)
+                if s.pending_consolidation == 0
+                    && s.consolidation
+                        .as_ref()
+                        .is_none_or(|job| matches!(job.state.as_str(), "idle" | "succeeded")) =>
+            {
+                return;
+            }
             Ok(s) => {
                 if started.elapsed() >= budget {
                     eprintln!(
-                        "[pm] {label}: drain budget exhausted with {} pending — answering against partial pipeline state",
-                        s.pending_consolidation
+                        "[pm] {label}: drain budget exhausted with {} pending (job {}) — answering against partial pipeline state",
+                        s.pending_consolidation,
+                        s.consolidation
+                            .as_ref()
+                            .map_or("unknown", |job| job.state.as_str())
                     );
                     return;
                 }
@@ -703,6 +714,12 @@ mod tests {
     // ── drain (consolidation settle) ──
 
     async fn spawn_status_stub(pending_sequence: Vec<usize>) -> (String, Arc<Mutex<usize>>) {
+        spawn_pipeline_status_stub(pending_sequence.into_iter().map(|n| (n, None)).collect()).await
+    }
+
+    async fn spawn_pipeline_status_stub(
+        pending_sequence: Vec<(usize, Option<&'static str>)>,
+    ) -> (String, Arc<Mutex<usize>>) {
         let polls = Arc::new(Mutex::new(0usize));
         let polls_handler = polls.clone();
         let app = axum::Router::new().route(
@@ -715,7 +732,7 @@ mod tests {
                     *n += 1;
                     // The sequence's tail repeats forever: a stub either
                     // settles at 0 (drain succeeds) or never does (budget).
-                    let pending = pending_sequence
+                    let (pending, state) = pending_sequence
                         .get(*n - 1)
                         .copied()
                         .unwrap_or_else(|| *pending_sequence.last().unwrap());
@@ -723,6 +740,9 @@ mod tests {
                         "total_memories": 10,
                         "total_edges": 0,
                         "pending_consolidation": pending,
+                        "consolidation": state.map(|s| serde_json::json!({
+                            "state": s, "started_at": null, "finished_at": null, "processed": 0, "errors": 0
+                        })),
                         "by_level": {},
                         "uptime_seconds": 1
                     }))
@@ -753,6 +773,24 @@ mod tests {
             3,
             "drain must keep polling until pending hits 0"
         );
+    }
+
+    #[tokio::test]
+    async fn drain_does_not_treat_running_or_failed_jobs_as_settled() {
+        let (base, polls) = spawn_pipeline_status_stub(vec![
+            (0, Some("running")),
+            (0, Some("failed")),
+            (0, Some("succeeded")),
+        ])
+        .await;
+        drain_consolidation(
+            &HttpMerkurClient::new(&base).unwrap(),
+            "test",
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(*polls.lock().unwrap(), 3);
     }
 
     #[tokio::test]

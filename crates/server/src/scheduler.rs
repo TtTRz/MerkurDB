@@ -5,72 +5,63 @@ use tokio::sync::watch;
 use tracing::{debug, error, info};
 
 pub struct Scheduler {
-    storage: Arc<dyn Storage>,
-    consolidator: Arc<dyn Consolidator>,
-    forgetter: Arc<dyn Forgetter>,
-    consolidation_interval: Duration,
-    consolidation_batch_size: usize,
-    forgetting_interval: Duration,
-    forgetting_batch_size: usize,
-    archive_days: i32,
-    purge_invalidated_days: i32,
-    adjudication_floor: f64,
-    adjudication_candidates: usize,
+    state: crate::app_state::AppState,
 }
 
 impl Scheduler {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        storage: Arc<dyn Storage>,
-        consolidator: Arc<dyn Consolidator>,
-        forgetter: Arc<dyn Forgetter>,
-        consolidation_interval: Duration,
-        consolidation_batch_size: usize,
-        forgetting_interval: Duration,
-        forgetting_batch_size: usize,
-        archive_days: i32,
-        purge_invalidated_days: i32,
-        adjudication_floor: f64,
-        adjudication_candidates: usize,
-    ) -> Self {
-        Self {
-            storage,
-            consolidator,
-            forgetter,
-            consolidation_interval,
-            consolidation_batch_size,
-            forgetting_interval,
-            forgetting_batch_size,
-            archive_days,
-            purge_invalidated_days,
-            adjudication_floor,
-            adjudication_candidates,
-        }
+    pub fn new(state: crate::app_state::AppState) -> Self {
+        Self { state }
     }
 
-    /// Run until the shutdown channel fires. The current tick is allowed to
-    /// finish before exiting so we don't truncate a half-written consolidation.
-    pub async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
-        let mut consolidate_ticker = tokio::time::interval(self.consolidation_interval);
-        let mut forget_ticker = tokio::time::interval(self.forgetting_interval);
-        consolidate_ticker.reset_after(Duration::from_secs(5));
-
-        loop {
-            tokio::select! {
-                _ = consolidate_ticker.tick() => {
-                    self.run_consolidation().await;
+    /// Separate loops keep slow consolidation from delaying forgetting.
+    /// Shutdown drains any owned job, including one started through HTTP.
+    pub async fn run(self: Arc<Self>, shutdown: watch::Receiver<bool>) {
+        let consolidation = async {
+            let mut shutdown = shutdown.clone();
+            let mut ticker = tokio::time::interval(Duration::from_secs(
+                self.state.config.consolidation.interval_seconds,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.reset_after(Duration::from_secs(5));
+            loop {
+                if *shutdown.borrow() {
+                    break;
                 }
-                _ = forget_ticker.tick() => {
-                    self.run_forgetting().await;
-                }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        info!("Scheduler received shutdown");
-                        break;
+                tokio::select! {
+                    biased;
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow() { break; }
+                    }
+                    _ = ticker.tick() => {
+                        if let Some(job) = self.state.start_consolidation()
+                            && let Err(e) = job.await {
+                                error!("Consolidation task failed: {e}");
+                            }
                     }
                 }
             }
-        }
+            self.state.consolidation.wait_idle().await;
+        };
+        let forgetting = async {
+            let mut shutdown = shutdown.clone();
+            let mut ticker = tokio::time::interval(Duration::from_secs(
+                self.state.config.forgetting.interval_seconds,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                if *shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    result = shutdown.changed() => {
+                        if result.is_err() || *shutdown.borrow() { break; }
+                    }
+                    _ = ticker.tick() => { self.run_forgetting().await; }
+                }
+            }
+        };
+        tokio::join!(consolidation, forgetting);
     }
 
     pub async fn run_consolidation_once(
@@ -84,7 +75,10 @@ impl Scheduler {
             Ok(p) => p,
             Err(e) => {
                 error!("Failed to list pending memories: {e}");
-                return ConsolidationReport::empty();
+                return ConsolidationReport {
+                    errors: 1,
+                    ..Default::default()
+                };
             }
         };
 
@@ -100,7 +94,18 @@ impl Scheduler {
             Ok(r) => r,
             Err(e) => {
                 error!("Consolidation failed: {e}");
-                return ConsolidationReport::empty();
+                let mut report = ConsolidationReport {
+                    errors: 1,
+                    ..Default::default()
+                };
+                if let Err(e) = storage
+                    .log_consolidation(started_at, chrono::Utc::now(), &report)
+                    .await
+                {
+                    error!("Failed to log consolidation: {e}");
+                    report.errors += 1;
+                }
+                return report;
             }
         };
 
@@ -142,13 +147,6 @@ impl Scheduler {
         }
         report.edges_created = actually_created;
 
-        if !consolidated_ids.is_empty()
-            && let Err(e) = storage.mark_consolidated(&consolidated_ids).await
-        {
-            error!("Failed to mark consolidated: {e}");
-            report.errors += 1;
-        }
-
         // Write governance (P1-7): adjudicate each pending memory against its
         // nearest neighbors in the same bucket. UPDATE/DELETE are destructive,
         // so an LLM verdict alone is never enough — it executes only when the
@@ -168,6 +166,7 @@ impl Scheduler {
                 Ok(e) => e,
                 Err(e) => {
                     error!("Failed to fetch embeddings for adjudication: {e}");
+                    report.errors += 1;
                     Default::default()
                 }
             };
@@ -186,6 +185,9 @@ impl Scheduler {
                 let futs: Vec<_> = chunk
                     .iter()
                     .map(|&(index, memory)| async move {
+                        // Embeddings are optional: text-only memories can finish
+                        // extraction without vector adjudication. Batch fetch errors
+                        // are recorded above and still prevent acknowledgement.
                         let embedding = embeddings.get(&memory.id)?;
                         let hits = match storage
                             .vector_search_ns(
@@ -201,7 +203,12 @@ impl Scheduler {
                                     "Adjudication candidate search failed for {}: {e}",
                                     memory.id
                                 );
-                                return None;
+                                return Some((
+                                    index,
+                                    merkur_core::Adjudication::default(),
+                                    Vec::new(),
+                                    true,
+                                ));
                             }
                         };
                         let candidates: Vec<_> = hits
@@ -264,6 +271,9 @@ impl Scheduler {
                                     .await
                                 {
                                     Ok(()) => {
+                                        // The target's content changed; it needs a fresh
+                                        // extraction even if it was also in this batch.
+                                        consolidated_ids.retain(|id| id != target);
                                         match storage
                                             .invalidate_memory(&memory.id, Some(target))
                                             .await
@@ -346,12 +356,28 @@ impl Scheduler {
             }
         }
 
+        let snapshots: Vec<_> = pending
+            .iter()
+            .filter(|m| consolidated_ids.contains(&m.id))
+            .map(|m| (m.id.clone(), m.content.clone()))
+            .collect();
+        // Retry failed batches without pretending partial work is settled.
+        // Existing writes remain visible; this is not an exactly-once transaction.
+        if report.errors == 0
+            && !consolidated_ids.is_empty()
+            && let Err(e) = storage.mark_consolidated_if_unchanged(&snapshots).await
+        {
+            error!("Failed to mark consolidated: {e}");
+            report.errors += 1;
+        }
+
         let finished_at = chrono::Utc::now();
         if let Err(e) = storage
             .log_consolidation(started_at, finished_at, &report)
             .await
         {
             error!("Failed to log consolidation: {e}");
+            report.errors += 1;
         }
 
         info!(
@@ -360,17 +386,6 @@ impl Scheduler {
         );
 
         report
-    }
-
-    async fn run_consolidation(&self) {
-        Self::run_consolidation_once(
-            &*self.storage,
-            &*self.consolidator,
-            self.consolidation_batch_size,
-            self.adjudication_floor,
-            self.adjudication_candidates,
-        )
-        .await;
     }
 
     pub async fn run_forgetting_once(
@@ -455,11 +470,11 @@ impl Scheduler {
 
     async fn run_forgetting(&self) {
         Self::run_forgetting_once(
-            &*self.storage,
-            &*self.forgetter,
-            self.forgetting_batch_size,
-            self.archive_days,
-            self.purge_invalidated_days,
+            &*self.state.storage,
+            &*self.state.forgetter,
+            self.state.config.forgetting.batch_size,
+            self.state.config.forgetting.archive_days,
+            self.state.config.forgetting.purge_invalidated_days,
         )
         .await;
     }

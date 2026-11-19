@@ -187,6 +187,14 @@ pub trait Storage: Send + Sync {
     async fn list_pending(&self, limit: usize) -> MerkurResult<Vec<Memory>>;
     async fn list_for_forgetting(&self, limit: usize) -> MerkurResult<Vec<Memory>>;
     async fn mark_consolidated(&self, ids: &[String]) -> MerkurResult<()>;
+
+    /// Atomically acknowledge only rows whose content still matches the
+    /// processed snapshot. Concurrent edits must remain pending.
+    /// Each tuple is (memory ID, expected content).
+    async fn mark_consolidated_if_unchanged(
+        &self,
+        snapshots: &[(String, String)],
+    ) -> MerkurResult<()>;
     async fn update_level(&self, id: &str, level: i32) -> MerkurResult<()>;
 
     /// Set the post-consolidation abstract on a memory. Writes the

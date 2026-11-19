@@ -170,6 +170,16 @@ function runView(fn) {
 function renderDashboard() {
   runView(async () => {
     const s = await api('/v1/status');
+    const job = s.consolidation;
+    const jobDetail = job
+      ? `<dl class="fields">
+          <dt>State</dt><dd>${esc(job.state)}</dd>
+          <dt>Started</dt><dd>${esc(job.started_at || '—')}</dd>
+          <dt>Finished</dt><dd>${esc(job.finished_at || '—')}</dd>
+          <dt>Processed</dt><dd>${fmtNum(job.processed)}</dd>
+          <dt>Errors</dt><dd>${fmtNum(job.errors)}</dd>
+        </dl>`
+      : '<p class="muted">Job status is unavailable on this server.</p>';
     const levelRows = Object.keys(LEVEL_BY_CODE).map(code => {
       const name = LEVEL_BY_CODE[code];
       const n = (s.by_level && s.by_level[code] !== undefined) ? s.by_level[code] : 0;
@@ -189,6 +199,11 @@ function renderDashboard() {
         <div class="card"><div class="card-label">Edges</div><div class="card-value">${fmtNum(s.total_edges)}</div></div>
         <div class="card"><div class="card-label">Pending consolidation</div><div class="card-value">${fmtNum(s.pending_consolidation)}</div></div>
         <div class="card"><div class="card-label">Uptime</div><div class="card-value">${esc(fmtUptime(s.uptime_seconds))}</div></div>
+      </section>
+      <section class="panel">
+        <h3>Consolidation job</h3>
+        ${jobDetail}
+        <p class="muted">Current or last run in this server process. Pending count alone does not indicate completion. Refresh to update.</p>
       </section>
       <section class="grid-2">
         <div class="panel">
