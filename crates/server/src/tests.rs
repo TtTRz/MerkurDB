@@ -22,11 +22,14 @@ mod integration {
     }
 
     async fn test_app() -> AppState {
+        test_app_with_db(&temp_db_path()).await
+    }
+
+    async fn test_app_with_db(path: &str) -> AppState {
         let dim = 16;
         let embedder: Arc<dyn merkur_core::Embedder> = Arc::new(NoopEmbedder::new(dim));
-        let storage: Arc<dyn merkur_core::Storage> = Arc::new(
-            SqliteStorage::new(&temp_db_path(), dim).expect("Failed to create test storage"),
-        );
+        let storage: Arc<dyn merkur_core::Storage> =
+            Arc::new(SqliteStorage::new(path, dim).expect("Failed to create test storage"));
         let consolidator: Arc<dyn Consolidator> = Arc::new(NoopConsolidator);
         let forgetter: Arc<dyn Forgetter> =
             Arc::new(EbbinghausForgetter::new(EbbinghausConfig::default()));
@@ -1298,7 +1301,11 @@ mod integration {
 
     #[tokio::test]
     async fn scheduled_consolidation_does_not_block_forgetting_and_shutdown_drains_it() {
-        let mut state = test_app().await;
+        // Shared-memory SQLite cannot use WAL and has different lock semantics.
+        // Exercise overlapping jobs with the server's file-backed storage mode.
+        let directory = tempfile::tempdir_in(".").unwrap();
+        let path = directory.path().join("scheduler.db");
+        let mut state = test_app_with_db(path.to_str().unwrap()).await;
         let old = state
             .storage
             .insert_memory(&gov_memory("old", 1.0, 0.0))
