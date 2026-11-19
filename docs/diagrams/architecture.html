@@ -4913,7 +4913,7 @@
         <text x="318" y="88" class="t-cloud" font-size="9" font-weight="600">MerkurDB 单一二进制（零运行时依赖）</text>
 
         <!-- Connection paths (before components for correct z-order) -->
-        <path data-edge-from="agents" data-edge-to="server" data-edge-label="REST / MCP stdio" data-edge-key="0" data-edge-id="agents-server" data-composition-points="190,359;340,359" d="M 190 359 L 340 359" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="agents" data-edge-to="server" data-edge-label="HTTP /v1" data-edge-key="0" data-edge-id="agents-server" data-composition-points="190,359;340,359" d="M 190 359 L 340 359" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
         <path data-edge-from="evalc" data-edge-to="server" data-edge-label="同一 serving 路径" data-edge-key="1" data-edge-id="eval-server" data-composition-points="190,592;265,592;265,373;340,373" d="M 190 592 L 257 592 Q 265 592 265 584 L 265 381 Q 265 373 273 373 L 340 373" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
         <path data-edge-from="server" data-edge-to="embedder" data-edge-label="encode" data-edge-key="2" data-edge-id="server-embedder" data-composition-points="430,330;430,164" d="M 430 330 L 430 164" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="server" data-edge-to="sqlite" data-edge-label="读写 / 混合检索" data-edge-key="3" data-edge-id="server-sqlite" data-composition-points="520,359;640,359" d="M 520 359 L 640 359" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
@@ -5029,9 +5029,9 @@
         </g>
 
         <!-- Connection labels -->
-        <g data-detail="context" data-edge-from="agents" data-edge-to="server" data-edge-label="REST / MCP stdio" data-edge-key="0" data-edge-id="agents-server">
+        <g data-detail="context" data-edge-from="agents" data-edge-to="server" data-edge-label="HTTP /v1" data-edge-key="0" data-edge-id="agents-server">
           <rect x="221.6" y="339" width="86.8" height="14" rx="3" class="c-mask"/>
-          <text x="265" y="349" class="t-backend" font-size="8" text-anchor="middle">REST / MCP stdio</text>
+          <text x="265" y="349" class="t-backend" font-size="8" text-anchor="middle">HTTP /v1</text>
         </g>
         <g data-detail="context" data-edge-from="evalc" data-edge-to="server" data-edge-label="同一 serving 路径" data-edge-key="1" data-edge-id="eval-server">
           <rect x="219.2" y="462.5" width="91.6" height="14" rx="3" class="c-mask"/>

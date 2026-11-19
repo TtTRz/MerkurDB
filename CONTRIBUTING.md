@@ -20,12 +20,23 @@ cargo test --workspace
    ```bash
    cargo fmt --check
    cargo build --workspace
+   python3 scripts/test_mcp_e2e.py
    cargo test --workspace
+   cargo build --workspace --all-features
+   cargo test --workspace --all-features
    cargo clippy --workspace --all-features -- -D warnings
+   cargo build --workspace --no-default-features
+   cargo bench --workspace --no-run
    ```
 4. Add tests for new functionality
 5. Update docs if the API or config changes
 6. Submit a PR
+
+All-feature builds require `protoc` and a C/C++ toolchain. The real-server MCP
+test also requires Python 3 and permission to bind loopback ports. It launches
+the built server and MCP binaries with a temporary SQLite database and Noop
+providers; it makes no external model calls. SDK and MCP HTTP tests also bind
+loopback ports, so they must run outside a sandbox that forbids local listeners.
 
 ## Code Style
 

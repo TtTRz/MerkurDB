@@ -51,16 +51,20 @@ flowchart TB
 
     subgraph Search Path
         A2[Agent] -->|GET /v1/search| E2[Embedder]
-        E2 --> H[Hybrid: BM25 x vector RRF]
+        E2 --> V[Vector candidates]
+        V -->|default hybrid| H[BM25 x vector RRF]
         H -->|composite re-rank| R[Results]
-        H -->|mode=deep| BFS[BFS Graph Diffusion]
+        V -->|mode=fast| R
+        V -->|mode=deep| BFS[Seeds plus BFS Graph Diffusion]
         BFS --> R
     end
 
     subgraph Background
-        SCH[Scheduler] -->|periodic| CON[Consolidator]
+        SCH[Scheduler] -->|consolidation timer| JOB[Shared execution gate]
+        MAN[Manual trigger] --> JOB
+        JOB --> CON[Consolidator]
         CON -->|abstracts + importance + edges + adjudication| S2[Storage]
-        SCH -->|periodic| FOR[Forgetter]
+        SCH -->|independent forgetting timer| FOR[Forgetter]
         FOR -->|downgrade / upgrade / archive / purge| S2
     end
 ```
@@ -88,6 +92,10 @@ w(t) = w₀ · exp(-Δt · ln2 / h) · min(1 + β · log₂(1+n), 3.0)
 
 Access is recorded at serving points only (search results actually served, context assembly, MCP search) — pure retrieval internals never touch the signal, so promotion reflects demonstrated demand.
 
+Consolidation acknowledges a memory only after its abstract is persisted and adjudication has finished without batch errors, with an atomic check that the source content is unchanged. Storage permits memories without vectors; these skip vector adjudication and can still complete extraction. Noop consolidation emits no abstracts and leaves pending work unchanged.
+
+Manual and scheduled consolidation share a process-local execution gate. Job state and pending count are separate signals: a settled queue requires zero pending and an `idle` or `succeeded` job. Failed jobs release the gate for retry; applied writes are retained. The [architecture document](ARCHITECTURE.md#consolidation-tick) defines status, error and shutdown behavior.
+
 ## 5. Configuration-Driven
 
 All plugins selected at startup via config — replaceable without recompilation:
@@ -109,21 +117,28 @@ Retrieval fusion (`retrieval.fusion.*`), write governance (`write.*`, `consolida
 **Hybrid approach**: Rust trait (reference impl) + OpenAPI 3.0 spec (multi-language codegen)
 
 - `merkur-client` crate (`MerkurClient` trait + `HttpMerkurClient`, optional `with_namespace` scoping)
+- `merkur-mcp` stdio adapter uses the HTTP SDK and server configuration; `assemble_context` returns a digest and source IDs under an estimated token budget
 - `openapi.yaml` for openapi-generator: Python, TypeScript, Go, etc.
 - Third parties can integrate via REST API directly
 
 ```rust
 // Rust usage
+use merkur_client::{HttpMerkurClient, MerkurClient, SearchParams};
+
 let client = HttpMerkurClient::with_token("http://localhost:1934", token)?
     .with_namespace("my-agent");
 let resp = client.write("hello world", None, None).await?;
 let results = client.search("hello", &SearchParams::default()).await?;
+let context = client.assemble_context("current task", 1000, Some(50)).await?;
 ```
+
+MCP tool calls are initiated by the Agent. The adapter does not capture whole conversations or intercept model requests. Recalled content is reference data, and returned IDs allow the Agent to inspect sources. Namespace routing is logical scoping, not user authorization.
 
 ## 7. Roadmap
 
 | Priority | Feature |
 |----------|---------|
+| P2 | SQLite vector-engine feasibility, migration and performance validation |
 | P2 | At-rest encryption (SQLCipher or app-layer) |
 | P2 | PostgreSQL backend via the Storage trait |
 | P3 | Multi-modal (image embeddings) |

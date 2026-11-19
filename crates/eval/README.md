@@ -74,6 +74,21 @@ stats|ingest|recall|qa|pm-run --server ... --token ...`), with per-question
 - **Resilience**: searches retry with backoff (3 attempts); exhausted
   questions are counted under `errors` and excluded from scoring rather than
   aborting the run.
+- **Pipeline state**: `pm-run --drain-consolidation` waits until pending is
+  zero and `consolidation.state` is `idle` or `succeeded`. A failed job or a
+  running job with zero pending does not count as settled. Servers without
+  job status use the pending count alone. On drain timeout, the runner warns
+  and answers against partial state; this does not prove pipeline completion.
+- **Pipeline experiments**: `MERKUR_EVAL_CONSOLIDATOR=llm` enables extraction
+  in the orchestration scripts. LoCoMo and fusion-sweep scripts check pending
+  count plus job state, aborting if the queue fails to drain within their
+  budget. The default Noop consolidator emits no abstracts, so it cannot
+  drain pending extraction work. `pm-run --serve-abstracts` changes the text
+  provided to the answer model; it is a separate experiment setting.
+- **Comparisons**: report the scored question count and errors alongside
+  accuracy. Match dataset, answer/judge model, retrieval budget, prompt,
+  ingestion and pipeline state before comparing systems. Aggregate results
+  alone do not identify which pipeline stage caused a difference.
 
 ## Tests
 

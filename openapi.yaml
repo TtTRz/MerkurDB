@@ -784,7 +784,18 @@ paths:
     post:
       tags: [Lifecycle]
       summary: Manually trigger consolidation
-      description: Feed pending memories to consolidator for summarization and edge creation
+      description: |
+        Run one batch of extraction and adjudication. Shares a process-local execution
+        gate with scheduled jobs; overlap returns 409 instead of queuing.
+        Once started, the job continues if the HTTP client disconnects.
+        A completed batch returns 200 with status ok or failed; inspect errors.
+        Pending is cleared only for persisted abstracts whose source content still
+        matches the processed snapshot after adjudication. Text-only memories
+        inserted through Storage skip vector adjudication without counting as errors.
+        Actual extraction, vector-read, candidate-search or adjudication failures
+        keep remaining pending work retryable; applied writes are not rolled back.
+        Audit-log failure reports a failed job without undoing completion writes.
+        This is not a durable queue or an exactly-once transaction.
       operationId: triggerConsolidate
       responses:
         "200":
@@ -796,8 +807,10 @@ paths:
                 properties:
                   status:
                     type: string
+                    enum: [ok, failed]
                   processed:
                     type: integer
+                    description: Memories reported processed by the consolidator; not the number of cleared pending flags
                   edges_created:
                     type: integer
                   absorptions:
@@ -816,6 +829,18 @@ paths:
                 invalidations: 0
                 errors: 0
 
+        "409":
+          description: A consolidation job is already running (CONSOLIDATION_RUNNING)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: The consolidation task could not complete (for example, a panic)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -915,7 +940,7 @@ paths:
   /status:
     get:
       tags: [Status]
-      summary: Get storage statistics
+      summary: Get storage statistics and consolidation job status
       operationId: status
       responses:
         "200":
@@ -1147,12 +1172,15 @@ components:
     StatusResponse:
       type: object
       properties:
+        consolidation:
+          $ref: "#/components/schemas/ConsolidationStatus"
         total_memories:
           type: integer
         total_edges:
           type: integer
         pending_consolidation:
           type: integer
+          description: Live memories still flagged pending; zero alone does not establish that a running batch has completed
         by_level:
           type: object
           additionalProperties:
@@ -1165,6 +1193,37 @@ components:
         uptime_seconds:
           type: integer
           nullable: true
+
+    ConsolidationStatus:
+      type: object
+      description: |
+        Current or last batch in this server process; resets to idle on restart.
+        succeeded means this batch completed without reported errors, not that
+        the entire queue is empty. To wait for settled work, require zero pending
+        and state idle or succeeded. State becomes terminal after adjudication,
+        completion marking and the audit-log attempt. Audit-log failure can make
+        a job fail after completion writes. Noop consolidation emits no abstracts
+        and leaves pending flags unchanged. This state does not coordinate servers.
+      required: [state, processed, errors]
+      properties:
+        state:
+          type: string
+          enum: [idle, running, succeeded, failed]
+          description: No batch started, active batch, successful last batch, or failed/interrupted last batch
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        processed:
+          type: integer
+          description: Memories reported processed by the last completed attempt, not cleared pending flags; zero during a run
+        errors:
+          type: integer
+          description: Errors reported by the last completed attempt; zero during a run
 
     ErrorResponse:
       type: object

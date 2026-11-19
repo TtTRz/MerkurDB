@@ -21,8 +21,9 @@ We aim to respond within 48 hours and publish fixes promptly.
 ## Security Considerations for Deployers
 
 - MerkurDB stores embeddings and memory content on disk. Secure the data directory appropriately.
-- All endpoints except `/v1/health` and `/v1/metrics` require `Authorization: Bearer <token>` (`auth.tokens` in config). The server refuses to start with an empty token list unless `auth.disabled = true` **and** `server.dev_mode = true` — never enable `dev_mode` in production.
+- Data and lifecycle endpoints require `Authorization: Bearer <token>` (`auth.tokens` in config). `/v1/health`, `/v1/metrics`, `/ui`, `/ui/app.js` and `/ui/style.css` are public; console data still comes from authenticated API requests. The server refuses to start with an empty token list unless `auth.disabled = true` **and** `server.dev_mode = true` — never enable `dev_mode` in production.
 - The default configuration binds to `127.0.0.1` (localhost only). If exposing externally, keep the built-in bearer auth on and put TLS in front of it.
 - Logical namespaces (`X-Merkur-Namespace`) are an isolation convenience, **not** a security boundary — any authenticated caller may claim any bucket.
+- `merkur-mcp` uses the HTTP service and its bearer authentication. Keep `MERKUR_TOKEN` in private environment/configuration files. Its namespace scopes writes and retrieval, while memory-by-ID tools address records directly. Review recalled text as data rather than treating it as trusted instructions.
 - API keys for hosted providers (OpenAI embedder, LLM consolidator backends) are loaded from config files or environment variables. Do not commit config files containing secrets; prefer the `MERKUR_*` env vars.
 - LanceDB feature requires `protoc` (protobuf compiler). This is a build-time dependency only and not present in the runtime image.

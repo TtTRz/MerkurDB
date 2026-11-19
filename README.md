@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/TtTRz/MerkurDB/actions/workflows/ci.yml/badge.svg)](https://github.com/TtTRz/MerkurDB/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.92+-orange.svg)](rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 
 > [中文文档](README_CN.md)
 
@@ -53,7 +53,7 @@ curl localhost:1934/v1/health
 - **Ebbinghaus Forgetting Curve**: Exponential weight decay, access boost, cascade downgrade (Full→Summary→Title→Archive) with hysteresis-based promotion back up on repeated retrieval
 - **Write Governance (mem0-style)**: near-duplicate writes NOOP onto the existing memory (top-1 cosine ≥ 0.92, same bucket); the async Consolidator adjudicates each new memory against its neighbors — UPDATE absorbs the new content into the existing row (salience, edges, and access history preserved; audit pointer kept), DELETE soft-invalidates the loser. Verdicts execute only with an LLM consolidator AND pair similarity ≥ `consolidation.adjudication_floor` (dual-signal); the synchronous write path stays LLM-free
 - **Soft-Invalidation & Retention**: adjudicated-out memories vanish from every retrieval channel immediately but stay auditable via `GET /v1/memory/{id}` until `forgetting.purge_invalidated_days` (30d) hard-deletes them; client `DELETE` stays an immediate hard delete
-- **Context Assembly**: `POST /v1/context` packs a token-budgeted, deduplicated, prompt-ready digest from hybrid recall — the MCP-friendly entry point
+- **Context Assembly**: `POST /v1/context` and MCP `assemble_context` return a deduplicated digest with source IDs, packed within an estimated token budget
 - **Offline Consolidation**: LLM-driven summarization, entity extraction, and automatic edge creation
 - **Logical Namespaces**: `X-Merkur-Namespace` header scopes writes & all search modes to one bucket; hybrid retrieval stays isolated per bucket. Logical isolation, not a security boundary
 - **Embedded Web Console**: read-only observability UI served by the server itself at `/ui` (assets compiled into the binary, no separate deployment) — status dashboard with level/namespace distribution, memory browse + detail, graph neighborhood explorer, consolidation audit log. Pages are public; data flows through the authenticated API
@@ -64,7 +64,7 @@ curl localhost:1934/v1/health
 
 ## Hybrid Search
 
-`/v1/search` runs two channels in parallel and fuses them with Reciprocal Rank Fusion (`k = 60`, the standard value across retrieval systems):
+`/v1/search` retrieves candidates from two channels and fuses them with Reciprocal Rank Fusion (default `k = 60`):
 
 | Channel | Engine | Strength |
 |---|---|---|
@@ -74,7 +74,7 @@ curl localhost:1934/v1/health
 Design properties:
 
 - **Default mode.** `mode=hybrid` is implied; `fast` and `deep` remain available as explicit opt-outs.
-- **Normalized scores.** Fused scores are scaled to `(0, 1]` by the theoretical maximum (rank-1 in both channels = `1.0`; single-channel hits cap at ~`0.5`). `score_threshold` gates this fused relevance in hybrid mode and raw cosine in fast mode — one meaning across modes.
+- **Normalized scores.** Fused scores are scaled to `(0, 1]` by the theoretical maximum (rank-1 in both channels = `1.0`; a hit in only one channel caps at `0.5` with equal channel weights). Hybrid `score_threshold` gates fused relevance; the returned score includes composite re-ranking. Fast mode returns and gates raw cosine.
 - **CJK-ready.** The trigram tokenizer indexes every 3-character sliding window, so Chinese/Japanese/Korean queries match without a word segmentation dependency.
 - **Short-query fallback.** Queries under 3 characters cannot produce a trigram; the BM25 channel yields no candidates and vector similarity covers those queries alone.
 - **Always-on consistency.** FTS5 triggers mirror every insert/update/delete — including writes from the LanceDB backend and admin tools — so both channels always see the same data.
@@ -84,14 +84,16 @@ Design properties:
 
 The `merkur-eval` harness (`crates/eval`, MIT) runs two public benchmarks end-to-end against a live server — the same serving path real clients use — and writes per-question JSONL dumps so every number is auditable.
 
-| Benchmark | Metric | MerkurDB (raw ingest) | MerkurDB (consolidation on) | Reference points |
-|---|---|---|---|---|
-| LoCoMo (1,986 QA) | QA accuracy @30 (LLM-judged) | 64.8% | **68.3%** | mem0 paper 66.9% (GPT-4-class answerer + full extraction pipeline) |
-| LoCoMo (1,986 QA) | QA accuracy @200 (guarded) | **74.6%** | 73.0% | retrieval budget dominates; pipeline gain is shallow-pool |
-| LoCoMo | retrieval hit@30 / coverage | 0.762 / 0.703 | **0.816 / 0.759** | — |
-| PersonaMem 32k (589 MC QA) | accuracy | **73.2%** | 71.2% (raw served) / 68.9% (abstracts served) | frontier LLMs full-context ~52%; TencentDB Agent Memory 76.1% (same answer model, full pipeline) |
+| Benchmark | Metric | Raw ingest | Consolidation enabled |
+|---|---|---|---|
+| LoCoMo (1,986 questions) | QA accuracy @30 (guarded, LLM-judged) | 64.8% | **68.3%** |
+| LoCoMo (1,986 questions) | QA accuracy @200 (guarded) | **74.6%** | 73.0% |
+| LoCoMo | retrieval hit@30 / coverage | 0.762 / 0.703 | **0.816 / 0.759** |
+| PersonaMem 32k (589 questions) | accuracy | **73.2%** | 71.2% (content served) / 68.9% (abstracts served) |
 
-Enabling the consolidation pipeline (LLM abstracts + importance + edges, adjudication off) lifts LoCoMo QA by +3.5pt and retrieval hit@30 by +5.4pt at depth 30: importance variance lets the composite re-rank promote better candidates into a shallow top-k cut. Two honest boundary findings: at depth 200 the budget alone carries the gain (raw 74.6% ≈ consolidated 73.0%), and on PersonaMem's discriminating-choice questions the pipeline is net-negative — adjudicated absorptions erase fact-recall evidence and distilled abstracts lose the verbatim detail near-duplicate distractors are built on. Measured otherwise with raw dialog-turn ingest and lightweight answer models (`deepseek-v4-flash-vision-exp` judge on LoCoMo, `kimi-k2.5` on PersonaMem); judge/answer-model choices make cross-paper numbers approximate. Harness design: LLM-free retrieval-recall track scored against LoCoMo evidence annotations, judge-graded QA track (adversarial questions score abstention as correct), and in-situ checkpoint replay for PersonaMem (no future-turn leakage).
+These are recorded runs, not a guarantee for other models or workloads. LoCoMo uses `deepseek-v4-flash-vision-exp` as judge; the consolidation runs generate abstracts, importance and edges with adjudication disabled. At @30 the raw run scored 1,962 questions with 24 errors excluded; the consolidation run scored all 1,986. Both @200 runs scored all 1,986. PersonaMem uses `kimi-k2.5`: raw ingest scored 589 questions, while each extraction-and-adjudication run scored 586. Errors and scoring denominators must accompany comparisons.
+
+The observations favor raw ingest at @200 and on PersonaMem, while the LoCoMo @30 consolidation run scores higher. They do not isolate which pipeline component causes a difference or establish equivalence with another system's evaluation. The [harness documentation](crates/eval/README.md) describes checkpoint replay, queue draining and error handling; per-question dumps support further analysis.
 
 ```bash
 scripts/fetch_locomo.sh          # datasets (CC BY-NC / MIT, gitignored)
@@ -105,20 +107,30 @@ scripts/sweep_fusion.sh          # P1-5 fusion-parameter sweep (persistent corpu
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/v1/health` | Health check |
+| `GET` | `/v1/metrics` | Prometheus metrics |
 | `POST` | `/v1/write` | Write a memory |
 | `POST` | `/v1/write-batch` | Batch write |
 | `GET` | `/v1/search` | Search (level/category/date filtering; `X-Merkur-Namespace` header scopes to one bucket) |
+| `GET` | `/v1/memories` | Browse live memories with namespace, level and category filters and pagination |
 | `POST` | `/v1/context` | Token-budget context assembly (digest + items; namespace-aware) |
 | `GET` | `/v1/memory/{id}` | Get memory details |
 | `PUT` | `/v1/memory/{id}` | Update (auto re-embed) |
 | `DELETE` | `/v1/memory/{id}` | Delete (cascade edges + tags) |
-| `GET` | `/v1/status` | Storage stats + uptime |
-| `POST` | `/v1/consolidate` | Trigger consolidation |
+| `GET` | `/v1/status` | Storage stats, uptime and current/last consolidation job |
+| `POST` | `/v1/consolidate` | Run one batch; 409 if consolidation is running |
 | `GET` | `/v1/consolidate/log` | Consolidation audit log |
 | `POST` | `/v1/forget` | Trigger forgetting |
 | `POST` | `/v1/relate` | Create edge |
 | `POST` | `/v1/relate-batch` | Batch create edges |
 | `GET` | `/v1/graph/{id}` | Graph neighborhood with edges |
+
+## Consolidation and Job Status
+
+Manual and scheduled consolidation share a process-local execution gate. `POST /v1/consolidate` waits for one batch; an overlapping trigger returns `409 CONSOLIDATION_RUNNING`. Once started, the job continues if the caller disconnects. Periodic forgetting uses a separate loop, and graceful shutdown waits for active consolidation.
+
+`GET /v1/status` returns `consolidation.state` (`idle`, `running`, `succeeded`, `failed`), start/finish timestamps, processed count and error count. The Dashboard shows this snapshot when refreshed; status resets on restart. `succeeded` describes one batch. A settled queue requires both `pending_consolidation == 0` and a job state of `idle` or `succeeded`.
+
+Pending is cleared only for memories with persisted abstracts whose source content is unchanged after adjudication. Extraction, persistence or adjudication errors leave the batch pending for retry; applied writes are retained. Text-only memories inserted through the Storage API skip vector adjudication without counting as errors. The default Noop consolidator emits no abstracts and does not clear pending. Audit-log failures also mark the job failed, but do not undo earlier completion writes. The execution gate covers one server process.
 
 ## Docker
 
@@ -129,15 +141,24 @@ docker run -p 1934:1934 -v ./data:/var/lib/merkur/data merkurdb
 
 ## MCP Integration
 
-`merkur-mcp` exposes MerkurDB as a Model Context Protocol server over stdio. AI assistants (Claude Desktop, Cursor, etc.) can directly read/write memories.
+`merkur-mcp` is a stdio MCP adapter for a running `merkur-server`. Every tool uses the server's embedding provider, write governance, retrieval configuration, and access accounting; MCP does not open a database.
 
 ```bash
-# Build
-cargo build --release -p merkur-mcp
-
-# Run standalone (uses NoopEmbedder by default)
-MERKUR_DB_PATH=~/.merkur/data/merkur.db merkur-mcp
+cargo build --release -p merkur-server -p merkur-mcp
+# Start the server with your database, embedding and authentication configuration
+target/release/merkur-server --config config.example.yaml
+# In another terminal; use the token configured in server auth.tokens
+export MERKUR_TOKEN='<server-token>'
+MERKUR_URL=http://127.0.0.1:1934 MERKUR_NAMESPACE=default target/release/merkur-mcp
 ```
+
+| Environment variable | Value |
+|---|---|
+| `MERKUR_URL` | Server root URL; default `http://127.0.0.1:1934`, without `/v1` |
+| `MERKUR_TOKEN` | Bearer token matching a server `auth.tokens` entry |
+| `MERKUR_NAMESPACE` | Logical bucket for writes and retrieval; default `default` |
+
+MCP uses a 120-second HTTP timeout and returns tool failures with `isError: true`. Database and embedding configuration belong to the server. Namespaces are logical buckets, not user authorization boundaries; memory-by-ID tools address records directly.
 
 ### Claude Desktop
 
@@ -149,7 +170,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
     "merkurdb": {
       "command": "/path/to/merkur-mcp",
       "env": {
-        "MERKUR_DB_PATH": "~/.merkur/data/merkur.db"
+        "MERKUR_URL": "http://127.0.0.1:1934",
+        "MERKUR_TOKEN": "<server-token>",
+        "MERKUR_NAMESPACE": "default"
       }
     }
   }
@@ -166,7 +189,9 @@ Add to `.cursor/mcp.json` in your project:
     "merkurdb": {
       "command": "/path/to/merkur-mcp",
       "env": {
-        "MERKUR_DB_PATH": "~/.merkur/data/merkur.db"
+        "MERKUR_URL": "http://127.0.0.1:1934",
+        "MERKUR_TOKEN": "<server-token>",
+        "MERKUR_NAMESPACE": "default"
       }
     }
   }
@@ -179,15 +204,20 @@ Add to `.cursor/mcp.json` in your project:
 |------|-------------|
 | `write_memory` | Write a new memory |
 | `search_memory` | Hybrid BM25 + vector relevance search |
+| `assemble_context` | Retrieve a deduplicated digest within an estimated token budget, with source IDs |
 | `get_memory` | Get memory by ID |
 | `delete_memory` | Delete memory by ID |
 | `relate` | Create edge between memories |
+
+Suggested Agent workflow: call `assemble_context` at task start (for example `{"query":"release plan","token_budget":1000}`), inspect sources using `get_memory`, then save relevant facts or decisions using `write_memory` with provenance such as `context.session_id`. Treat recalled content as reference data. The Agent chooses when to call tools; this adapter does not automatically capture conversations or intercept model requests.
 
 ## Development
 
 ```bash
 cargo build --workspace
 cargo test --workspace
+# After building the server and MCP binaries; no external model calls
+python3 scripts/test_mcp_e2e.py
 cargo clippy --workspace --all-features -- -D warnings
 
 # Feature gates
@@ -216,6 +246,7 @@ crates/
 
 | Priority | Feature | Description |
 |----------|---------|-------------|
+| P2 | SQLite vector engine | Feasibility, migration and performance validation for the default backend |
 | P2 | At-rest encryption | SQLCipher or app-layer embedding column encryption |
 | P2 | PostgreSQL backend | PG storage backend via Storage trait |
 | P3 | Multi-modal | Image embedding support (CLIP, etc.) |

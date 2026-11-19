@@ -51,16 +51,20 @@ flowchart TB
 
     subgraph 检索路径
         A2[Agent] -->|GET /v1/search| E2[Embedder]
-        E2 --> H[混合: BM25 x 向量 RRF]
+        E2 --> V[向量候选]
+        V -->|默认 hybrid| H[BM25 x 向量 RRF]
         H -->|复合分重排| R[结果]
-        H -->|mode=deep| BFS[BFS 图扩散]
+        V -->|mode=fast| R
+        V -->|mode=deep| BFS[种子与 BFS 图扩散]
         BFS --> R
     end
 
     subgraph 后台
-        SCH[Scheduler] -->|周期| CON[Consolidator]
+        SCH[Scheduler] -->|巩固定时器| JOB[共享执行锁]
+        MAN[手动触发] --> JOB
+        JOB --> CON[Consolidator]
         CON -->|摘要 + 重要性 + 边 + 裁决| S2[Storage]
-        SCH -->|周期| FOR[Forgetter]
+        SCH -->|独立遗忘定时器| FOR[Forgetter]
         FOR -->|降级 / 回升 / 归档 / 清除| S2
     end
 ```
@@ -88,6 +92,10 @@ w(t) = w₀ · exp(-Δt · ln2 / h) · min(1 + β · log₂(1+n), 3.0)
 
 访问仅在实际服务的返回点记账（搜索结果被 served、上下文装配、MCP 搜索）—— 纯检索内部绝不触碰信号，回升反映的是真实需求。
 
+巩固仅在摘要已落盘、裁决结束且批次没有错误时确认记忆完成，并原子检查原文与处理时一致。Storage 允许记忆不带向量；这类记忆跳过向量裁决，仍可完成抽取。Noop consolidation 不产出摘要，保留 pending。
+
+手动和定时巩固共用进程内执行锁。任务状态和 pending 数量是两个独立信号：队列处理完需 pending 为零且任务为 `idle` 或 `succeeded`。失败任务释放执行锁供后续重试，已经应用的写入保留。[架构文档](ARCHITECTURE_CN.md#巩固-tick)定义了状态、错误和关机语义。
+
 ## 5. 配置驱动
 
 所有插件在启动时经配置选择 —— 无需重新编译即可替换：
@@ -109,21 +117,28 @@ storage:
 **混合路线**：Rust trait（参考实现）+ OpenAPI 3.0 规范（多语言代码生成）
 
 - `merkur-client` crate（`MerkurClient` trait + `HttpMerkurClient`，可选 `with_namespace` 桶限定）
+- `merkur-mcp` stdio 适配器通过 HTTP SDK 复用服务端配置；`assemble_context` 按估算 token 预算返回上下文摘要和来源 ID
 - `openapi.yaml` 供 openapi-generator 生成 Python、TypeScript、Go 等客户端
 - 第三方可直接经 REST API 集成
 
 ```rust
-// Rust 用法
+// Rust usage
+use merkur_client::{HttpMerkurClient, MerkurClient, SearchParams};
+
 let client = HttpMerkurClient::with_token("http://localhost:1934", token)?
     .with_namespace("my-agent");
 let resp = client.write("hello world", None, None).await?;
 let results = client.search("hello", &SearchParams::default()).await?;
+let context = client.assemble_context("current task", 1000, Some(50)).await?;
 ```
+
+MCP 工具由 Agent 主动调用，适配器不采集整段会话或拦截模型请求。召回内容作为参考数据处理，返回的 ID 可用于核对来源。namespace 仅控制逻辑分桶，不提供用户授权。
 
 ## 7. 路线图
 
 | 优先级 | 特性 |
 |--------|------|
+| P2 | SQLite 向量引擎的可行性、迁移与性能验证 |
 | P2 | 静态加密（SQLCipher 或应用层） |
 | P2 | PostgreSQL 后端（经 Storage trait） |
 | P3 | 多模态（图像嵌入） |
