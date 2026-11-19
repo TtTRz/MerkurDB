@@ -27,7 +27,7 @@ pub type ClientResult<T> = Result<T, ClientError>;
 
 // ── Response types ──
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WriteResponse {
     pub id: String,
     pub status: String,
@@ -53,11 +53,22 @@ pub struct SearchResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct StatusResponse {
+    /// Absent on servers predating job status reporting.
+    pub consolidation: Option<ConsolidationStatus>,
     pub total_memories: usize,
     pub total_edges: usize,
     pub pending_consolidation: usize,
     pub by_level: HashMap<i32, usize>,
     pub uptime_seconds: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConsolidationStatus {
+    pub state: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub processed: usize,
+    pub errors: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +110,25 @@ pub struct SearchParams {
     pub to: Option<String>,
     pub include_graph: Option<bool>,
     pub context: Option<HashMap<String, String>>,
+}
+
+/// Context assembled by the server with source IDs for follow-up reads.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContextResponse {
+    pub digest: String,
+    pub items: Vec<ContextItem>,
+    pub token_estimate: usize,
+    pub dropped: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContextItem {
+    pub id: String,
+    pub content: String,
+    pub score: f64,
+    pub weight: f64,
+    pub importance: f64,
+    pub namespace: String,
 }
 
 // ── Trait ──
@@ -187,6 +217,23 @@ impl HttpMerkurClient {
             namespace: Some(namespace.into()),
             ..self
         }
+    }
+
+    /// Retrieve a deduplicated digest within the server's estimated token budget.
+    /// Returned item IDs can be used to inspect the original memories.
+    pub async fn assemble_context(
+        &self,
+        query: &str,
+        token_budget: usize,
+        limit: Option<usize>,
+    ) -> ClientResult<ContextResponse> {
+        let req = self
+            .client
+            .post(format!("{}/v1/context", self.base_url))
+            .json(&serde_json::json!({
+                "q": query, "token_budget": token_budget, "limit": limit
+            }));
+        Self::handle_response(self.apply_headers(req).send().await?).await
     }
 
     fn apply_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -454,6 +501,38 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn context_assembly_preserves_auth_scope_budget_and_sources() {
+        let app = axum::Router::new().route(
+            "/v1/context",
+            axum::routing::post(|headers: axum::http::HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer test-token");
+                assert_eq!(headers["x-merkur-namespace"], "project-a");
+                assert_eq!(body, serde_json::json!({"q": "release", "token_budget": 400, "limit": 20}));
+                axum::Json(serde_json::json!({
+                    "digest": "- Release on Friday",
+                    "items": [{"id": "source-1", "content": "Release on Friday", "score": 0.9, "weight": 1.0, "importance": 0.5, "namespace": "project-a"}],
+                    "token_estimate": 5, "dropped": 2
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpMerkurClient::with_token(&base, "test-token")
+            .unwrap()
+            .with_namespace("project-a");
+        let result = client
+            .assemble_context("release", 400, Some(20))
+            .await
+            .unwrap();
+        assert_eq!(result.digest, "- Release on Friday");
+        assert_eq!(result.items[0].id, "source-1");
+        assert_eq!(result.token_estimate, 5);
+        assert_eq!(result.dropped, 2);
+        task.abort();
     }
 
     #[tokio::test]

@@ -3651,9 +3651,8 @@ name = "merkur-mcp"
 version = "0.4.0"
 dependencies = [
  "anyhow",
- "merkur-core",
- "merkur-embedders",
- "merkur-storage",
+ "axum",
+ "merkur-client",
  "rmcp",
  "schemars 1.2.1",
  "serde",
