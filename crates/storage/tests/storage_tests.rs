@@ -26,6 +26,428 @@ fn new_test_memory(content: &str, embedding: Option<Vec<f32>>) -> NewMemory {
 }
 
 #[tokio::test]
+async fn vector_cache_observes_independent_writer_without_reopening() -> MerkurResult<()> {
+    use merkur_core::{AdjudicationWrite, MemorySnapshot};
+    let dir = std::env::temp_dir().join(format!("merkur_refresh_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("memories.db").to_string_lossy().to_string();
+    let writer = SqliteStorage::new(&path, 4)?;
+    let reader = SqliteStorage::new(&path, 4)?;
+    let target = writer
+        .insert_memory(&new_test_memory("old", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+    assert_eq!(
+        reader
+            .vector_search_ns(&[1.0, 0.0, 0.0, 0.0], "default", 1)
+            .await?[0]
+            .id,
+        target,
+        "an already-open reader must discover another handle's insertion"
+    );
+    writer
+        .update_memory(&target, "edited", Some(&[0.0, 1.0, 0.0, 0.0]))
+        .await?;
+    let hits = reader
+        .vector_search_ns(&[0.0, 1.0, 0.0, 0.0], "default", 1)
+        .await?;
+    assert_eq!(hits[0].content, "edited");
+    assert!(hits[0].score > 0.99);
+    writer.update_memory(&target, "text only", None).await?;
+    assert!(
+        reader
+            .vector_search_ns(&[0.0, 1.0, 0.0, 0.0], "default", 1)
+            .await?
+            .is_empty()
+    );
+    writer
+        .update_memory(&target, "old again", Some(&[1.0, 0.0, 0.0, 0.0]))
+        .await?;
+    let source = writer
+        .insert_memory(&new_test_memory("absorbed", Some(vec![0.0, 0.0, 1.0, 0.0])))
+        .await?;
+    assert!(
+        writer
+            .apply_adjudication(&AdjudicationWrite::Absorb {
+                pending: MemorySnapshot::from(&writer.get_memory(&source).await?.unwrap()),
+                target: MemorySnapshot::from(&writer.get_memory(&target).await?.unwrap()),
+            })
+            .await?
+    );
+    let hits = reader
+        .vector_search_ns(&[0.0, 0.0, 1.0, 0.0], "default", 5)
+        .await?;
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].id, target);
+    assert!(hits[0].score > 0.99);
+    writer.update_level(&target, -1).await?;
+    assert!(
+        reader
+            .vector_search_ns(&[0.0, 0.0, 1.0, 0.0], "default", 1)
+            .await?
+            .is_empty()
+    );
+    writer.update_level(&target, 2).await?;
+    assert_eq!(
+        reader
+            .vector_search_ns(&[0.0, 0.0, 1.0, 0.0], "default", 1)
+            .await?[0]
+            .id,
+        target
+    );
+    writer.delete_memory(&target).await?;
+    assert!(
+        reader
+            .vector_search_ns(&[0.0, 0.0, 1.0, 0.0], "default", 1)
+            .await?
+            .is_empty()
+    );
+    drop(reader);
+    drop(writer);
+    std::fs::remove_dir_all(dir).ok();
+    Ok(())
+}
+
+#[tokio::test]
+async fn vector_cache_falls_back_after_history_is_compacted() -> MerkurResult<()> {
+    let path = temp_db_path();
+    let writer = SqliteStorage::new(&path, 4)?;
+    let reader = SqliteStorage::new(&path, 4)?;
+    let base = writer
+        .insert_memory(&new_test_memory("base", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+    assert_eq!(
+        reader
+            .vector_search_ns(&[1.0, 0.0, 0.0, 0.0], "default", 1)
+            .await?[0]
+            .id,
+        base
+    );
+    let needle = writer
+        .insert_memory(&new_test_memory(
+            "missed insertion",
+            Some(vec![0.0, 1.0, 0.0, 0.0]),
+        ))
+        .await?;
+    let mut conn = rusqlite::Connection::open(&path).unwrap();
+    let tx = conn.transaction().unwrap();
+    let positive: Vec<_> = [1.0_f32, 0.0, 0.0, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let negative: Vec<_> = [-1.0_f32, 0.0, 0.0, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    for i in 0..4200 {
+        tx.execute(
+            "UPDATE memories SET embedding = ?1 WHERE id = ?2",
+            rusqlite::params![if i % 2 == 0 { &negative } else { &positive }, base],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM merkur_vector_changes", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(
+        count <= 4096,
+        "the journal must not grow with total lifetime writes"
+    );
+    let hits = reader
+        .vector_search_ns(&[0.0, 1.0, 0.0, 0.0], "default", 1)
+        .await?;
+    assert_eq!(
+        hits[0].id, needle,
+        "an insertion pruned from the journal still requires a full reload"
+    );
+    assert!(hits[0].score > 0.99);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_updates_do_not_dirty_the_vector_cache() -> MerkurResult<()> {
+    let path = temp_db_path();
+    let storage = SqliteStorage::new(&path, 4)?;
+    let id = storage
+        .insert_memory(&new_test_memory("content", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let generation = || {
+        conn.query_row::<i64, _, _>(
+            "SELECT CAST(value AS INTEGER) FROM merkur_meta WHERE key = 'vector_generation'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let before = generation();
+    storage.record_access(std::slice::from_ref(&id)).await?;
+    storage.update_abstract(&id, "summary").await?;
+    storage.update_importance(&id, 0.8).await?;
+    storage.mark_consolidated(std::slice::from_ref(&id)).await?;
+    assert_eq!(
+        generation(),
+        before,
+        "serving and extraction metadata must not trigger vector reloads"
+    );
+    storage
+        .update_memory(&id, "same vector, new content", Some(&[1.0, 0.0, 0.0, 0.0]))
+        .await?;
+    assert_eq!(
+        generation(),
+        before,
+        "identical vectors do not require index refresh"
+    );
+    storage
+        .update_memory(&id, "replacement", Some(&[0.0, 1.0, 0.0, 0.0]))
+        .await?;
+    assert!(generation() > before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn vector_cache_recovers_when_change_history_has_a_gap() -> MerkurResult<()> {
+    let path = temp_db_path();
+    let writer = SqliteStorage::new(&path, 4)?;
+    let reader = SqliteStorage::new(&path, 4)?;
+    let id = writer
+        .insert_memory(&new_test_memory(
+            "missing journal event",
+            Some(vec![1.0, 0.0, 0.0, 0.0]),
+        ))
+        .await?;
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("DELETE FROM merkur_vector_changes", [])
+        .unwrap();
+    let hits = reader
+        .vector_search_ns(&[1.0, 0.0, 0.0, 0.0], "default", 1)
+        .await?;
+    assert_eq!(
+        hits.len(),
+        1,
+        "an incomplete journal must fall back to a full snapshot"
+    );
+    assert_eq!(hits[0].id, id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn guarded_absorption_is_atomic_and_rejects_independent_writer() -> MerkurResult<()> {
+    use merkur_core::{AdjudicationWrite, MemorySnapshot};
+    let dir = std::env::temp_dir().join(format!("merkur_guard_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("memories.db").to_string_lossy().to_string();
+    let storage = SqliteStorage::new(&path, 4)?;
+    let writer = SqliteStorage::new(&path, 4)?;
+    let target = storage
+        .insert_memory(&new_test_memory("old", Some(vec![1.0, 0.0, 0.0, 0.0])))
+        .await?;
+    let source = storage
+        .insert_memory(&new_test_memory("new", Some(vec![0.0, 1.0, 0.0, 0.0])))
+        .await?;
+    let snapshot = |m: &merkur_core::Memory| MemorySnapshot::from(m);
+    let original_target = storage.get_memory(&target).await?.unwrap();
+    let original_source = storage.get_memory(&source).await?.unwrap();
+    let write = AdjudicationWrite::Absorb {
+        pending: snapshot(&original_source),
+        target: snapshot(&original_target),
+    };
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fail_source BEFORE UPDATE OF invalid_at ON memories
+        BEGIN SELECT RAISE(ABORT, 'injected invalidation failure'); END;",
+    )
+    .unwrap();
+    assert!(storage.apply_adjudication(&write).await.is_err());
+    assert_eq!(storage.get_memory(&target).await?.unwrap().content, "old");
+    assert_eq!(
+        storage.get_memory(&target).await?.unwrap().content_revision,
+        original_target.content_revision
+    );
+    assert!(
+        storage
+            .get_memory(&source)
+            .await?
+            .unwrap()
+            .invalid_at
+            .is_none()
+    );
+    assert_eq!(
+        storage
+            .get_embeddings(std::slice::from_ref(&target))
+            .await?[&target],
+        vec![1.0, 0.0, 0.0, 0.0]
+    );
+    assert!(
+        storage
+            .text_search("old", "default", 5)
+            .await?
+            .iter()
+            .any(|(id, _)| id == &target)
+    );
+    conn.execute_batch("DROP TRIGGER fail_source;").unwrap();
+
+    writer
+        .update_memory(&target, "edited", Some(&[0.0, 0.0, 1.0, 0.0]))
+        .await?;
+    writer
+        .update_memory(&target, "old", Some(&[0.0, 0.0, 1.0, 0.0]))
+        .await?;
+    assert!(
+        !storage.apply_adjudication(&write).await?,
+        "independent handle ABA must conflict"
+    );
+    assert!(
+        storage
+            .get_memory(&source)
+            .await?
+            .unwrap()
+            .pending_consolidation
+    );
+    let fresh = AdjudicationWrite::Absorb {
+        pending: snapshot(&original_source),
+        target: snapshot(&storage.get_memory(&target).await?.unwrap()),
+    };
+    assert!(storage.apply_adjudication(&fresh).await?);
+    assert!(
+        !storage.apply_adjudication(&fresh).await?,
+        "consumed source cannot apply twice"
+    );
+    assert_eq!(storage.get_memory(&target).await?.unwrap().content, "new");
+    assert_eq!(
+        storage
+            .get_embeddings(std::slice::from_ref(&target))
+            .await?[&target],
+        vec![0.0, 1.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        storage
+            .vector_search_ns(&[0.0, 1.0, 0.0, 0.0], "default", 1)
+            .await?[0]
+            .id,
+        target
+    );
+    drop(conn);
+    drop(writer);
+    drop(storage);
+    std::fs::remove_dir_all(dir).ok();
+    Ok(())
+}
+
+#[tokio::test]
+async fn guarded_mutations_reject_cross_namespace_and_unexamined_targets() -> MerkurResult<()> {
+    use merkur_core::{AdjudicationWrite, MemorySnapshot};
+    let storage = new_test_storage(4)?;
+    let m = new_test_memory("source", Some(vec![1.0, 0.0, 0.0, 0.0]));
+    let source = storage.insert_memory(&m).await?;
+    let mut foreign = m.clone();
+    foreign.namespace = "foreign".into();
+    let foreign = storage.insert_memory(&foreign).await?;
+    let candidate = storage.insert_memory(&m).await?;
+    let unexamined = storage.insert_memory(&m).await?;
+    let pending = MemorySnapshot::from(&storage.get_memory(&source).await?.unwrap());
+    let target = MemorySnapshot::from(&storage.get_memory(&foreign).await?.unwrap());
+    assert!(
+        !storage
+            .apply_adjudication(&AdjudicationWrite::Invalidate {
+                pending: pending.clone(),
+                candidates: vec![],
+                target_id: source.clone(),
+            })
+            .await?
+    );
+    assert!(
+        !storage
+            .apply_adjudication(&AdjudicationWrite::Absorb {
+                pending: pending.clone(),
+                target: target.clone(),
+            })
+            .await?
+    );
+    let mut forged = target;
+    forged.namespace = pending.namespace.clone();
+    assert!(
+        !storage
+            .apply_adjudication(&AdjudicationWrite::Invalidate {
+                pending: pending.clone(),
+                candidates: vec![forged],
+                target_id: foreign.clone(),
+            })
+            .await?
+    );
+    let candidate_snapshot = MemorySnapshot::from(&storage.get_memory(&candidate).await?.unwrap());
+    assert!(
+        !storage
+            .apply_adjudication(&AdjudicationWrite::Invalidate {
+                pending: pending.clone(),
+                candidates: vec![candidate_snapshot.clone()],
+                target_id: unexamined.clone(),
+            })
+            .await?
+    );
+    assert!(
+        !storage
+            .apply_adjudication(&AdjudicationWrite::Absorb {
+                pending: pending.clone(),
+                target: pending.clone(),
+            })
+            .await?
+    );
+    storage.invalidate_memory(&candidate, None).await?;
+    assert!(
+        !storage
+            .apply_adjudication(&AdjudicationWrite::Invalidate {
+                pending,
+                candidates: vec![candidate_snapshot],
+                target_id: source.clone(),
+            })
+            .await?
+    );
+    for id in [source, foreign, unexamined] {
+        assert!(storage.get_memory(&id).await?.unwrap().invalid_at.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_revisions_survive_aba_and_ignore_system_updates() -> MerkurResult<()> {
+    use merkur_core::MemorySnapshot;
+    let storage = new_test_storage(4)?;
+    let id = storage
+        .insert_memory(&new_test_memory("original", None))
+        .await?;
+    let original = storage.get_memory(&id).await?.unwrap();
+    let snapshot = MemorySnapshot::from(&original);
+    storage.update_abstract(&id, "summary").await?;
+    storage.update_importance(&id, 0.8).await?;
+    assert_eq!(
+        storage.get_memory(&id).await?.unwrap().content_revision,
+        snapshot.content_revision
+    );
+    storage.update_memory(&id, "changed", None).await?;
+    storage.update_memory(&id, "original", None).await?;
+    storage.mark_consolidated_if_unchanged(&[snapshot]).await?;
+    let current = storage.get_memory(&id).await?.unwrap();
+    assert!(current.pending_consolidation);
+    assert!(current.content_revision > original.content_revision);
+    let wire = serde_json::to_value(&current).unwrap();
+    assert!(wire.get("content_revision").is_none());
+    storage
+        .mark_consolidated_if_unchanged(&[MemorySnapshot::from(&current)])
+        .await?;
+    assert!(
+        !storage
+            .get_memory(&id)
+            .await?
+            .unwrap()
+            .pending_consolidation
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_insert_and_get() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
     let id = storage
@@ -227,7 +649,7 @@ async fn test_stats() -> MerkurResult<()> {
 }
 
 #[tokio::test]
-async fn test_stats_pending_excludes_invalidated() -> MerkurResult<()> {
+async fn test_stats_pending_excludes_invalidated_and_archived() -> MerkurResult<()> {
     let storage = new_test_storage(4)?;
 
     storage
@@ -243,12 +665,53 @@ async fn test_stats_pending_excludes_invalidated() -> MerkurResult<()> {
         ))
         .await?;
     storage.invalidate_memory(&dead, None).await?;
+    let archived = storage
+        .insert_memory(&new_test_memory("pending then archived", None))
+        .await?;
+    storage.update_level(&archived, -1).await?;
 
     let stats = storage.stats().await?;
     // Invalidated rows never become consolidation work again (list_pending
     // excludes them); the status metric must match that semantics or every
     // queue-drain wait spins on phantoms.
     assert_eq!(stats.pending_consolidation, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn archived_pending_does_not_occupy_batch_and_reactivates_when_restored() -> MerkurResult<()>
+{
+    use merkur_core::MemorySnapshot;
+    let storage = new_test_storage(4)?;
+    let archived = storage
+        .insert_memory(&new_test_memory("archived first", None))
+        .await?;
+    storage.update_level(&archived, -1).await?;
+    let live = storage
+        .insert_memory(&new_test_memory("live second", None))
+        .await?;
+    for _ in 0..3 {
+        let batch = storage.list_pending(1).await?;
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].id, live,
+            "archived work must not starve the next live memory"
+        );
+    }
+    let snapshot = MemorySnapshot::from(&storage.get_memory(&live).await?.unwrap());
+    storage.mark_consolidated_if_unchanged(&[snapshot]).await?;
+    assert!(storage.list_pending(1).await?.is_empty());
+    assert_eq!(storage.stats().await?.pending_consolidation, 0);
+    assert!(
+        storage
+            .get_memory(&archived)
+            .await?
+            .unwrap()
+            .pending_consolidation
+    );
+    storage.update_level(&archived, 2).await?;
+    assert_eq!(storage.stats().await?.pending_consolidation, 1);
+    assert_eq!(storage.list_pending(1).await?[0].id, archived);
     Ok(())
 }
 

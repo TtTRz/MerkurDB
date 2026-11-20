@@ -19,6 +19,7 @@ type BfsRow = (
     String,
     String,
     f64,
+    i64,
 );
 
 /// Build a connection pool that enforces `foreign_keys=ON` on every connection.
@@ -53,7 +54,7 @@ pub fn parse_rfc3339(s: &str) -> DateTime<Utc> {
 /// SELECT that feeds the mapper must list exactly these columns in this order,
 /// so the `Memory` read model cannot drift between single-row and listing
 /// queries.
-const MEMORY_COLUMNS: &str = "id, content, abstract, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, access_count, namespace, importance, valid_at, invalid_at";
+const MEMORY_COLUMNS: &str = "id, content, abstract, category, weight, level, pending_consolidation, metadata, created_at, updated_at, accessed_at, access_count, namespace, importance, valid_at, invalid_at, content_revision";
 
 /// Raw form of one [`MEMORY_COLUMNS`] row. Construction into a `Memory`
 /// (metadata parse, context tags, level coercion) lives in
@@ -75,6 +76,7 @@ type MemoryRow = (
     f64,
     Option<String>,
     Option<String>,
+    i64,
 );
 
 /// Map one row of the canonical [`MEMORY_COLUMNS`] projection into its raw
@@ -97,6 +99,7 @@ fn memory_row_mapper(row: &rusqlite::Row) -> rusqlite::Result<MemoryRow> {
         row.get::<_, f64>(13)?,
         row.get::<_, Option<String>>(14)?,
         row.get::<_, Option<String>>(15)?,
+        row.get::<_, i64>(16)?,
     ))
 }
 
@@ -120,6 +123,7 @@ fn memory_from_row(pool: &Pool<SqliteConnectionManager>, row: MemoryRow) -> Merk
         importance,
         valid_at,
         invalid_at,
+        content_revision,
     ) = row;
     let level = MemoryLevel::from_i32(level_i32);
     let metadata: HashMap<String, serde_json::Value> =
@@ -128,6 +132,7 @@ fn memory_from_row(pool: &Pool<SqliteConnectionManager>, row: MemoryRow) -> Merk
     Ok(Memory {
         id,
         content,
+        content_revision,
         abstract_,
         category,
         weight,
@@ -321,7 +326,7 @@ pub fn bfs_expand(
                 WHERE bfs.d < ?2
                   AND bfs.path NOT LIKE '%,' || (CASE WHEN e.source_id = bfs.id THEN e.target_id ELSE e.source_id END) || ',%'{ns_step_filter}
             )
-        SELECT bfs.id, bfs.d, bfs.w, m.content, m.abstract, m.level, m.category, m.created_at, m.namespace, m.importance
+        SELECT bfs.id, bfs.d, bfs.w, m.content, m.abstract, m.level, m.category, m.created_at, m.namespace, m.importance, m.content_revision
         FROM bfs
         JOIN memories m ON m.id = bfs.id
         WHERE bfs.d > 0 AND m.level >= 0 AND m.invalid_at IS NULL{ns_clause}
@@ -340,6 +345,7 @@ pub fn bfs_expand(
             row.get::<_, String>(7)?,
             row.get::<_, String>(8)?,
             row.get::<_, f64>(9)?,
+            row.get::<_, i64>(10)?,
         ))
     }
 
@@ -387,6 +393,7 @@ pub fn bfs_expand(
         created_at,
         namespace,
         importance,
+        content_revision,
     ) in intermediate
     {
         let level = MemoryLevel::from_i32(level_i32);
@@ -398,6 +405,7 @@ pub fn bfs_expand(
         results.push(ScoredMemory {
             id,
             content,
+            content_revision,
             abstract_,
             score,
             weight,
@@ -479,7 +487,7 @@ pub fn search_by_context(
     Ok(results)
 }
 
-/// List pending consolidation memory IDs.
+/// List runnable pending IDs. Archived flags remain available for restoration.
 pub fn list_pending_ids(
     pool: &Pool<SqliteConnectionManager>,
     limit: usize,
@@ -488,7 +496,7 @@ pub fn list_pending_ids(
         .get()
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
     let mut stmt = conn
-        .prepare("SELECT id FROM memories WHERE pending_consolidation = 1 AND invalid_at IS NULL LIMIT ?1")
+        .prepare("SELECT id FROM memories WHERE pending_consolidation = 1 AND invalid_at IS NULL AND level >= 0 LIMIT ?1")
         .map_err(|e| MerkurError::Storage(format!("Failed to prepare pending query: {e}")))?;
     Ok(stmt
         .query_map(params![limit as i64], |row| row.get::<_, String>(0))
@@ -535,10 +543,23 @@ pub fn mark_consolidated(pool: &Pool<SqliteConnectionManager>, ids: &[String]) -
     Ok(())
 }
 
-/// Compare content and acknowledge in one SQL statement, avoiding a read/write race.
+// Keep the outer lookup ID-only. Outer pending/level predicates can make SQLite
+// choose a secondary-index queue scan even when a batch ID bound is present.
+const MARK_CONSOLIDATED_IF_UNCHANGED_SQL: &str = "UPDATE memories SET pending_consolidation = 0
+         WHERE id IN (SELECT json_extract(value, '$[0]') FROM json_each(?1))
+         AND EXISTS (
+             SELECT 1 FROM json_each(?1) AS snapshot
+             WHERE memories.id = json_extract(snapshot.value, '$[0]')
+               AND memories.namespace = json_extract(snapshot.value, '$[1]')
+               AND memories.content_revision = json_extract(snapshot.value, '$[2]')
+               AND memories.pending_consolidation = 1
+               AND memories.invalid_at IS NULL AND memories.level >= 0
+         )";
+
+/// Compare revisions and acknowledge in one statement, including ABA edits.
 pub fn mark_consolidated_if_unchanged(
     pool: &Pool<SqliteConnectionManager>,
-    snapshots: &[(String, String)],
+    snapshots: &[merkur_core::MemorySnapshot],
 ) -> MerkurResult<()> {
     if snapshots.is_empty() {
         return Ok(());
@@ -546,20 +567,131 @@ pub fn mark_consolidated_if_unchanged(
     let conn = pool
         .get()
         .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
-    let snapshots = serde_json::to_string(snapshots)
+    let snapshots: Vec<_> = snapshots
+        .iter()
+        .map(|s| (&s.id, &s.namespace, s.content_revision))
+        .collect();
+    let snapshots = serde_json::to_string(&snapshots)
         .map_err(|e| MerkurError::Storage(format!("Failed to encode snapshots: {e}")))?;
-    conn.execute(
-        "UPDATE memories SET pending_consolidation = 0
-         WHERE id IN (SELECT json_extract(value, '$[0]') FROM json_each(?1))
-         AND EXISTS (
-             SELECT 1 FROM json_each(?1) AS snapshot
-             WHERE memories.id = json_extract(snapshot.value, '$[0]')
-               AND memories.content = json_extract(snapshot.value, '$[1]')
-         )",
-        params![snapshots],
-    )
-    .map_err(|e| MerkurError::Storage(format!("Failed to mark consolidated: {e}")))?;
+    conn.execute(MARK_CONSOLIDATED_IF_UNCHANGED_SQL, params![snapshots])
+        .map_err(|e| MerkurError::Storage(format!("Failed to mark consolidated: {e}")))?;
     Ok(())
+}
+
+/// The transaction owns every evidence guard and the complete mutation.
+/// `lance_vectors` selects an immutable vector reference instead of a blob.
+pub(crate) fn apply_adjudication(
+    pool: &Pool<SqliteConnectionManager>,
+    write: &merkur_core::AdjudicationWrite,
+    lance_vectors: bool,
+) -> MerkurResult<bool> {
+    use merkur_core::AdjudicationWrite;
+    let (pending, candidates) = match write {
+        AdjudicationWrite::Absorb { pending, target } => (pending, std::slice::from_ref(target)),
+        AdjudicationWrite::Invalidate {
+            pending,
+            candidates,
+            ..
+        } => (pending, candidates.as_slice()),
+    };
+    if candidates.is_empty()
+        || candidates
+            .iter()
+            .any(|candidate| pending.id == candidate.id || pending.namespace != candidate.namespace)
+    {
+        return Ok(false);
+    }
+    let mut conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(format!("adjudication connection: {e}")))?;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| MerkurError::Storage(format!("adjudication begin: {e}")))?;
+    for (snapshot, needs_pending) in
+        std::iter::once((pending, true)).chain(candidates.iter().map(|c| (c, false)))
+    {
+        let matches: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memories
+             WHERE id = ?1 AND namespace = ?2 AND content_revision = ?3
+               AND invalid_at IS NULL AND level >= 0
+               AND (?4 = 0 OR pending_consolidation = 1))",
+                params![
+                    snapshot.id,
+                    snapshot.namespace,
+                    snapshot.content_revision,
+                    needs_pending
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|e| MerkurError::Storage(format!("adjudication guard: {e}")))?;
+        if !matches {
+            return Ok(false);
+        }
+    }
+    let now = Utc::now().to_rfc3339();
+    match write {
+        AdjudicationWrite::Absorb { pending, target } => {
+            let (column, value) = if lance_vectors {
+                ("lance_vector_id", "COALESCE(lance_vector_id, id)")
+            } else {
+                ("embedding", "embedding")
+            };
+            let has_vector: bool = tx.query_row(
+                &format!("SELECT {value} IS NOT NULL AND length({value}) > 0 FROM memories WHERE id = ?1"),
+                params![pending.id], |row| row.get(0),
+            ).map_err(|e| MerkurError::Storage(format!("adjudication source vector: {e}")))?;
+            if !has_vector {
+                return Err(MerkurError::Storage(
+                    "adjudication source has no vector".into(),
+                ));
+            }
+            let changed = tx.execute(
+                &format!("UPDATE memories SET content = (SELECT content FROM memories WHERE id = ?1),
+                    {column} = (SELECT {value} FROM memories WHERE id = ?1),
+                    pending_consolidation = 1, updated_at = ?2 WHERE id = ?3"),
+                params![pending.id, now, target.id],
+            ).map_err(|e| MerkurError::Storage(format!("adjudication absorb: {e}")))?;
+            if changed != 1 {
+                return Ok(false);
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE memories SET invalid_at = ?1, updated_at = ?1,
+                    metadata = json_set(metadata, '$.absorbed_into', ?2)
+                 WHERE id = ?3 AND invalid_at IS NULL",
+                    params![now, target.id, pending.id],
+                )
+                .map_err(|e| {
+                    MerkurError::Storage(format!("adjudication invalidate source: {e}"))
+                })?;
+            if changed != 1 {
+                return Ok(false);
+            }
+        }
+        AdjudicationWrite::Invalidate {
+            pending,
+            candidates,
+            target_id,
+        } => {
+            if target_id != &pending.id && !candidates.iter().any(|c| target_id == &c.id) {
+                return Ok(false);
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE memories SET invalid_at = ?1, updated_at = ?1
+                 WHERE id = ?2 AND invalid_at IS NULL",
+                    params![now, target_id],
+                )
+                .map_err(|e| MerkurError::Storage(format!("adjudication invalidate: {e}")))?;
+            if changed != 1 {
+                return Ok(false);
+            }
+        }
+    }
+    tx.commit()
+        .map_err(|e| MerkurError::Storage(format!("adjudication commit: {e}")))?;
+    Ok(true)
 }
 
 /// Update memory level.
@@ -660,10 +792,8 @@ pub fn stats(pool: &Pool<SqliteConnectionManager>) -> MerkurResult<StorageStats>
 
     let pending_consolidation: usize = conn
         .query_row(
-            // Match list_pending: invalidated rows are dead weight, never
-            // consolidation work — counting them makes drain-waits spin on
-            // phantoms that can never clear.
-            "SELECT COUNT(*) FROM memories WHERE pending_consolidation = 1 AND invalid_at IS NULL",
+            // Match runnable queue eligibility; archived rows may re-enter if restored.
+            "SELECT COUNT(*) FROM memories WHERE pending_consolidation = 1 AND invalid_at IS NULL AND level >= 0",
             [],
             |row| row.get(0),
         )
@@ -1052,6 +1182,44 @@ pub fn update_importance(
 #[cfg(test)]
 mod tests {
     use super::dedup_verdict;
+
+    #[test]
+    fn completion_work_is_bounded_by_snapshot_batch() {
+        let path = format!(
+            "file:ack_scale_{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        );
+        let pool = super::build_pool(&path, 1).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+            id TEXT PRIMARY KEY, namespace TEXT NOT NULL DEFAULT 'default',
+            content_revision INTEGER NOT NULL DEFAULT 0,
+            pending_consolidation INTEGER NOT NULL DEFAULT 1,
+            invalid_at TEXT, level INTEGER NOT NULL DEFAULT 2);
+            CREATE INDEX idx_mem_pending ON memories(pending_consolidation);
+            WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM rows WHERE n < 100000)
+            INSERT INTO memories(id) SELECT printf('mem_%06d', n) FROM rows;",
+        )
+        .unwrap();
+        let snapshots: Vec<_> = (1..=10)
+            .map(|i| (format!("mem_{i:06}"), "default", 0))
+            .collect();
+        let mut stmt = conn
+            .prepare(super::MARK_CONSOLIDATED_IF_UNCHANGED_SQL)
+            .unwrap();
+        let changed = stmt
+            .execute(rusqlite::params![
+                serde_json::to_string(&snapshots).unwrap()
+            ])
+            .unwrap();
+        assert_eq!(changed, 10);
+        let steps = stmt.get_status(rusqlite::StatementStatus::VmStep);
+        assert!(
+            steps < 50_000,
+            "completing ten snapshots must not scan the entire queue: {steps} VM steps"
+        );
+    }
 
     #[test]
     fn dedup_verdict_noops_above_threshold() {

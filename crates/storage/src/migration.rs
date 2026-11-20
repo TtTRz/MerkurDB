@@ -4,7 +4,8 @@ use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::params;
 use tracing::info;
 
-const CURRENT_VERSION: i64 = 6;
+const CURRENT_VERSION: i64 = 8;
+pub(crate) const VECTOR_CHANGE_HISTORY: i64 = 4096;
 
 const META_DDL: &str = "
 CREATE TABLE IF NOT EXISTS merkur_meta (
@@ -81,8 +82,14 @@ pub fn migrate(pool: &Pool<SqliteConnectionManager>) -> MerkurResult<()> {
     if version < 6 {
         migrate_step(&mut conn, 6, run_v6)?;
     }
+    if version < 7 {
+        migrate_step(&mut conn, 7, run_v7)?;
+    }
+    if version < 8 {
+        migrate_step(&mut conn, 8, run_v8)?;
+    }
     // Future migrations go here:
-    // if version < 7 { migrate_step(&mut conn, 7, run_v7)?; }
+    // if version < 9 { migrate_step(&mut conn, 9, run_v9)?; }
 
     info!("Migrations complete (schema v{CURRENT_VERSION})");
     Ok(())
@@ -234,6 +241,86 @@ fn run_v6(conn: &rusqlite::Connection) -> MerkurResult<()> {
             "ALTER TABLE consolidate_log ADD COLUMN invalidations INTEGER NOT NULL DEFAULT 0;",
         )
         .map_err(|e| MerkurError::Storage(format!("migration v6: invalidations: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Revisions cover every content/vector publication, even an identical
+/// replacement. NULL vector keys preserve legacy Lance rows keyed by memory id;
+/// an empty key explicitly represents a memory without an embedding.
+fn run_v7(conn: &rusqlite::Connection) -> MerkurResult<()> {
+    if !has_column(conn, "memories", "content_revision")? {
+        conn.execute_batch(
+            "ALTER TABLE memories ADD COLUMN content_revision INTEGER NOT NULL DEFAULT 0;",
+        )
+        .map_err(|e| MerkurError::Storage(format!("migration v7: revision: {e}")))?;
+    }
+    if !has_column(conn, "memories", "lance_vector_id")? {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN lance_vector_id TEXT;")
+            .map_err(|e| MerkurError::Storage(format!("migration v7: vector reference: {e}")))?;
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS memories_revision_au
+         AFTER UPDATE OF content, lance_vector_id, namespace ON memories BEGIN
+             UPDATE memories SET content_revision = old.content_revision + 1 WHERE id = new.id;
+         END;
+         CREATE INDEX IF NOT EXISTS idx_mem_lance_vector ON memories(COALESCE(lance_vector_id, id));",
+    ).map_err(|e| MerkurError::Storage(format!("migration v7: revision trigger: {e}")))?;
+    Ok(())
+}
+
+/// Bounded vector change tracking and fenced Lance staging capabilities.
+fn run_v8(conn: &rusqlite::Connection) -> MerkurResult<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS lance_vector_staging (
+            vector_id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending', 'collecting'))
+         );
+         CREATE INDEX IF NOT EXISTS idx_lance_staging_state ON lance_vector_staging(state, created_at);",
+    ).map_err(|e| MerkurError::Storage(format!("migration v8: staging: {e}")))?;
+    if !has_column(conn, "memories", "embedding")? {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO merkur_meta(key, value) VALUES ('vector_generation', '0');
+         CREATE TABLE IF NOT EXISTS merkur_vector_changes (
+            sequence INTEGER PRIMARY KEY,
+            memory_id TEXT NOT NULL
+         );
+         DROP TRIGGER IF EXISTS memories_revision_au;
+         CREATE TRIGGER memories_revision_au
+         AFTER UPDATE OF content, embedding, lance_vector_id, namespace ON memories BEGIN
+            UPDATE memories SET content_revision = old.content_revision + 1 WHERE id = new.id;
+         END;",
+    )
+    .map_err(|e| MerkurError::Storage(format!("migration v8: vector journal: {e}")))?;
+    let old_live = "old.embedding IS NOT NULL AND old.invalid_at IS NULL AND old.level >= 0";
+    let new_live = "new.embedding IS NOT NULL AND new.invalid_at IS NULL AND new.level >= 0";
+    let changed = format!(
+        "({old_live}) != ({new_live}) OR (({new_live}) AND old.embedding IS NOT new.embedding)"
+    );
+    for (name, event, row, condition) in [
+        ("insert", "INSERT", "new", new_live),
+        (
+            "update",
+            "UPDATE OF embedding, invalid_at, level",
+            "new",
+            changed.as_str(),
+        ),
+        ("delete", "DELETE", "old", old_live),
+    ] {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER IF NOT EXISTS memories_vector_{name} AFTER {event} ON memories
+             WHEN {condition} BEGIN
+                UPDATE merkur_meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'vector_generation';
+                INSERT INTO merkur_vector_changes(sequence, memory_id)
+                    SELECT CAST(value AS INTEGER), {row}.id FROM merkur_meta WHERE key = 'vector_generation';
+                DELETE FROM merkur_vector_changes WHERE sequence <= (
+                    SELECT CAST(value AS INTEGER) - {VECTOR_CHANGE_HISTORY} FROM merkur_meta WHERE key = 'vector_generation'
+                );
+             END;"
+        )).map_err(|e| MerkurError::Storage(format!("migration v8: vector {name} trigger: {e}")))?;
     }
     Ok(())
 }

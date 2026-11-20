@@ -80,9 +80,20 @@ pub trait Storage: Send + Sync {
     /// original timestamp.
     async fn invalidate_memory(&self, id: &str, absorbed_into: Option<&str>) -> MerkurResult<()>;
 
+    /// Validate the pending and evidence snapshots, then apply atomically.
+    /// False means conflict, with no writes. Errors never consume pending work.
+    /// Absorption copies the source's current content and vector in storage.
+    async fn apply_adjudication(&self, write: &crate::AdjudicationWrite) -> MerkurResult<bool>;
+
     /// Hard-delete memories invalidated more than `days` ago — the retention
     /// window for the soft-invalidation channel.
     async fn purge_invalidated_older_than(&self, days: i32) -> MerkurResult<usize>;
+
+    /// Backend maintenance for abandoned vector stages and unreferenced keys.
+    /// Returns processed keys, not reclaimed bytes or deleted memory rows.
+    async fn cleanup_orphan_vectors(&self) -> MerkurResult<usize> {
+        Ok(0)
+    }
 
     /// Pure cosine channel over **every** bucket. Kept for the rare
     /// cross-namespace audit path; new callers should prefer
@@ -188,12 +199,11 @@ pub trait Storage: Send + Sync {
     async fn list_for_forgetting(&self, limit: usize) -> MerkurResult<Vec<Memory>>;
     async fn mark_consolidated(&self, ids: &[String]) -> MerkurResult<()>;
 
-    /// Atomically acknowledge only rows whose content still matches the
-    /// processed snapshot. Concurrent edits must remain pending.
-    /// Each tuple is (memory ID, expected content).
+    /// Atomically acknowledge only live rows at the processed revision.
+    /// Concurrent edits, including edit-and-restore, must remain pending.
     async fn mark_consolidated_if_unchanged(
         &self,
-        snapshots: &[(String, String)],
+        snapshots: &[crate::MemorySnapshot],
     ) -> MerkurResult<()>;
     async fn update_level(&self, id: &str, level: i32) -> MerkurResult<()>;
 

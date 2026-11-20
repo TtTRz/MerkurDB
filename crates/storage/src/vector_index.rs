@@ -92,6 +92,18 @@ impl InMemoryVectorIndex {
         self.inner.write().remove(id);
     }
 
+    /// Publish an entire database snapshot delta under one index write lock.
+    pub(crate) fn apply_changes(&self, changes: Vec<(String, Option<Vec<f32>>)>) {
+        let mut inner = self.inner.write();
+        for (id, embedding) in changes {
+            if let Some(embedding) = embedding {
+                inner.upsert(id, embedding);
+            } else {
+                inner.remove(&id);
+            }
+        }
+    }
+
     /// Top-k cosine similarity search using a min-heap of size `limit`.
     ///
     /// Complexity: O(n log k) vs the naive O(n log n). Returns scores in the
@@ -169,14 +181,14 @@ impl Ord for TotalF64 {
     }
 }
 
-fn l2_norm(v: &[f32]) -> f64 {
+pub(crate) fn l2_norm(v: &[f32]) -> f64 {
     v.iter()
         .map(|x| f64::from(*x) * f64::from(*x))
         .sum::<f64>()
         .sqrt()
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32], norm_a: f64, norm_b: f64) -> f64 {
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32], norm_a: f64, norm_b: f64) -> f64 {
     if a.len() != b.len() || norm_a == 0.0 || norm_b == 0.0 {
         return 0.0;
     }

@@ -1,4 +1,7 @@
-use merkur_core::{ConsolidationReport, Consolidator, Forgetter, LevelAction, Storage};
+use merkur_core::{
+    AdjudicationWrite, ConsolidationReport, Consolidator, Forgetter, LevelAction, MemorySnapshot,
+    Storage,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -156,8 +159,8 @@ impl Scheduler {
         // it can never execute, so the adjudication call is skipped as pure
         // cost. Verdict *gathering* (candidate search + LLM call, both
         // read-only) runs concurrently; verdict *execution* (absorb /
-        // invalidate writes) runs serially in pending order so two verdicts
-        // cannot race on the same target.
+        // invalidate writes) runs serially in pending order. Storage checks the original
+        // evidence revisions atomically, including conflicts with earlier verdicts or users.
         if adjudication_candidates > 0 {
             const ADJUDICATION_CONCURRENCY: usize = 4;
 
@@ -244,9 +247,6 @@ impl Scheduler {
                     continue;
                 }
                 let memory = &pending[index];
-                let Some(embedding) = embeddings.get(&memory.id) else {
-                    continue;
-                };
                 let score_of = |id: &str| candidates.iter().find(|c| c.id == id).map(|c| c.score);
                 match verdict.action {
                     merkur_core::AdjudicationAction::Add
@@ -262,37 +262,25 @@ impl Scheduler {
                         }
                         match score_of(target) {
                             Some(sim) if sim >= adjudication_floor => {
-                                // Absorb: the target takes the new content
-                                // (keeping its learned salience and edges);
-                                // the pending row is invalidated with a
-                                // pointer for audit.
-                                match storage
-                                    .update_memory(target, &memory.content, Some(embedding))
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        // The target's content changed; it needs a fresh
-                                        // extraction even if it was also in this batch.
+                                let candidate = candidates.iter().find(|c| c.id == target).unwrap();
+                                let write = AdjudicationWrite::Absorb {
+                                    pending: MemorySnapshot::from(memory),
+                                    target: MemorySnapshot {
+                                        id: candidate.id.clone(),
+                                        namespace: candidate.namespace.clone(),
+                                        content_revision: candidate.content_revision,
+                                    },
+                                };
+                                match storage.apply_adjudication(&write).await {
+                                    Ok(true) => {
                                         consolidated_ids.retain(|id| id != target);
-                                        match storage
-                                            .invalidate_memory(&memory.id, Some(target))
-                                            .await
-                                        {
-                                            Ok(()) => {
-                                                report.absorptions += 1;
-                                                debug!(
-                                                    absorbed = %memory.id,
-                                                    into = %target,
-                                                    sim,
-                                                    reason = %verdict.reason,
-                                                    "absorbed pending memory into existing one"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                error!("Failed to invalidate {}: {e}", memory.id);
-                                                report.errors += 1;
-                                            }
-                                        }
+                                        report.absorptions += 1;
+                                        debug!(absorbed = %memory.id, into = target, sim,
+                                            reason = %verdict.reason, "absorbed pending memory");
+                                    }
+                                    Ok(false) => {
+                                        consolidated_ids.retain(|id| id != &memory.id);
+                                        debug!(id = %memory.id, target, "stale UPDATE skipped; retry pending");
                                     }
                                     Err(e) => {
                                         error!("Failed to absorb into {target}: {e}");
@@ -315,9 +303,8 @@ impl Scheduler {
                         let Some(target) = verdict.target_id.as_deref() else {
                             continue;
                         };
-                        // Evidence for the pair: the target's own similarity,
-                        // or — when the pending memory itself loses — the top
-                        // candidate's (the contradiction partner).
+                        // All candidates clear the floor. Self DELETE does not
+                        // identify the contradiction partner, so guard every input.
                         let evidence = if target == memory.id {
                             candidates.first().map(|c| c.score)
                         } else {
@@ -325,15 +312,29 @@ impl Scheduler {
                         };
                         match evidence {
                             Some(sim) if sim >= adjudication_floor => {
-                                match storage.invalidate_memory(target, None).await {
-                                    Ok(()) => {
+                                let candidate_snapshots = candidates
+                                    .iter()
+                                    .filter(|c| target == memory.id || c.id == target)
+                                    .map(|c| MemorySnapshot {
+                                        id: c.id.clone(),
+                                        namespace: c.namespace.clone(),
+                                        content_revision: c.content_revision,
+                                    })
+                                    .collect();
+                                let write = AdjudicationWrite::Invalidate {
+                                    pending: MemorySnapshot::from(memory),
+                                    candidates: candidate_snapshots,
+                                    target_id: target.to_string(),
+                                };
+                                match storage.apply_adjudication(&write).await {
+                                    Ok(true) => {
                                         report.invalidations += 1;
-                                        debug!(
-                                            target,
-                                            sim,
-                                            reason = %verdict.reason,
-                                            "invalidated memory per DELETE verdict"
-                                        );
+                                        debug!(target, sim, reason = %verdict.reason,
+                                            "invalidated memory per DELETE verdict");
+                                    }
+                                    Ok(false) => {
+                                        consolidated_ids.retain(|id| id != &memory.id);
+                                        debug!(id = %memory.id, target, "stale DELETE skipped; retry pending");
                                     }
                                     Err(e) => {
                                         error!("Failed to invalidate {target}: {e}");
@@ -359,7 +360,7 @@ impl Scheduler {
         let snapshots: Vec<_> = pending
             .iter()
             .filter(|m| consolidated_ids.contains(&m.id))
-            .map(|m| (m.id.clone(), m.content.clone()))
+            .map(MemorySnapshot::from)
             .collect();
         // Retry failed batches without pretending partial work is settled.
         // Existing writes remain visible; this is not an exactly-once transaction.
@@ -463,6 +464,12 @@ impl Scheduler {
             .unwrap_or(0);
         if purged > 0 {
             info!("Purged {purged} invalidated memories");
+        }
+
+        match storage.cleanup_orphan_vectors().await {
+            Ok(processed) if processed > 0 => info!("Processed {processed} orphan vector keys"),
+            Err(e) => error!("Orphan vector cleanup failed; retained for retry: {e}"),
+            _ => {}
         }
 
         (archived, downgraded, upgraded, cleaned, purged)

@@ -154,6 +154,7 @@ mod tests {
             weight,
             level,
             pending_consolidation: false,
+            content_revision: 0,
             embedding: None,
             metadata: Default::default(),
             context: Default::default(),

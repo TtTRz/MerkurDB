@@ -6,6 +6,9 @@ use std::collections::HashMap;
 pub struct Memory {
     pub id: String,
     pub content: String,
+    /// Storage-only CAS token. Every content/vector publication advances it.
+    #[serde(skip)]
+    pub content_revision: i64,
     #[serde(rename = "abstract")]
     pub abstract_: Option<String>,
     pub category: String,
@@ -42,6 +45,39 @@ pub struct Memory {
     /// retention purge. Clients cannot set it.
     #[serde(default)]
     pub invalid_at: Option<DateTime<Utc>>,
+}
+
+/// One original memory revision used to guard a destructive verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemorySnapshot {
+    pub id: String,
+    pub namespace: String,
+    pub content_revision: i64,
+}
+
+impl From<&Memory> for MemorySnapshot {
+    fn from(memory: &Memory) -> Self {
+        Self {
+            id: memory.id.clone(),
+            namespace: memory.namespace.clone(),
+            content_revision: memory.content_revision,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum AdjudicationWrite {
+    Absorb {
+        pending: MemorySnapshot,
+        target: MemorySnapshot,
+    },
+    Invalidate {
+        pending: MemorySnapshot,
+        /// The selected candidate, or every input candidate for self DELETE:
+        /// the verdict identifies only the loser, not the contradiction partner.
+        candidates: Vec<MemorySnapshot>,
+        target_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +184,9 @@ pub struct NewEdge {
 pub struct ScoredMemory {
     pub id: String,
     pub content: String,
+    /// The metadata revision read with this candidate, never an API field.
+    #[serde(skip)]
+    pub content_revision: i64,
     #[serde(rename = "abstract")]
     pub abstract_: Option<String>,
     pub score: f64,

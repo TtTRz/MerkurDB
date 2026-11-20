@@ -1051,6 +1051,63 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn archived_pending_cannot_starve_later_consolidation_batches() {
+        let state = test_app().await;
+        let archived = state
+            .storage
+            .insert_memory(&gov_memory("archived first", 1.0, 0.0))
+            .await
+            .unwrap();
+        state.storage.update_level(&archived, -1).await.unwrap();
+        let live = state
+            .storage
+            .insert_memory(&gov_memory("live second", 0.9, 0.1))
+            .await
+            .unwrap();
+        let c = PausedAdjudicator {
+            entered: Default::default(),
+            release: Default::default(),
+            fail: false,
+        };
+        let mut processed = Vec::new();
+        // Disable vector adjudication: extraction and completion use the real scheduler path.
+        for _ in 0..3 {
+            let report =
+                crate::scheduler::Scheduler::run_consolidation_once(&*state.storage, &c, 1, 0.6, 0)
+                    .await;
+            assert_eq!(report.errors, 0);
+            processed.push(report.memories_processed);
+        }
+        assert_eq!(
+            processed,
+            vec![1, 0, 0],
+            "archived rows must not be claimed on every tick"
+        );
+        assert!(
+            !state
+                .storage
+                .get_memory(&live)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_consolidation
+        );
+        assert!(
+            state
+                .storage
+                .get_memory(&archived)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_consolidation
+        );
+        assert_eq!(
+            state.storage.stats().await.unwrap().pending_consolidation,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn edits_during_adjudication_remain_pending() {
         let state = test_app().await;
         let old = state
@@ -1092,6 +1149,429 @@ mod integration {
         assert!(
             memory.pending_consolidation,
             "a stale batch must not acknowledge new content"
+        );
+    }
+
+    struct PausedVerdict {
+        pause: PausedAdjudicator,
+        action: merkur_core::AdjudicationAction,
+        delete_pending: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Consolidator for PausedVerdict {
+        async fn consolidate(
+            &self,
+            memories: &[merkur_core::Memory],
+        ) -> merkur_core::MerkurResult<merkur_core::ConsolidationReport> {
+            self.pause.consolidate(memories).await
+        }
+
+        async fn adjudicate(
+            &self,
+            pending: &merkur_core::Memory,
+            candidates: &[merkur_core::ScoredMemory],
+        ) -> merkur_core::MerkurResult<merkur_core::Adjudication> {
+            self.pause.adjudicate(pending, candidates).await?;
+            Ok(merkur_core::Adjudication {
+                action: self.action.clone(),
+                target_id: if self.delete_pending {
+                    Some(pending.id.clone())
+                } else {
+                    candidates.first().map(|c| c.id.clone())
+                },
+                reason: "paused verdict".into(),
+            })
+        }
+    }
+
+    async fn stale_verdict_case(
+        action: merkur_core::AdjudicationAction,
+        change: &str,
+        delete_pending: bool,
+    ) {
+        let state = test_app().await;
+        let target = state
+            .storage
+            .insert_memory(&gov_memory("old", 1.0, 0.0))
+            .await
+            .unwrap();
+        state
+            .storage
+            .mark_consolidated(std::slice::from_ref(&target))
+            .await
+            .unwrap();
+        let pending = state
+            .storage
+            .insert_memory(&gov_memory("new", 0.9, 0.1))
+            .await
+            .unwrap();
+        let c = Arc::new(PausedVerdict {
+            pause: PausedAdjudicator {
+                entered: Default::default(),
+                release: Default::default(),
+                fail: false,
+            },
+            action,
+            delete_pending,
+        });
+        let job = tokio::spawn({
+            let storage = state.storage.clone();
+            let c = c.clone();
+            async move {
+                crate::scheduler::Scheduler::run_consolidation_once(&*storage, &*c, 10, 0.6, 5)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            c.pause.entered.notified(),
+        )
+        .await
+        .unwrap();
+        match change {
+            "edit_pending" | "pending_aba" => {
+                state
+                    .storage
+                    .update_memory(&pending, "edited", Some(&[1.0; 16]))
+                    .await
+                    .unwrap();
+                if change == "pending_aba" {
+                    state
+                        .storage
+                        .update_memory(&pending, "new", Some(&[1.0; 16]))
+                        .await
+                        .unwrap();
+                }
+            }
+            "edit_target" | "target_aba" => {
+                state
+                    .storage
+                    .update_memory(&target, "edited", Some(&[1.0; 16]))
+                    .await
+                    .unwrap();
+                if change == "target_aba" {
+                    state
+                        .storage
+                        .update_memory(&target, "old", Some(&[1.0; 16]))
+                        .await
+                        .unwrap();
+                }
+            }
+            "delete_target" => state.storage.delete_memory(&target).await.unwrap(),
+            "delete_pending" => state.storage.delete_memory(&pending).await.unwrap(),
+            "invalidate_target" => state
+                .storage
+                .invalidate_memory(&target, None)
+                .await
+                .unwrap(),
+            "invalidate_pending" => state
+                .storage
+                .invalidate_memory(&pending, None)
+                .await
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        c.pause.release.notify_one();
+        let report = job.await.unwrap();
+        assert_eq!(
+            report.absorptions, 0,
+            "stale absorption executed after {change}"
+        );
+        assert_eq!(
+            report.invalidations, 0,
+            "stale DELETE executed after {change}"
+        );
+        let source = state.storage.get_memory(&pending).await.unwrap();
+        if change == "delete_pending" {
+            assert!(source.is_none());
+        } else if change != "invalidate_pending" {
+            let source = source.unwrap();
+            assert!(
+                source.invalid_at.is_none(),
+                "stale verdict invalidated source after {change}"
+            );
+            assert!(
+                source.pending_consolidation,
+                "conflicting work must be retried after {change}"
+            );
+        }
+        if let Some(target) = state.storage.get_memory(&target).await.unwrap() {
+            assert_eq!(
+                target.content,
+                if change == "edit_target" {
+                    "edited"
+                } else {
+                    "old"
+                }
+            );
+            assert_eq!(target.invalid_at.is_some(), change == "invalidate_target");
+        }
+    }
+
+    #[tokio::test]
+    async fn adjudication_rejects_stale_update() {
+        for change in [
+            "edit_target",
+            "edit_pending",
+            "pending_aba",
+            "target_aba",
+            "delete_target",
+            "delete_pending",
+            "invalidate_target",
+            "invalidate_pending",
+        ] {
+            stale_verdict_case(merkur_core::AdjudicationAction::Update, change, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn adjudication_rejects_stale_delete() {
+        for delete_pending in [false, true] {
+            for change in [
+                "edit_target",
+                "edit_pending",
+                "pending_aba",
+                "target_aba",
+                "delete_target",
+                "delete_pending",
+                "invalidate_target",
+                "invalidate_pending",
+            ] {
+                stale_verdict_case(
+                    merkur_core::AdjudicationAction::Delete,
+                    change,
+                    delete_pending,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn delete_with_nonfirst_candidate_change(
+        storage: Arc<dyn merkur_core::Storage>,
+        change: &str,
+        delete_pending: bool,
+    ) {
+        let first = storage
+            .insert_memory(&gov_memory("related fact", 1.0, 0.0))
+            .await
+            .unwrap();
+        let second = storage
+            .insert_memory(&gov_memory("contradicting evidence", 0.9, 0.3))
+            .await
+            .unwrap();
+        storage
+            .mark_consolidated(&[first.clone(), second.clone()])
+            .await
+            .unwrap();
+        let memory = gov_memory("new fact", 1.0, 0.0);
+        let pending = storage.insert_memory(&memory).await.unwrap();
+        let candidates: Vec<_> = storage
+            .vector_search_ns(memory.embedding.as_deref().unwrap(), "default", 3)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.id != pending)
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(candidates, [first.clone(), second.clone()]);
+        let c = Arc::new(PausedVerdict {
+            pause: PausedAdjudicator {
+                entered: Default::default(),
+                release: Default::default(),
+                fail: false,
+            },
+            action: merkur_core::AdjudicationAction::Delete,
+            delete_pending,
+        });
+        let job = tokio::spawn({
+            let storage = storage.clone();
+            let c = c.clone();
+            async move {
+                crate::scheduler::Scheduler::run_consolidation_once(&*storage, &*c, 10, 0.6, 5)
+                    .await
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            c.pause.entered.notified(),
+        )
+        .await
+        .unwrap();
+        match change {
+            "edit" | "edit_restore" => {
+                storage
+                    .update_memory(&second, "corrected evidence", Some(&[0.0; 16]))
+                    .await
+                    .unwrap();
+                if change == "edit_restore" {
+                    let original = gov_memory("contradicting evidence", 0.9, 0.3);
+                    storage
+                        .update_memory(&second, &original.content, original.embedding.as_deref())
+                        .await
+                        .unwrap();
+                }
+            }
+            "delete" => storage.delete_memory(&second).await.unwrap(),
+            "invalidate" => storage.invalidate_memory(&second, None).await.unwrap(),
+            "archive" => storage.update_level(&second, -1).await.unwrap(),
+            "unchanged" => {}
+            _ => unreachable!(),
+        }
+        c.pause.release.notify_one();
+        let report = job.await.unwrap();
+        let conflict = delete_pending && change != "unchanged";
+        assert_eq!(
+            report.invalidations,
+            usize::from(!conflict),
+            "unexpected DELETE outcome after {change}, self={delete_pending}"
+        );
+        assert_eq!(report.errors, 0, "a revision conflict is not a batch error");
+        let current = storage.get_memory(&pending).await.unwrap().unwrap();
+        assert_eq!(current.invalid_at.is_some(), delete_pending && !conflict);
+        if conflict {
+            assert!(
+                current.pending_consolidation,
+                "conflicting work must remain retryable"
+            );
+        }
+        if !delete_pending {
+            assert!(
+                !current.pending_consolidation,
+                "the unchanged source must finish"
+            );
+        }
+        let first = storage.get_memory(&first).await.unwrap().unwrap();
+        assert_eq!(first.invalid_at.is_some(), !delete_pending && !conflict);
+        assert_eq!(first.content, "related fact");
+    }
+
+    #[tokio::test]
+    async fn self_delete_retries_when_nonfirst_candidate_changes() {
+        for change in [
+            "edit",
+            "edit_restore",
+            "delete",
+            "invalidate",
+            "archive",
+            "unchanged",
+        ] {
+            delete_with_nonfirst_candidate_change(test_app().await.storage, change, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_delete_ignores_unrelated_evidence_changes() {
+        delete_with_nonfirst_candidate_change(test_app().await.storage, "edit", false).await;
+    }
+
+    #[cfg(feature = "lancedb")]
+    #[tokio::test]
+    async fn lance_delete_guards_original_candidates() {
+        for change in [
+            "edit",
+            "edit_restore",
+            "delete",
+            "invalidate",
+            "archive",
+            "unchanged",
+        ] {
+            for delete_pending in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let storage = merkur_storage::LanceDbStorage::new(
+                    dir.path().join("lance").to_str().unwrap(),
+                    dir.path().join("meta.db").to_str().unwrap(),
+                    16,
+                )
+                .await
+                .unwrap();
+                delete_with_nonfirst_candidate_change(Arc::new(storage), change, delete_pending)
+                    .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gathered_verdicts_cannot_overwrite_an_earlier_absorption() {
+        struct SameTarget(String);
+        #[async_trait::async_trait]
+        impl Consolidator for SameTarget {
+            async fn consolidate(
+                &self,
+                memories: &[merkur_core::Memory],
+            ) -> merkur_core::MerkurResult<merkur_core::ConsolidationReport> {
+                let mut report = merkur_core::ConsolidationReport::empty();
+                report.memories_processed = memories.len();
+                report.new_abstracts = memories
+                    .iter()
+                    .map(|m| (m.id.clone(), "summary".into()))
+                    .collect();
+                Ok(report)
+            }
+            async fn adjudicate(
+                &self,
+                _: &merkur_core::Memory,
+                candidates: &[merkur_core::ScoredMemory],
+            ) -> merkur_core::MerkurResult<merkur_core::Adjudication> {
+                assert!(candidates.iter().any(|c| c.id == self.0));
+                Ok(merkur_core::Adjudication {
+                    action: merkur_core::AdjudicationAction::Update,
+                    target_id: Some(self.0.clone()),
+                    reason: "same target".into(),
+                })
+            }
+        }
+        let state = test_app().await;
+        let target = state
+            .storage
+            .insert_memory(&gov_memory("old", 1.0, 0.0))
+            .await
+            .unwrap();
+        state
+            .storage
+            .mark_consolidated(std::slice::from_ref(&target))
+            .await
+            .unwrap();
+        let a = state
+            .storage
+            .insert_memory(&gov_memory("first", 0.9, 0.1))
+            .await
+            .unwrap();
+        let b = state
+            .storage
+            .insert_memory(&gov_memory("second", 0.8, 0.2))
+            .await
+            .unwrap();
+        let report = crate::scheduler::Scheduler::run_consolidation_once(
+            &*state.storage,
+            &SameTarget(target.clone()),
+            10,
+            0.6,
+            5,
+        )
+        .await;
+        assert_eq!(report.errors, 0);
+        assert_eq!(
+            report.absorptions, 1,
+            "the second original target revision must conflict"
+        );
+        let a = state.storage.get_memory(&a).await.unwrap().unwrap();
+        let b = state.storage.get_memory(&b).await.unwrap().unwrap();
+        assert_ne!(a.invalid_at.is_some(), b.invalid_at.is_some());
+        let survivor = if a.invalid_at.is_none() { a } else { b };
+        assert!(
+            survivor.pending_consolidation,
+            "conflicted source must remain pending"
+        );
+        assert!(
+            state
+                .storage
+                .get_memory(&target)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_consolidation
         );
     }
 
@@ -1554,6 +2034,41 @@ mod integration {
             "no candidate clears the floor; adjudication must not be called"
         );
     }
+    #[cfg(feature = "lancedb")]
+    #[tokio::test]
+    async fn forgetting_collects_orphan_vectors_when_no_memories_remain() {
+        use merkur_core::Storage;
+        let dir = tempfile::tempdir_in(".").unwrap();
+        let sqlite = dir.path().join("meta.db").to_string_lossy().to_string();
+        let lance = dir.path().join("lance").to_string_lossy().to_string();
+        let storage = Arc::new(
+            merkur_storage::LanceDbStorage::new(&lance, &sqlite, 16)
+                .await
+                .unwrap(),
+        );
+        let id = storage
+            .insert_memory(&gov_memory("orphaned vector", 1.0, 0.0))
+            .await
+            .unwrap();
+        // Simulate a pre-ledger failed dual write or metadata recovery.
+        let pool = merkur_storage::sqlite_helpers::build_pool(&sqlite, 1).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute("DELETE FROM memories WHERE id = ?1", [id.as_str()])
+            .unwrap();
+        let mut state = test_app().await;
+        state.storage = storage.clone();
+        let response = router::create_router(state)
+            .oneshot(Request::post("/v1/forget").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            storage.cleanup_orphan_vectors().await.unwrap(),
+            0,
+            "the HTTP forgetting path must already have collected the orphan"
+        );
+    }
+
     /// Write-governance retention (Q7): the forgetting tick hard-deletes rows
     /// whose invalid_at is older than purge_invalidated_days — and must do so
     /// even when no forgetting candidates exist (invalidated rows are

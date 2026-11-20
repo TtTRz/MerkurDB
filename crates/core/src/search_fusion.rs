@@ -331,6 +331,7 @@ fn scored_from_memory(m: crate::Memory, score: f64) -> ScoredMemory {
     ScoredMemory {
         id: m.id,
         content: m.content,
+        content_revision: m.content_revision,
         abstract_: m.abstract_,
         score,
         weight: m.weight,
@@ -352,6 +353,7 @@ mod tests {
         ScoredMemory {
             id: id.into(),
             content: content.into(),
+            content_revision: 0,
             abstract_: None,
             score,
             weight: 1.0,
@@ -634,6 +636,7 @@ mod tests {
             weight: 1.0,
             level: crate::MemoryLevel::Full,
             pending_consolidation: false,
+            content_revision: 0,
             embedding: None,
             metadata: Default::default(),
             context: Default::default(),
@@ -674,6 +677,9 @@ mod tests {
             unimplemented!()
         }
         async fn delete_memory(&self, _: &str) -> MerkurResult<()> {
+            unimplemented!()
+        }
+        async fn apply_adjudication(&self, _: &crate::AdjudicationWrite) -> MerkurResult<bool> {
             unimplemented!()
         }
         async fn invalidate_memory(&self, _: &str, _: Option<&str>) -> MerkurResult<()> {
@@ -757,7 +763,10 @@ mod tests {
         async fn mark_consolidated(&self, _: &[String]) -> MerkurResult<()> {
             unimplemented!()
         }
-        async fn mark_consolidated_if_unchanged(&self, _: &[(String, String)]) -> MerkurResult<()> {
+        async fn mark_consolidated_if_unchanged(
+            &self,
+            _: &[crate::MemorySnapshot],
+        ) -> MerkurResult<()> {
             unimplemented!()
         }
         async fn update_level(&self, _: &str, _: i32) -> MerkurResult<()> {

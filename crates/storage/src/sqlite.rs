@@ -86,6 +86,7 @@ pub(crate) type MemoryRow = (
     String,
     String,
     f64,
+    i64,
 );
 
 /// Batch-fetch live memory rows of one bucket for the candidate ids.
@@ -113,7 +114,7 @@ pub(crate) async fn fetch_rows_in_namespace(
             .map_err(|e| MerkurError::Storage(format!("Failed to encode ids: {e}")))?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, content, abstract, category, weight, level, created_at, namespace, importance
+                "SELECT id, content, abstract, category, weight, level, created_at, namespace, importance, content_revision
                  FROM memories
                  WHERE id IN (SELECT value FROM json_each(?1))
                    AND level >= 0 AND namespace = ?2 AND invalid_at IS NULL",
@@ -131,6 +132,7 @@ pub(crate) async fn fetch_rows_in_namespace(
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
                     row.get::<_, f64>(8)?,
+                    row.get::<_, i64>(9)?,
                 ))
             })
             .map_err(|e| MerkurError::Storage(format!("Batch query failed: {e}")))?;
@@ -146,6 +148,8 @@ pub(crate) async fn fetch_rows_in_namespace(
 pub struct SqliteStorage {
     pool: Pool<SqliteConnectionManager>,
     vector_index: Arc<InMemoryVectorIndex>,
+    // Last database generation fully reflected in the index; also serializes local writers.
+    vector_writes: Arc<parking_lot::Mutex<i64>>,
 }
 
 impl SqliteStorage {
@@ -163,7 +167,11 @@ impl SqliteStorage {
 
         let vector_index = Arc::new(InMemoryVectorIndex::new(embedding_dim));
 
-        let storage = Self { pool, vector_index };
+        let storage = Self {
+            pool,
+            vector_index,
+            vector_writes: Arc::new(parking_lot::Mutex::new(-1)),
+        };
         storage.load_vectors_from_db()?;
         info!(
             "SqliteStorage initialized, loaded {} vectors",
@@ -178,30 +186,108 @@ impl SqliteStorage {
     }
 
     fn load_vectors_from_db(&self) -> MerkurResult<()> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
-        let mut stmt = conn
-            .prepare("SELECT id, embedding FROM memories WHERE embedding IS NOT NULL")
-            .map_err(|e| MerkurError::Storage(format!("Failed to prepare statement: {e}")))?;
-        let rows = stmt
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let blob: Vec<u8> = row.get(1)?;
-                Ok((id, blob))
-            })
-            .map_err(|e| MerkurError::Storage(format!("Failed to query embeddings: {e}")))?;
-
-        let mut vectors = Vec::new();
-        for row in rows {
-            let (id, blob) = row.map_err(|e| MerkurError::Storage(format!("Row error: {e}")))?;
-            let vec = bytes_to_vec_f32(&blob);
-            vectors.push((id, vec));
-        }
-        self.vector_index.rebuild(vectors);
-        Ok(())
+        synchronize_vectors(
+            &self.pool,
+            &self.vector_index,
+            &mut self.vector_writes.lock(),
+        )
     }
+
+    async fn refresh_vector_cache(&self) -> MerkurResult<()> {
+        let pool = self.pool.clone();
+        let index = self.vector_index.clone();
+        let writes = self.vector_writes.clone();
+        run_blocking(move || synchronize_vectors(&pool, &index, &mut writes.lock())).await
+    }
+}
+
+/// Read the generation and vectors from one SQLite snapshot. A reader that
+/// outlives the bounded journal falls back to a full live-vector snapshot.
+fn synchronize_vectors(
+    pool: &Pool<SqliteConnectionManager>,
+    index: &InMemoryVectorIndex,
+    last_generation: &mut i64,
+) -> MerkurResult<()> {
+    let mut conn = pool
+        .get()
+        .map_err(|e| MerkurError::Storage(e.to_string()))?;
+    let observed: i64 = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM merkur_meta WHERE key = 'vector_generation'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| MerkurError::Storage(format!("read vector generation: {e}")))?;
+    if observed == *last_generation {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction()
+        .map_err(|e| MerkurError::Storage(e.to_string()))?;
+    let generation: i64 = tx
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM merkur_meta WHERE key = 'vector_generation'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| MerkurError::Storage(format!("read vector generation: {e}")))?;
+    if generation == *last_generation {
+        return Ok(());
+    }
+    let mut full = *last_generation < 0
+        || generation < *last_generation
+        || generation - *last_generation > crate::migration::VECTOR_CHANGE_HISTORY;
+    if !full {
+        let available: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM merkur_vector_changes WHERE sequence > ?1 AND sequence <= ?2",
+                params![*last_generation, generation],
+                |r| r.get(0),
+            )
+            .map_err(|e| MerkurError::Storage(e.to_string()))?;
+        full = available != generation - *last_generation;
+    }
+    let changes = {
+        let sql = if full {
+            "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL AND invalid_at IS NULL AND level >= 0"
+        } else {
+            "SELECT c.memory_id, CASE WHEN m.invalid_at IS NULL AND m.level >= 0 THEN m.embedding END
+             FROM merkur_vector_changes c LEFT JOIN memories m ON m.id = c.memory_id
+             WHERE c.sequence > ?1 AND c.sequence <= ?2 GROUP BY c.memory_id"
+        };
+        let mut stmt = tx
+            .prepare(sql)
+            .map_err(|e| MerkurError::Storage(e.to_string()))?;
+        let mapper = |r: &rusqlite::Row| -> rusqlite::Result<(String, Option<Vec<u8>>)> {
+            Ok((r.get(0)?, r.get(1)?))
+        };
+        let rows = if full {
+            stmt.query_map([], mapper)
+        } else {
+            stmt.query_map(params![*last_generation, generation], mapper)
+        }
+        .map_err(|e| MerkurError::Storage(e.to_string()))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| MerkurError::Storage(e.to_string()))?
+    };
+    tx.commit()
+        .map_err(|e| MerkurError::Storage(e.to_string()))?;
+    let changes: Vec<_> = changes
+        .into_iter()
+        .map(|(id, blob)| (id, blob.map(|b| bytes_to_vec_f32(&b))))
+        .collect();
+    if full {
+        index.rebuild(
+            changes
+                .into_iter()
+                .filter_map(|(id, vector)| vector.map(|vector| (id, vector)))
+                .collect(),
+        );
+    } else {
+        index.apply_changes(changes);
+    }
+    *last_generation = generation;
+    Ok(())
 }
 
 /// Wrap a synchronous rusqlite operation so it runs on Tokio's blocking pool.
@@ -238,7 +324,11 @@ impl Storage for SqliteStorage {
 
         let pool = self.pool.clone();
         let id_for_db = id.clone();
+        let index = self.vector_index.clone();
+        let vector_writes = self.vector_writes.clone();
+        let embedding = mem.embedding.clone();
         run_blocking(move || -> MerkurResult<()> {
+            let _guard = vector_writes.lock();
             let mut conn = pool
                 .get()
                 .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
@@ -260,13 +350,10 @@ impl Storage for SqliteStorage {
             }
             tx.commit()
                 .map_err(|e| MerkurError::Storage(format!("commit failed: {e}")))?;
+            if let Some(embedding) = embedding { index.add(id_for_db, embedding); }
             Ok(())
         })
         .await?;
-
-        if let Some(embedding) = mem.embedding.clone() {
-            self.vector_index.add(id.clone(), embedding);
-        }
 
         Ok(id)
     }
@@ -303,32 +390,25 @@ impl Storage for SqliteStorage {
         embedding: Option<&[f32]>,
     ) -> MerkurResult<()> {
         let embedding_blob = embedding.map(vec_f32_to_bytes);
+        let embedding = embedding.map(<[f32]>::to_vec);
         let id = id.to_string();
         let content = content.to_string();
         let pool = self.pool.clone();
-        let id_clone = id.clone();
-
-        let affected = run_blocking(move || -> MerkurResult<usize> {
-            let conn = pool
-                .get()
+        let index = self.vector_index.clone();
+        let vector_writes = self.vector_writes.clone();
+        run_blocking(move || {
+            let _guard = vector_writes.lock();
+            let conn = pool.get()
                 .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
-            conn.execute(
+            let affected = conn.execute(
                 "UPDATE memories SET content = ?1, embedding = ?2, pending_consolidation = 1, updated_at = ?3 WHERE id = ?4",
-                params![content, embedding_blob, Utc::now().to_rfc3339(), id_clone],
-            )
-            .map_err(|e| MerkurError::Storage(format!("Failed to update memory: {e}")))
-        })
-        .await?;
-
-        if affected == 0 {
-            return Err(MerkurError::MemoryNotFound(id.clone()));
-        }
-        if let Some(vec) = embedding {
-            self.vector_index.add(id.clone(), vec.to_vec());
-        } else {
-            self.vector_index.remove(&id);
-        }
-        Ok(())
+                params![content, embedding_blob, Utc::now().to_rfc3339(), id],
+            ).map_err(|e| MerkurError::Storage(format!("Failed to update memory: {e}")))?;
+            if affected == 0 { return Err(MerkurError::MemoryNotFound(id)); }
+            if let Some(embedding) = embedding { index.add(id, embedding); }
+            else { index.remove(&id); }
+            Ok(())
+        }).await
     }
 
     async fn get_memory(&self, id: &str) -> MerkurResult<Option<Memory>> {
@@ -341,6 +421,46 @@ impl Storage for SqliteStorage {
         let filter = filter.clone();
         let pool = self.pool.clone();
         run_blocking(move || sqlite_helpers::list_memories_filtered(&pool, &filter)).await
+    }
+
+    async fn apply_adjudication(
+        &self,
+        write: &merkur_core::AdjudicationWrite,
+    ) -> MerkurResult<bool> {
+        let pool = self.pool.clone();
+        let index = self.vector_index.clone();
+        let vector_writes = self.vector_writes.clone();
+        let write = write.clone();
+        run_blocking(move || {
+            let _guard = vector_writes.lock();
+            // Finish fallible cache preparation before committing the verdict.
+            // The SQL source revision guard also validates this embedding read.
+            let embedding = match &write {
+                merkur_core::AdjudicationWrite::Absorb { pending, .. } => {
+                    sqlite_helpers::get_embeddings_batch(&pool, std::slice::from_ref(&pending.id))?
+                        .remove(&pending.id)
+                }
+                _ => None,
+            };
+            if !sqlite_helpers::apply_adjudication(&pool, &write, false)? {
+                return Ok(false);
+            }
+            match &write {
+                merkur_core::AdjudicationWrite::Absorb { pending, target } => {
+                    if let Some(embedding) = embedding {
+                        index.add(target.id.clone(), embedding);
+                    } else {
+                        index.remove(&target.id);
+                    }
+                    index.remove(&pending.id);
+                }
+                merkur_core::AdjudicationWrite::Invalidate { target_id, .. } => {
+                    index.remove(target_id)
+                }
+            }
+            Ok(true)
+        })
+        .await
     }
 
     async fn invalidate_memory(&self, id: &str, absorbed_into: Option<&str>) -> MerkurResult<()> {
@@ -376,7 +496,9 @@ impl Storage for SqliteStorage {
     async fn purge_invalidated_older_than(&self, days: i32) -> MerkurResult<usize> {
         let pool = self.pool.clone();
         let vector_index = self.vector_index.clone();
+        let vector_writes = self.vector_writes.clone();
         run_blocking(move || -> MerkurResult<usize> {
+            let _guard = vector_writes.lock();
             let threshold = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
             let conn = pool
                 .get()
@@ -406,23 +528,25 @@ impl Storage for SqliteStorage {
     }
 
     async fn delete_memory(&self, id: &str) -> MerkurResult<()> {
-        let id_owned = id.to_string();
+        let id = id.to_string();
         let pool = self.pool.clone();
-
-        let affected = run_blocking(move || -> MerkurResult<usize> {
+        let index = self.vector_index.clone();
+        let vector_writes = self.vector_writes.clone();
+        run_blocking(move || {
+            let _guard = vector_writes.lock();
             let conn = pool
                 .get()
                 .map_err(|e| MerkurError::Storage(format!("Failed to get connection: {e}")))?;
-            conn.execute("DELETE FROM memories WHERE id = ?1", params![id_owned])
-                .map_err(|e| MerkurError::Storage(format!("Failed to delete memory: {e}")))
+            let affected = conn
+                .execute("DELETE FROM memories WHERE id = ?1", params![id])
+                .map_err(|e| MerkurError::Storage(format!("Failed to delete memory: {e}")))?;
+            if affected == 0 {
+                return Err(MerkurError::MemoryNotFound(id));
+            }
+            index.remove(&id);
+            Ok(())
         })
-        .await?;
-
-        if affected == 0 {
-            return Err(MerkurError::MemoryNotFound(id.to_string()));
-        }
-        self.vector_index.remove(id);
-        Ok(())
+        .await
     }
 
     async fn text_search(
@@ -447,6 +571,7 @@ impl Storage for SqliteStorage {
         namespace: &str,
         limit: usize,
     ) -> MerkurResult<Vec<ScoredMemory>> {
+        self.refresh_vector_cache().await?;
         // The in-memory index is global (no per-bucket partitioning), so the
         // namespace filter runs in SQL over the fetched candidates. A fixed
         // oversample starves a small bucket whenever foreign-bucket vectors
@@ -515,6 +640,7 @@ impl Storage for SqliteStorage {
                     created_at,
                     namespace,
                     importance,
+                    content_revision,
                 )| {
                     let level = MemoryLevel::from_i32(level_i32);
                     let score = scores.get(&id).copied().unwrap_or(0.0);
@@ -522,6 +648,7 @@ impl Storage for SqliteStorage {
                     ScoredMemory {
                         id,
                         content,
+                        content_revision,
                         abstract_,
                         score,
                         weight,
@@ -671,7 +798,7 @@ impl Storage for SqliteStorage {
 
     async fn mark_consolidated_if_unchanged(
         &self,
-        snapshots: &[(String, String)],
+        snapshots: &[merkur_core::MemorySnapshot],
     ) -> MerkurResult<()> {
         let snapshots = snapshots.to_vec();
         let pool = self.pool.clone();
@@ -702,7 +829,9 @@ impl Storage for SqliteStorage {
     async fn delete_archived_older_than(&self, days: i32) -> MerkurResult<usize> {
         let pool = self.pool.clone();
         let vector_index = self.vector_index.clone();
+        let vector_writes = self.vector_writes.clone();
         run_blocking(move || -> MerkurResult<usize> {
+            let _guard = vector_writes.lock();
             let threshold = (Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
             let conn = pool
                 .get()

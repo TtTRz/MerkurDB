@@ -6,6 +6,13 @@ All notable changes to MerkurDB. Format follows [Keep a Changelog](https://keepa
 
 ### Added
 
+- Schema v8 adds a bounded SQLite vector change journal and durable Lance staging capabilities. Queries refresh vector caches across handles/processes, with full reload after journal compaction; identical vectors and metadata-only updates do not invalidate the cache. Missing journal events trigger a safe full reload.
+- Forgetting maintenance collects abandoned and legacy orphan Lance keys in batches of 128, with a 300-second staging grace. SQL capability fencing rejects late publication, interrupted collections retry after restart, and current/shared/invalidated references are protected. Cleanup removes logical rows without vacuuming historical snapshots.
+
+- Revision-guarded adjudication commits validate both memories and atomically absorb or invalidate them in SQLite. Schema v7 adds internal content revisions and immutable Lance vector references; conflicting verdicts remain pending, including edit-and-restore and same-batch conflicts.
+- LanceDB writes stage immutable vectors before SQL publication; retrieval and embedding reads follow current references. Reference-aware retention preserves shared vectors after absorption, and legacy memory-ID keys remain readable. Failed staging/publication may leave invisible orphan vectors.
+- SDK management responses expose namespace counts, absorptions, invalidations and purged counts, with defaults for older server responses.
+
 - Shared process-local consolidation execution gate for HTTP and scheduled runs; overlapping triggers return 409, started jobs survive client disconnects, and graceful shutdown drains active jobs.
 - The `consolidation` object in `GET /v1/status` and the dashboard expose current/last job state, timestamps, processed count and errors. Periodic forgetting runs independently. Status resets on restart; a successful batch does not imply an empty queue.
 - Real-server MCP integration test covers deduplication, namespace retrieval, context budget, provenance, access accounting and authentication; CI runs it without external model services. Evaluation drain checks both pending count and job state.
@@ -49,6 +56,12 @@ All notable changes to MerkurDB. Format follows [Keep a Changelog](https://keepa
 - MCP `search_memory` tool upgraded from pure vector similarity to hybrid retrieval.
 
 ### Fixed
+
+- Self-DELETE adjudication validates every input candidate in the same SQLite transaction as invalidation. A changed, removed or archived nonfirst candidate leaves the source pending for retry; UPDATE and DELETE of a named candidate retain their pair guards.
+
+- LanceDB retrieval now uses explicit Cosine and full-vector refinement instead of an L2 approximation, preventing false deduplication at cosine thresholds. Zero-vector behavior matches SQLite, legacy L2 indexes are bypassed safely, and managed indexes migrate to Cosine IVF-PQ without repeated training on every insertion.
+
+- Archived pending memories no longer occupy consolidation batches or pending counts; restoring them makes their retained pending work eligible again. Completion confirmation is bounded by batch IDs while retaining namespace, revision and live-state guards, avoiding queue-wide scans under the SQLite write lock.
 
 - **Consolidation completion and failure reporting** — pending is acknowledged after adjudication only for persisted abstracts with unchanged source content, using a shared atomic SQL check in both backends. Extraction, candidate-search and adjudication failures keep remaining pending work retryable and report a failed job; absorbed targets rewritten during the batch need fresh extraction. Applied writes are not rolled back; an audit-log error can fail a job after completion marking.
 - **Text-only consolidation batches** — memories inserted through the Storage API without an embedding skip vector adjudication without incrementing errors, allowing a mixed text/vector batch to complete. Actual vector-read and adjudication failures retain error handling.

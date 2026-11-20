@@ -31,6 +31,7 @@ mod tests {
             weight: 1.0,
             level: MemoryLevel::Full,
             pending_consolidation: true,
+            content_revision: 0,
             embedding: None,
             metadata: Default::default(),
             context: Default::default(),

@@ -59,6 +59,8 @@ pub struct StatusResponse {
     pub total_edges: usize,
     pub pending_consolidation: usize,
     pub by_level: HashMap<i32, usize>,
+    #[serde(default)]
+    pub by_namespace: HashMap<String, usize>,
     pub uptime_seconds: Option<i64>,
 }
 
@@ -77,6 +79,10 @@ pub struct ConsolidateResponse {
     pub processed: usize,
     pub edges_created: usize,
     pub errors: usize,
+    #[serde(default)]
+    pub absorptions: usize,
+    #[serde(default)]
+    pub invalidations: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +93,8 @@ pub struct ForgetResponse {
     #[serde(default)]
     pub upgraded: usize,
     pub cleaned: usize,
+    #[serde(default)]
+    pub purged: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -501,6 +509,53 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn management_responses_support_current_and_older_servers() {
+        for current in [false, true] {
+            let mut status = serde_json::json!({"total_memories": 3, "total_edges": 1,
+                "pending_consolidation": 1, "by_level": {"2": 3}});
+            let mut consolidate = serde_json::json!({"status": "ok", "processed": 2, "edges_created": 1, "errors": 0});
+            let mut forget =
+                serde_json::json!({"status": "ok", "archived": 1, "downgraded": 2, "cleaned": 0});
+            if current {
+                status["by_namespace"] = serde_json::json!({"alpha": 2, "beta": 1});
+                consolidate["absorptions"] = 1.into();
+                consolidate["invalidations"] = 2.into();
+                forget["purged"] = 3.into();
+            }
+            let app = axum::Router::new()
+                .route(
+                    "/v1/status",
+                    axum::routing::get(move || async move { axum::Json(status) }),
+                )
+                .route(
+                    "/v1/consolidate",
+                    axum::routing::post(move || async move { axum::Json(consolidate) }),
+                )
+                .route(
+                    "/v1/forget",
+                    axum::routing::post(move || async move { axum::Json(forget) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = HttpMerkurClient::new(&base).unwrap();
+            let status = client.status().await.unwrap();
+            let consolidated = client.consolidate().await.unwrap();
+            let forgotten = client.forget().await.unwrap();
+            assert_eq!(
+                status.by_namespace.get("alpha").copied(),
+                if current { Some(2) } else { None }
+            );
+            assert_eq!(consolidated.absorptions, usize::from(current));
+            assert_eq!(consolidated.invalidations, if current { 2 } else { 0 });
+            assert_eq!(forgotten.purged, if current { 3 } else { 0 });
+            assert!(status.consolidation.is_none());
+            assert_eq!(forgotten.upgraded, 0);
+            server.abort();
+        }
     }
 
     #[tokio::test]

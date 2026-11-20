@@ -58,7 +58,8 @@ curl localhost:1934/v1/health
 - **逻辑命名空间**：`X-Merkur-Namespace` 请求头将写入与所有搜索模式限定到单个桶；桶间逻辑隔离，非安全边界
 - **内嵌 Web 观测台**：服务自身在 `/ui` 提供的只读观测界面（静态资源编译进二进制，无需独立部署）—— 状态总览（level/namespace 分布）、记忆浏览与详情、图邻域探索、巩固审计日志。页面公开，数据经认证 API 获取
 - **插件架构**：Embedder / Storage / Consolidator / Forgetter — 通过 trait + 配置注入独立替换
-- **双存储**：SQLite（默认）+ LanceDB 磁盘索引（feature gate）
+- **双存储**：SQLite（默认）+ LanceDB 磁盘 Cosine 索引（feature gate），写入治理阈值使用完整向量精排分数
+- **向量维护**：SQLite 向量缓存通过有界日志跨句柄刷新；LanceDB 在 forgetting 期间清理孤儿，并拒绝已被回收的迟到发布
 - **Rust SDK**：`merkur-client` crate，含 `MerkurClient` trait 和 `HttpMerkurClient`
 - **OpenAPI 3.0**：多语言 SDK 代码生成
 
@@ -77,7 +78,7 @@ curl localhost:1934/v1/health
 - **归一化分数**。融合分按理论最大值归一到 `(0, 1]`（双通道 rank-1 = `1.0`；通道权重相等时，仅命中一条通道的上限为 `0.5`）。hybrid 的 `score_threshold` 门控融合相关度，返回分数包含复合重排；fast 模式返回并门控原始余弦。
 - **CJK 就绪**。trigram 分词索引每 3 字符滑动窗口，中日韩查询无需分词依赖。
 - **短查询回退**。不足 3 字符的查询无法产生 trigram，BM25 通道无候选，由向量相似度独立覆盖。
-- **始终一致**。FTS5 触发器镜像每一次插入/更新/删除 —— 包括 LanceDB 后端与管理工具的写入 —— 双通道永远看到同一份数据。
+- **FTS 一致性**：触发器在同一 SQLite 事务中镜像记忆的插入、更新和删除，包括 LanceDB 元数据与管理工具写入。
 - **可调融合**。`retrieval.fusion.rrf_k`（排名平滑）、`bm25_weight`/`vector_weight`（通道份额）、`score_search`/`score_weight`/`score_importance`（复合分份额）均可按部署配置；出厂默认值已经公开 benchmark 验证。
 
 ## 评测
@@ -128,9 +129,9 @@ scripts/sweep_fusion.sh          # P1-5 融合参数扫描（持久语料库）
 
 手动与定时巩固共用进程内执行锁。`POST /v1/consolidate` 等待一个批次完成；重叠触发返回 `409 CONSOLIDATION_RUNNING`。任务启动后，调用方断开连接不会取消它。定时遗忘使用独立循环，正常关机等待已启动的巩固结束。
 
-`GET /v1/status` 返回 `consolidation.state`（`idle`、`running`、`succeeded`、`failed`）、起止时间、处理数和错误数。Dashboard 在刷新时显示这份快照，重启后状态重置。`succeeded` 只表示一个批次完成；队列处理完需同时满足 `pending_consolidation == 0` 且任务为 `idle` 或 `succeeded`。
+`GET /v1/status` 返回 `consolidation.state`（`idle`、`running`、`succeeded`、`failed`）、起止时间、处理数和错误数。Dashboard 在刷新时显示这份快照，重启后状态重置。`succeeded` 只表示一个批次完成；队列处理完需同时满足 `pending_consolidation == 0` 且任务为 `idle` 或 `succeeded`。待处理计数和批次领取只包含未归档、未失效的记忆；归档行保留 pending 标记，恢复后可重新进入队列。
 
-裁决结束后，仅为摘要已落盘且原文未变的记忆清除 pending。抽取、落盘或裁决错误会保留批次的 pending 供重试，已经应用的写入不回滚。经 Storage API 插入的无向量记忆跳过向量裁决，不计作错误。默认 Noop consolidator 不产出摘要，不清除 pending。审计日志写入失败也会使任务失败，但不会撤销之前的完成标记。执行锁只覆盖一个服务进程。
+裁决结束后，仅为摘要已落盘且原始有效版本未变的记忆清除 pending，包含“改后恢复原文”的保护。破坏性裁决校验双方原始版本，并在一个 SQLite 事务内完成吸收或失效；冲突时保留 pending。LanceDB 通过同一 SQL 事务发布不可变向量引用。抽取、落盘或裁决错误会保留批次的 pending 供重试，已经应用的写入不回滚。经 Storage API 插入的无向量记忆跳过向量裁决，不计作错误。默认 Noop consolidator 不产出摘要，不清除 pending。审计日志写入失败也会使任务失败，但不会撤销之前的完成标记。执行锁只覆盖一个服务进程。
 
 ## Docker
 

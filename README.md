@@ -58,7 +58,8 @@ curl localhost:1934/v1/health
 - **Logical Namespaces**: `X-Merkur-Namespace` header scopes writes & all search modes to one bucket; hybrid retrieval stays isolated per bucket. Logical isolation, not a security boundary
 - **Embedded Web Console**: read-only observability UI served by the server itself at `/ui` (assets compiled into the binary, no separate deployment) — status dashboard with level/namespace distribution, memory browse + detail, graph neighborhood explorer, consolidation audit log. Pages are public; data flows through the authenticated API
 - **Plugin Architecture**: Embedder / Storage / Consolidator / Forgetter — independently replaceable via trait + config injection
-- **Dual Storage**: SQLite (default) + LanceDB disk-based index (feature gated)
+- **Dual Storage**: SQLite (default) + LanceDB disk-based Cosine index (feature gated), with full-vector score refinement for governance thresholds
+- **Vector maintenance**: SQLite vector caches refresh across handles with bounded change tracking; LanceDB orphan cleanup fences delayed publications during forgetting
 - **Rust SDK**: `merkur-client` crate with `MerkurClient` trait and `HttpMerkurClient`
 - **OpenAPI 3.0**: Multi-language SDK code generation
 
@@ -77,7 +78,7 @@ Design properties:
 - **Normalized scores.** Fused scores are scaled to `(0, 1]` by the theoretical maximum (rank-1 in both channels = `1.0`; a hit in only one channel caps at `0.5` with equal channel weights). Hybrid `score_threshold` gates fused relevance; the returned score includes composite re-ranking. Fast mode returns and gates raw cosine.
 - **CJK-ready.** The trigram tokenizer indexes every 3-character sliding window, so Chinese/Japanese/Korean queries match without a word segmentation dependency.
 - **Short-query fallback.** Queries under 3 characters cannot produce a trigram; the BM25 channel yields no candidates and vector similarity covers those queries alone.
-- **Always-on consistency.** FTS5 triggers mirror every insert/update/delete — including writes from the LanceDB backend and admin tools — so both channels always see the same data.
+- **FTS consistency.** Triggers mirror memory inserts, updates and deletes in the same SQLite transaction, including LanceDB metadata and admin-tool writes.
 - **Tunable fusion.** `retrieval.fusion.rrf_k` (rank smoothing), `bm25_weight`/`vector_weight` (channel shares), and `score_search`/`score_weight`/`score_importance` (composite re-rank shares) are configurable per deployment; the shipped defaults are validated against the public benchmarks below.
 
 ## Evaluation
@@ -128,9 +129,9 @@ scripts/sweep_fusion.sh          # P1-5 fusion-parameter sweep (persistent corpu
 
 Manual and scheduled consolidation share a process-local execution gate. `POST /v1/consolidate` waits for one batch; an overlapping trigger returns `409 CONSOLIDATION_RUNNING`. Once started, the job continues if the caller disconnects. Periodic forgetting uses a separate loop, and graceful shutdown waits for active consolidation.
 
-`GET /v1/status` returns `consolidation.state` (`idle`, `running`, `succeeded`, `failed`), start/finish timestamps, processed count and error count. The Dashboard shows this snapshot when refreshed; status resets on restart. `succeeded` describes one batch. A settled queue requires both `pending_consolidation == 0` and a job state of `idle` or `succeeded`.
+`GET /v1/status` returns `consolidation.state` (`idle`, `running`, `succeeded`, `failed`), start/finish timestamps, processed count and error count. The Dashboard shows this snapshot when refreshed; status resets on restart. `succeeded` describes one batch. A settled queue requires both `pending_consolidation == 0` and a job state of `idle` or `succeeded`. The pending count and batch selection include only non-archived, non-invalidated rows; archived rows retain their flag and become eligible again if restored.
 
-Pending is cleared only for memories with persisted abstracts whose source content is unchanged after adjudication. Extraction, persistence or adjudication errors leave the batch pending for retry; applied writes are retained. Text-only memories inserted through the Storage API skip vector adjudication without counting as errors. The default Noop consolidator emits no abstracts and does not clear pending. Audit-log failures also mark the job failed, but do not undo earlier completion writes. The execution gate covers one server process.
+Pending is cleared only for memories with persisted abstracts whose original live revision is unchanged after adjudication, including edit-and-restore protection. Destructive verdicts validate both original revisions and commit absorption/invalidation atomically in SQLite; conflicts remain pending. LanceDB publishes immutable vector references through the same SQL transaction. Extraction, persistence or adjudication errors leave the batch pending for retry; applied writes are retained. Text-only memories inserted through the Storage API skip vector adjudication without counting as errors. The default Noop consolidator emits no abstracts and does not clear pending. Audit-log failures also mark the job failed, but do not undo earlier completion writes. The execution gate covers one server process.
 
 ## Docker
 

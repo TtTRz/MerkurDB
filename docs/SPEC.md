@@ -92,7 +92,7 @@ w(t) = w₀ · exp(-Δt · ln2 / h) · min(1 + β · log₂(1+n), 3.0)
 
 Access is recorded at serving points only (search results actually served, context assembly, MCP search) — pure retrieval internals never touch the signal, so promotion reflects demonstrated demand.
 
-Consolidation acknowledges a memory only after its abstract is persisted and adjudication has finished without batch errors, with an atomic check that the source content is unchanged. Storage permits memories without vectors; these skip vector adjudication and can still complete extraction. Noop consolidation emits no abstracts and leaves pending work unchanged.
+Consolidation acknowledges a memory only after its abstract is persisted and adjudication has finished without batch errors, with an atomic check of the original live content revision, including edit-and-restore protection. Destructive adjudication validates original revisions and applies absorption or invalidation in one SQLite transaction; self-DELETE guards every input candidate because the verdict does not identify the contradiction partner. Conflicting work remains pending. LanceDB vectors are immutable and published by SQL reference, so an absorption can copy content and vector reference atomically. This is not a cross-store transaction or a shared search snapshot. SQLite vector caches refresh across handles using a bounded change journal; stale readers fall back to a full live snapshot. Lance orphan GC consumes/revokes staging capabilities to fence delayed publications, processing at most 128 keys per forgetting pass after a 300-second grace. It does not vacuum historical snapshots. Storage permits memories without vectors; these skip vector adjudication and can still complete extraction. Noop consolidation emits no abstracts and leaves pending work unchanged.
 
 Manual and scheduled consolidation share a process-local execution gate. Job state and pending count are separate signals: a settled queue requires zero pending and an `idle` or `succeeded` job. Failed jobs release the gate for retry; applied writes are retained. The [architecture document](ARCHITECTURE.md#consolidation-tick) defines status, error and shutdown behavior.
 
@@ -111,6 +111,8 @@ storage:
 ```
 
 Retrieval fusion (`retrieval.fusion.*`), write governance (`write.*`, `consolidation.adjudication_*`), and lifecycle thresholds (`forgetting.*`) are all config knobs with startup validation.
+
+Management responses expose namespace counts, absorption/invalidation counts and purged counts; missing fields from older servers default to empty maps or zero.
 
 ## 6. SDK Strategy
 

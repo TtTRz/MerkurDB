@@ -488,6 +488,7 @@ mod tests {
             weight: 1.0,
             level: merkur_core::MemoryLevel::Full,
             pending_consolidation: true,
+            content_revision: 0,
             embedding: None,
             metadata: Default::default(),
             context: Default::default(),
@@ -560,6 +561,7 @@ mod tests {
         let cand = merkur_core::ScoredMemory {
             id: "mem_x".into(),
             content: "the region is us-east".into(),
+            content_revision: 0,
             abstract_: None,
             score: 0.87,
             weight: 1.0,

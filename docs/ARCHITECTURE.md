@@ -71,17 +71,29 @@ The authoritative surface is `crates/core/src/traits.rs`; implement at the trait
 ### SqliteStorage (default)
 - **Metadata**: SQLite, WAL mode, r2d2 connection pool
 - **Vector index**: `InMemoryVectorIndex` — `parking_lot::RwLock`, parallel arrays + HashMap, O(n log k) top-k with pre-cached L2 norms
-- **Persistence**: vectors are stored in `memories.embedding` and loaded into the index at startup
+- **Persistence**: live vectors are stored in `memories.embedding` and loaded at startup. Before searching, a scalar generation check discovers changes from other connections/processes. A bounded 4096-event journal drives atomic index deltas; readers beyond that window or with incomplete history reload a consistent live-vector snapshot. Identical vectors, access counts, summaries and importance updates do not dirty the vector cache.
 - **Tables**: `memories`, `edges`, `context_tags`, `consolidate_log`, `memories_fts` (FTS5, trigger-synced with every write path), `merkur_meta` (schema version)
 - **Migrations**: per-version, transactional, replay-safe; a partially migrated database self-heals on boot
 
 ### LanceDbStorage (feature `lancedb`)
 - **Metadata**: SQLite (same DDL, same migrations)
-- **Vectors**: LanceDB disk storage, auto-builds IVF index past 256 rows
+- **Vectors**: LanceDB disk storage; startup and insert checks build a Cosine IVF-PQ index at 256 rows and skip training when a matching index exists. Writes append immutable UUID keys before SQLite publishes the reference; legacy keys fall back to the memory ID. Search maps only current references to live memories, and embedding reads query LanceDB. OSS readers check the latest table version on each read.
 - **Requires**: `protoc` (build-only), `--features lancedb`
 
+Queries explicitly request Cosine and `refine_factor(1)`: PQ candidates are rescored from full vectors before scores are used for dedup/adjudication thresholds. Missing, unknown or mixed/non-Cosine vector-index metrics use a flat query. The managed default L2 index is replaced by a Cosine index without rewriting stored vectors; custom mixed index layouts remain safely bypassed. New rows outside an existing index remain searchable.
+
+A zero operand has similarity 0, matching SQLite. Zero queries project IDs; incomplete, non-finite or negative native candidate sets use a streaming exact fallback so omitted zero vectors can outrank negative matches. This fallback scans raw vectors with memory bounded by batches plus the candidate limit. ANN recall remains approximate; refinement and metadata checks add work. [Pinned-source evidence and tests](research/cosine-parity.md).
+
 ### Shared SQL Logic
-`sqlite_helpers.rs` shares row projection (`get_memory_row`), batch embedding fetch, BFS, audit bookkeeping and metadata operations across both backends. `mark_consolidated_if_unchanged` atomically compares source content before acknowledging a memory. Backend-specific vector writes stay in the storage implementations. The database schema is v6, including absorption and invalidation counts in `consolidate_log`.
+`sqlite_helpers.rs` shares row projection (`get_memory_row`), BFS, audit bookkeeping and metadata operations across both backends. The database schema is v8: `content_revision` advances on content, namespace, SQLite embedding or Lance vector-reference publication; summaries and importance do not advance it. Revisions and vector references are internal and are omitted from HTTP responses.
+
+`Storage::apply_adjudication` validates original revisions, namespace, live state and source pending eligibility in one SQLite immediate transaction. UPDATE copies current source content and the SQLite embedding or immutable Lance reference to the target, then invalidates the source in that transaction. DELETE of a named candidate validates that pair. Self-DELETE validates every candidate supplied to the model: the verdict identifies the loser but not the contradiction partner, so any changed candidate makes it stale. A conflict changes no memories; a still-pending source is left for retry. The same guards reject verdicts made stale by earlier verdicts in the batch or independent database writers. `mark_consolidated_if_unchanged` acknowledges only the original live revision, including protection against edit-and-restore.
+
+Lance reference cleanup checks all remaining SQL references, including invalidated rows, so purging an absorbed source cannot delete a survivor’s shared vector. Fresh vector keys are registered in `lance_vector_staging` before append. Publishing a new pointer consumes a `pending` stage in the same SQL transaction as the memory write; a missing or revoked stage cannot publish.
+
+Forgetting maintenance invokes `Storage::cleanup_orphan_vectors`, including when no live memories remain. Lance GC retries `collecting` stages, claims expired stages after a 300-second grace, and streams the ID column to discover older unregistered orphans. Each pass processes at most 128 keys. Claiming rechecks every current reference and revokes publication in a short SQL transaction; Lance deletion runs outside that lock. Successful deletion removes the capability, which still fences delayed publishers. Interrupted claims remain durable for retry. Grace reduces interference with active writers; fencing provides safety. The scan may visit the full ID column, so the key budget does not bound total scan latency.
+
+All writers sharing Lance data must use the stage/capability protocol; mixed older writers or direct external Lance mutations are unsupported. GC deletes logical vector rows and makes no claim about reclaimed disk bytes: MVCC history and snapshot files are not vacuumed. SQL publication provides metadata/reference atomicity, not a distributed transaction or a common search snapshot across stores. Iterative candidate fetching filters old/unpublished keys but does not promise full ANN recall. The SQLite index is local to each handle and refreshes from database snapshots at query time; it is not a shared cache. [Adjudication evidence](research/adjudication-concurrency.md) and [maintenance protocol](research/vector-maintenance.md).
 
 ## Retrieval System
 
@@ -166,10 +178,10 @@ sequenceDiagram
         Note over S: candidates pre-filtered by floor (below-floor sets skip the LLM call);<br/>gathering runs 4-wide (read-only), execution serial in pending order
         S->>L: adjudicate(pending, candidates)
         L-->>S: ADD/UPDATE/DELETE/NOOP per memory
-        S->>D: execute only if cosine ≥ adjudication_floor
+        S->>D: apply_adjudication(original evidence revisions), if cosine ≥ floor
         Note over S,D: UPDATE absorbs in place (absorbed_into audit pointer);<br/>DELETE sets invalid_at; anything unparseable collapses to ADD
     end
-    S->>D: mark_consolidated_if_unchanged(eligible IDs and source content)
+    S->>D: mark_consolidated_if_unchanged(eligible source revisions)
     S->>D: log_consolidation(report)
 ```
 
@@ -186,9 +198,9 @@ Manual and scheduled consolidation share one process-local execution gate; overl
 
 Status includes `started_at`, `finished_at`, `processed` and `errors`. `processed` counts memories reported processed by the consolidator, not cleared pending flags. Terminal state is published after adjudication, completion marking and the audit-log attempt. Audit-log failure makes the job fail without undoing preceding completion writes. Exceptions before a report can be written, such as a panic, are reflected in job status and server logs.
 
-Only IDs with persisted abstracts are eligible for completion. With no extraction, persistence or adjudication errors, completion marking compares the processed content atomically in SQLite. Concurrent edits and targets rewritten by absorption remain pending. Failed batches retain their remaining pending work for retry; already-applied writes are not rolled back. This provides neither whole-batch transactions nor coordination between server processes. The default Noop consolidator emits no abstracts, so it leaves pending flags unchanged.
+Pending selection and its status count exclude archived and invalidated rows. Archived rows retain their pending flag for restoration. Completion updates seek only batch IDs before checking namespace, revision and liveness; eligibility guards stay inside the correlated check to avoid a secondary-index queue scan. Only IDs with persisted abstracts are eligible for completion. With no extraction, persistence or adjudication errors, completion marking compares the processed revision atomically in SQLite. Concurrent edits, conflicting verdicts and targets rewritten by absorption remain pending. Failed batches retain their remaining pending work for retry; already-applied writes are not rolled back. This provides neither whole-batch transactions nor coordination between server processes. The default Noop consolidator emits no abstracts, so it leaves pending flags unchanged.
 
-Vectors are optional in the Storage API. A memory without one skips vector adjudication and can still finish extraction; batch vector-read errors, candidate-search errors and adjudication errors are failures. Settled work requires both `pending_consolidation == 0` and an `idle` or `succeeded` job. The SDK exposes both fields, evaluation waiters check both, and the console displays their snapshot.
+Vectors are optional in the Storage API. A memory without one skips vector adjudication and can still finish extraction; batch vector-read errors, candidate-search errors and adjudication errors are failures. Settled work requires both `pending_consolidation == 0` and an `idle` or `succeeded` job. The SDK exposes both fields, evaluation waiters check both, and the console displays their snapshot. SDK management responses also expose `by_namespace`, `absorptions`, `invalidations` and `purged`, defaulting missing counts/maps to zero/empty for older servers.
 
 ## Configuration
 

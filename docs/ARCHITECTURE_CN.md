@@ -71,17 +71,29 @@ flowchart LR
 ### SqliteStorage（默认）
 - **元数据**：SQLite，WAL 模式，r2d2 连接池
 - **向量索引**：`InMemoryVectorIndex` —— `parking_lot::RwLock`，并行数组 + HashMap，O(n log k) top-k，L2 范数预缓存
-- **持久化**：向量保存在 `memories.embedding`，启动时加载到内存索引
+- **持久化**：有效向量保存在 `memories.embedding`，启动时加载。查询前用一个标量 generation 检查发现其他连接/进程的变化。最多保留 4096 条变化日志，按一致数据库快照原子应用增量；读取实例落后超过窗口或日志存在缺口时全量重建。相同向量、访问计数、摘要和 importance 更新不触发向量刷新。
 - **表**：`memories`、`edges`、`context_tags`、`consolidate_log`、`memories_fts`（FTS5，触发器同步所有写路径）、`merkur_meta`（schema 版本）
 - **迁移**：逐版本、事务化、可重放；半成品迁移的库启动时自愈
 
 ### LanceDbStorage（feature `lancedb`）
 - **元数据**：SQLite（同一套 DDL、同一套迁移）
-- **向量**：LanceDB 磁盘存储，超过 256 行自动建 IVF 索引
+- **向量**：LanceDB 磁盘存储；启动和插入后检查，达到 256 行时建 Cosine IVF-PQ 索引，存在匹配索引时跳过训练。写入先追加不可变 UUID key，再由 SQLite 发布引用；旧数据默认以 memory ID 为 key。搜索只将当前引用映射为有效记忆，embedding 从 LanceDB 读取。OSS 读取每次检查最新表版本。
 - **依赖**：`protoc`（仅构建期）、`--features lancedb`
 
+查询显式使用 Cosine 和 `refine_factor(1)`，取回完整向量重算 PQ 候选分数，再用于去重/裁决阈值。向量索引 metric 缺失、未知、混用或非 Cosine 时走 flat 查询。受管理的默认 L2 索引替换为 Cosine，无需改写已有向量；自定义混合索引布局继续安全绕过。已有索引之外的新增行仍可检索。
+
+任一操作数为零时相似度为 0，与 SQLite 一致。零查询只投影 ID；原生候选不足、非有限或包含负分时，流式精确扫描，保证被原生省略的零向量能排在负分前。该回退扫描原始向量，内存按批次与候选上限约束。ANN 召回仍为近似，精排和元数据检查有额外开销。[版本源码依据与测试](research/cosine-parity.md)。
+
 ### 共享 SQL 逻辑
-`sqlite_helpers.rs` 供两个后端共享行投影（`get_memory_row`）、批量向量获取、BFS、审计簿记和元数据操作。`mark_consolidated_if_unchanged` 在确认完成前原子比较原文。各后端的向量写入由其存储实现处理。当前数据库 schema 为 v6，`consolidate_log` 包含吸收和失效计数。
+`sqlite_helpers.rs` 供两个后端共享行投影（`get_memory_row`）、BFS、审计簿记和元数据操作。当前 schema 为 v8：正文、namespace、SQLite embedding 或 Lance 向量引用发布时递增 `content_revision`，摘要和 importance 更新不递增。版本和向量引用属于内部字段，不出现在 HTTP 响应中。
+
+`Storage::apply_adjudication` 在同一个 SQLite immediate 事务中校验原始版本、namespace、有效状态及来源的 pending 资格。UPDATE 在事务内将当前来源正文及 SQLite embedding 或不可变 Lance 引用复制给目标，并使来源失效。删除指定候选时校验对应双方；删除来源自身时校验送入模型的全部候选，因为裁决只标明失效对象，没有标明矛盾依据，任一候选变化都会使裁决过期。冲突时不修改任何记忆，仍为 pending 的来源留待重试。同批较早裁决或独立数据库写入造成的过期裁决同样会被拒绝。`mark_consolidated_if_unchanged` 仅确认原始有效版本，能识别“改后恢复原文”。
+
+Lance 引用回收检查所有剩余 SQL 引用，包含已失效记忆，避免清理被吸收来源时删除目标共享的向量。新 key 追加前先注册到 `lance_vector_staging`；发布新引用必须在记忆写入的同一 SQL 事务内消费 `pending` 暂存记录。记录缺失或被撤销后无法发布。
+
+forgetting 维护会调用 `Storage::cleanup_orphan_vectors`，即使已经没有有效记忆。Lance GC 重试 `collecting` 记录、领取超过 300 秒宽限期的暂存记录，并流式扫描 ID 列发现旧版未登记的孤儿。单轮最多处理 128 个 key。领取时在短 SQL 事务中重查所有引用、撤销发布资格；Lance 删除在事务外执行。删除成功后移除资格记录，迟到发布仍会被拒绝；中断的领取状态持久保留供重试。宽限期减少对正常写入的干扰，资格校验保证安全。扫描可能遍历整个 ID 列，key 数量上限不代表扫描耗时上限。
+
+共享 Lance 数据的所有写入方必须遵循暂存与发布资格协议，不支持混用旧版写入或外部直接修改 Lance。GC 删除逻辑向量行，不承诺已释放磁盘字节；不会 vacuum MVCC 历史或快照文件。SQL 发布保证元数据和引用的原子性，不构成跨库事务或共同搜索快照。逐步补取会过滤过期、未发布 key，但不承诺完整 ANN 召回。SQLite 索引仍属于各句柄，在查询前按数据库快照刷新，不是共享缓存。[裁决依据](research/adjudication-concurrency.md)与[维护协议](research/vector-maintenance.md)。
 
 ## 检索系统
 
@@ -166,10 +178,10 @@ sequenceDiagram
         Note over S: 候选先按 floor 预过滤（全低于 floor 的集合跳过 LLM 调用）；<br/>收集相 4 路并发（只读），执行相按序串行（写）
         S->>L: adjudicate(pending, candidates)
         L-->>S: 每条记忆的 ADD/UPDATE/DELETE/NOOP
-        S->>D: 仅当余弦 ≥ adjudication_floor 才执行
+        S->>D: 余弦 ≥ floor 时 apply_adjudication（证据原始版本）
         Note over S,D: UPDATE 就地吸收（absorbed_into 审计指针）；<br/>DELETE 置 invalid_at；不可解析输出坍缩为 ADD
     end
-    S->>D: mark_consolidated_if_unchanged（符合条件的 id 与处理时原文）
+    S->>D: mark_consolidated_if_unchanged（符合条件的来源版本）
     S->>D: log_consolidation(report)
 ```
 
@@ -186,9 +198,9 @@ sequenceDiagram
 
 状态还包含 `started_at`、`finished_at`、`processed` 和 `errors`。`processed` 是 consolidator 报告的处理数，不是已清除的 pending 数量。终态在裁决、完成标记和尝试写入审计日志后发布。日志写入失败会使任务失败，但不会撤销之前的完成标记。panic 等来不及写审计报告的异常通过任务状态和服务日志体现。
 
-只有摘要已落盘的 id 才有资格标记完成。没有抽取、落盘或裁决错误时，完成标记在 SQLite 中原子比较处理时的原文；并发修改的记忆和被吸收改写的目标继续保留 pending。失败批次留下的 pending 供后续重试，已经应用的写入不回滚。整批操作不具备事务性，执行锁也不协调多个服务进程。默认 Noop consolidator 不产出摘要，因此不清除 pending。
+pending 领取和状态计数排除归档、失效记忆；归档行保留 pending 标记以便恢复。完成确认先按本批 ID 定位，再检查 namespace、版本和有效性；资格条件保留在相关校验中，避免优化器选择次级索引扫描整条队列。只有摘要已落盘的 id 才有资格标记完成。没有抽取、落盘或裁决错误时，完成标记在 SQLite 中原子比较处理时的版本；并发修改、裁决冲突的来源和被吸收改写的目标继续保留 pending。失败批次留下的 pending 供后续重试，已经应用的写入不回滚。整批操作不具备事务性，执行锁也不协调多个服务进程。默认 Noop consolidator 不产出摘要，因此不清除 pending。
 
-Storage API 允许向量为空。无向量记忆跳过向量裁决，仍可完成抽取；批量读取向量、候选搜索和裁决的实际错误则计为失败。等待队列处理完需同时满足 `pending_consolidation == 0` 且任务为 `idle` 或 `succeeded`。SDK 暴露这两个字段，评测等待逻辑检查两者，控制台显示对应快照。
+Storage API 允许向量为空。无向量记忆跳过向量裁决，仍可完成抽取；批量读取向量、候选搜索和裁决的实际错误则计为失败。等待队列处理完需同时满足 `pending_consolidation == 0` 且任务为 `idle` 或 `succeeded`。SDK 暴露这两个字段，评测等待逻辑检查两者，控制台显示对应快照。SDK 管理响应还暴露 `by_namespace`、`absorptions`、`invalidations` 和 `purged`；旧服务端缺失这些字段时，计数和 map 分别默认为零和空。
 
 ## 配置
 
